@@ -2572,7 +2572,7 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                     context.user_data["cron_from_inline"] = False
                 else:
                     text = f"<b>🔄 Day already refreshed</b>\n{_fmt_stats(old_stats)}"
-                    await edit_here(text)
+                    await edit_here(text, build_inline_launcher_kb())
 
                 await query.answer(feedback, show_alert=False)
                 return
@@ -2591,7 +2591,8 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 if is_inline_refresh:
                     # Inline panel: turn back into "Status + shortcuts"
                     text = f"<b>📊 Status</b>\n{_fmt_stats(new_stats)}"
-                    await edit_here(text)
+                    await edit_here(text, build_inline_launcher_kb())
+
                 else:
                     text = f"<b>🔄 Day refreshed!</b>\n{_fmt_stats(new_stats)}"
                     await edit_here(text)
@@ -2606,7 +2607,8 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 if is_inline_refresh:
                     # Inline panel: also go back to "Status + shortcuts", but with old stats
                     text = f"<b>📊 Status</b>\n{_fmt_stats(old_stats)}"
-                    await edit_here(text)
+                    await edit_here(text, build_inline_launcher_kb())
+
                 else:
                     text = f"<b>❌ Failed to refresh day.</b>\n{_fmt_stats(old_stats)}"
                     await edit_here(text)
@@ -2623,7 +2625,7 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 text = f"<b>📊 Status</b>\n{_fmt_stats(stats)}"
 
                 try:
-                    await edit_here(text)  # Status + Inline shortcuts menu
+                    await edit_here(text, build_inline_launcher_kb())  # Status + Inline shortcuts menu
                 except Exception:
                     pass
 
@@ -2677,7 +2679,16 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             # Optional panel hint: habits/todos/rewards/completedTodos/dailys
             panel_hint = parts[2] if len(parts) > 2 else None
 
-            if query.inline_message_id is not None and panel_hint in {"habits", "todos", "rewards"}:
+            # 🔹 Case A: plain "cmd:buy_potion" from the inline shortcut menu
+            # (the button in build_inline_launcher_kb)
+            if len(parts) == 2:
+                # Make the shortcuts message show the fresh Status, just like cmd:status
+                text = f"<b>📊 Status</b>\n{_fmt_stats(new_stats)}"
+                await edit_here(text)
+
+            # 🔹 Case B: "cmd:buy_potion:<panel_hint>" from a panel footer,
+            #            in an INLINE message (habits/dailys/todos/rewards panels)
+            elif query.inline_message_id is not None and panel_hint in {"habits", "dailys", "todos", "rewards"}:
                 # Rebuild the proper panel keyboard so we keep the same UI
                 if panel_hint == "habits":
                     habits = get_tasks(user_id, api_key, "habits") or []
@@ -2696,10 +2707,18 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                         row = []
                         if down_flag:
                             row.append(
-                                InlineKeyboardButton(f"➖({counter_down}) {short}", callback_data=f"hMenu:down:{hid}"))
+                                InlineKeyboardButton(
+                                    f"➖({counter_down}) {short}",
+                                    callback_data=f"hMenu:down:{hid}",
+                                )
+                            )
                         if up_flag:
                             row.append(
-                                InlineKeyboardButton(f"➕({counter_up}) {short}", callback_data=f"hMenu:up:{hid}"))
+                                InlineKeyboardButton(
+                                    f"➕({counter_up}) {short}",
+                                    callback_data=f"hMenu:up:{hid}",
+                                )
+                            )
                         if row:
                             rows.append(row)
                     layout_mode = "full"
@@ -2779,9 +2798,12 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 # Inline message: update header+status text + keep same keyboard
                 await edit_here("\n".join([header, _status_block(new_stats)]), markup)
 
+            # 🔹 Case C: panel footer in a normal chat message
             else:
-                # Normal chat message (or no hint) → keep existing behavior
-                await _update_panel_text_if_needed(new_stats, query.message.reply_markup if query.message else None)
+                await _update_panel_text_if_needed(
+                    new_stats,
+                    query.message.reply_markup if query.message else None,
+                )
 
             # Always keep the pinned HUD in sync in the user’s private chat
             await update_and_pin_status(context, home_chat_id, stats_override=new_stats)
@@ -2848,13 +2870,25 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 if is_due and not completed and yester_flag:
                     yester_dailies.append(task)
 
-            # Save yesterday's daily IDs so the yester/cron handlers can rebuild the keyboard
-            context.user_data["cron_yesterday_ids"] = [
-                t.get("id") for t in yester_dailies if t.get("id")
-            ]
-            context.user_data["cron_compact_layout"] = False  # start in full layout
+            # --- Build metadata for the refresh-day UI -------------------------
+            cron_meta: dict[str, dict] = {}
+            for t in yester_dailies:
+                tid = t.get("id")
+                if not tid:
+                    continue
+                cron_meta[tid] = {
+                    "text": t.get("text", "(no title)"),
+                    "checked": False,
+                }
 
-            # Build the text (same style as your /refresh_day panel)
+            context.user_data["cron_meta"] = cron_meta
+            layout_mode = context.user_data.get("cron_layout_mode", "full")
+            context.user_data["cron_layout_mode"] = layout_mode
+
+            # Mark that this refresh-day came from the inline shortcuts
+            context.user_data["cron_from_inline"] = True
+
+            # Build the text (same style as /refresh_day panel)
             lines: list[str] = []
             if yester_dailies:
                 lines.append("<b>These Dailies were due yesterday and are still unchecked:</b>")
@@ -2870,38 +2904,8 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                     "You can safely refresh your day now."
                 )
 
-            # Build the keyboard (✖️/✔️ + Refresh/Cancel + layout toggle)
-            rows: list[list[InlineKeyboardButton]] = []
-            MAX_LABEL_LEN = 30
-
-            for t in yester_dailies:
-                full_title = t.get("text", "(no title)")
-                label = (
-                    full_title
-                    if len(full_title) <= MAX_LABEL_LEN
-                    else full_title[:MAX_LABEL_LEN - 3] + "…"
-                )
-                # initial state = unchecked -> ✖️
-                button_text = f"✖️ {label}"
-                rows.append([
-                    InlineKeyboardButton(
-                        button_text,
-                        callback_data=f"yester:0:{t.get('id')}",
-                    )
-                ])
-
-            # Refresh + Cancel in one row
-            rows.append([
-                InlineKeyboardButton("✅ Refresh day now", callback_data="cron:run"),
-                InlineKeyboardButton("❌ Cancel", callback_data="cron:cancel"),
-            ])
-
-            # Layout toggle – first press will switch to compact layout
-            rows.append([
-                InlineKeyboardButton("🧩 Compact view", callback_data="yesterLayout:next"),
-            ])
-
-            keyboard = InlineKeyboardMarkup(rows)
+            # Keyboard (✖️/✔️ + Refresh/Cancel + layout toggle)
+            keyboard = build_refresh_day_keyboard(cron_meta, layout_mode)
 
             # Finally, EDIT the inline shortcuts message itself
             try:
@@ -2913,8 +2917,6 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             except Exception as e:
                 logging.exception("Failed to edit inline message to refresh-day panel: %s", e)
             return
-
-
 
     # -------------------------------------------------------------------------
     # Panel refresh (no scoring, just re-sync from Habitica)
@@ -3841,12 +3843,24 @@ async def open_refresh_day_menu_for_chat(
         if is_due and not completed and yester_flag:
             yester_dailies.append(task)
 
-    # Save yesterday's daily IDs so the callback handler can rebuild the keyboard
-    context.user_data["cron_yesterday_ids"] = [
-        t.get("id") for t in yester_dailies if t.get("id")
-    ]
-    context.user_data["cron_compact_layout"] = False  # start in full layout
+    # --- Build metadata for the refresh-day UI -----------------------------
+    # One entry per Daily with a "checked" flag that controls the ✖️/✔️ icon.
+    cron_meta: dict[str, dict] = {}
+    for t in yester_dailies:
+        tid = t.get("id")
+        if not tid:
+            continue
+        cron_meta[tid] = {
+            "text": t.get("text", "(no title)"),
+            "checked": False,  # user hasn't said they did it yet
+        }
 
+    # Store metadata + layout mode so yester / yesterLayout can rebuild
+    context.user_data["cron_meta"] = cron_meta
+    layout_mode = context.user_data.get("cron_layout_mode", "full")
+    context.user_data["cron_layout_mode"] = layout_mode
+
+    # --- Text --------------------------------------------------------------
     lines: list[str] = []
     if yester_dailies:
         lines.append("<b>These Dailies were due yesterday and are still unchecked:</b>")
@@ -3862,37 +3876,8 @@ async def open_refresh_day_menu_for_chat(
             "You can safely refresh your day now."
         )
 
-    # --- Build keyboard (initially FULL layout: 1 per row, using ✖️/✔️) ---
-    rows: list[list[InlineKeyboardButton]] = []
-    MAX_LABEL_LEN = 30
-
-    for t in yester_dailies:
-        full_title = t.get("text", "(no title)")
-        label = (
-            full_title if len(full_title) <= MAX_LABEL_LEN
-            else full_title[:MAX_LABEL_LEN - 3] + "..."
-        )
-        # initial state = unchecked -> ✖️
-        button_text = f"✖️ {label}"
-        rows.append([
-            InlineKeyboardButton(
-                button_text,
-                callback_data=f"yester:0:{t.get('id')}",
-            )
-        ])
-
-    # Refresh + Cancel in one row
-    rows.append([
-        InlineKeyboardButton("✅ Refresh day now", callback_data="cron:run"),
-        InlineKeyboardButton("❌ Cancel",          callback_data="cron:cancel"),
-    ])
-
-    # Layout toggle button – first press will switch to COMPACT
-    rows.append([
-        InlineKeyboardButton("🧩 Compact view", callback_data="yesterLayout:compact")
-    ])
-
-    keyboard = InlineKeyboardMarkup(rows)
+    # --- Keyboard (✖️/✔️ + Refresh/Cancel + layout toggle) ---------------
+    keyboard = build_refresh_day_keyboard(cron_meta, layout_mode)
 
     await context.bot.send_message(
         chat_id=chat_id,
