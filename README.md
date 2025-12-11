@@ -79,6 +79,12 @@ You can try the running bot here: **[@HHabitica_bot](https://t.me/HHabitica_bot)
     * ✅ Completed Todos / 🔁 Menu
   * `/menu` and `/menu_rk` control how/when it’s shown
 
+* 🧍 **Avatar image export**
+
+  * `/avatar` sends a PNG image of your current Habitica avatar
+  * Uses a small Node.js helper with Puppeteer + the `habitica-avatar` library (optional; see “Installation & setup”)
+
+
 * ⚙️ **Configurable panel layout via `PANEL_BEHAVIOUR`**
 
   * One central dict defines how each panel looks:
@@ -161,6 +167,7 @@ Common commands you’ll see in the bot:
 | `/inline`         | Show inline launcher helper message                             |
 | `/menu`           | Show / rebuild the reply keyboard menu                          |
 | `/task_list`      | Text-only grouped task list (Habits / Dailys / Todos / Rewards) |
+| `/avatar`         | Generate and send your Habitica avatar as a PNG image           |
 | `/debug`          | Debug info (intended for dev/testing)                           |
 | `/sync_commands`  | Manually re-sync Telegram commands menu                         |
 
@@ -237,6 +244,29 @@ $env:TELEGRAM_BOT_TOKEN="your-telegram-bot-token-here"
 ```
 
 *(On hosts like PythonAnywhere you can set this in your WSGI file or environment config instead of committing it to the repo.)*
+
+### 7. (Optional) Enable `/avatar` (Node.js avatar renderer)
+
+If you want the `/avatar` command to send a PNG of your Habitica avatar, you also need Node.js and the small helper project in this repo (`render_avatar_from_json.js`, `package.json`, etc.). 
+
+1. Install **Node.js 18+** on the server (required by Puppeteer). 
+2. From the project root, install the Node dependencies defined in `package.json`:
+
+   ```bash
+   npm install
+   ```
+3. Build (or rebuild) the browser bundle that the renderer uses:
+
+   ```bash
+   npx browserify node_modules/habitica-avatar/index.js -s habiticaAvatar -o habitica-avatar.bundle.js
+   ```
+
+   You do not need to recreate `habitica-avatar.bundle.js` on every deploy.
+You can commit the generated file to the repo and deploy it like any other asset.
+Only rebuild it if you update the `habitica-avatar` dependency or change the avatar renderer code.
+
+
+
 
 ---
 
