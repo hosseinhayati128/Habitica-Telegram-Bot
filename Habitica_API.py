@@ -127,11 +127,11 @@ def score_task(user_id: str, api_key: str, task_id: str, direction: str) -> Opti
     return response_data.get('data') if response_data else None
 
 
-
 def export_avatar_png(user_id: str, api_key: str) -> bytes | None:
     """
     Returns the current user's avatar PNG bytes, or None on failure.
     Uses Habitica's export endpoint for the *authenticated* user.
+    NOTE: This endpoint is known to be flaky / broken in Habitica's API.
     """
     try:
         base = BASE_URL.split("/api/")[0]  # "https://habitica.com"
@@ -139,6 +139,7 @@ def export_avatar_png(user_id: str, api_key: str) -> bytes | None:
         headers = {
             "x-api-user": user_id,
             "x-api-key": api_key,
+            "x-client": "habitica-telegram-bot",  # match your other calls
         }
         resp = requests.get(url, headers=headers, timeout=30)
         resp.raise_for_status()
@@ -146,6 +147,8 @@ def export_avatar_png(user_id: str, api_key: str) -> bytes | None:
     except requests.RequestException as e:
         logging.error(f"Failed to download avatar: {e}")
         return None
+
+
 
 
 def buy_potion(user_id: str, api_key: str) -> bool:

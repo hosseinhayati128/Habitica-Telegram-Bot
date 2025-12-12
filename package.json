@@ -1,0 +1,19 @@
+{
+  "name": "habitica",
+  "version": "1.0.0",
+  "description": "",
+  "main": "render_avatar.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "browserify": "^17.0.1",
+    "habitica-avatar": "^0.2.0",
+    "node-fetch": "^2.7.0",
+    "puppeteer": "^24.32.0"
+  }
+}

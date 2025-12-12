@@ -1,9 +1,19 @@
 from typing import Final, Optional
 
+import json
+import subprocess
+import tempfile
+import shutil
+from pathlib import Path
+
+
 import asyncio
 import html
 import logging
 import os
+
+import shutil
+
 
 import httpx
 import requests
@@ -15,6 +25,8 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
+    InlineQueryResultCachedPhoto,
+    InlineQueryResultCachedDocument,
     InlineQueryResultPhoto,
     InputTextMessageContent,
     KeyboardButton,
@@ -54,17 +66,63 @@ from Habitica_API import (
     get_tasks,
 )
 
+import json
+import subprocess
+import tempfile
+
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 
+debug = False
 
 BOT_TOKEN: Final = os.environ.get("TELEGRAM_BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+
+
+def _detect_node_bin() -> str:
+    """
+    Try to find a usable 'node' binary.
+
+    Order:
+    1) Explicit env override: NODE_BIN
+    2) Whatever is on PATH (shutil.which)
+    3) Common nvm locations under ~/.nvm/versions/node/*/bin/node
+    4) Plain 'node' as a last resort (may still fail)
+    """
+    # 1) Explicit override
+    env_bin = os.environ.get("NODE_BIN")
+    if env_bin and os.path.exists(env_bin):
+        return env_bin
+
+    # 2) PATH lookup
+    found = shutil.which("node")
+    if found:
+        return found
+
+    # 3) Look for nvm-installed node
+    home = Path.home()
+    nvm_root = home / ".nvm" / "versions" / "node"
+    if nvm_root.is_dir():
+        # pick "highest" version folder
+        candidates = sorted(nvm_root.glob("v*/bin/node"), reverse=True)
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+
+    # 4) Last resort: let subprocess try plain 'node'
+    return "node"
+
+
+NODE_BIN = _detect_node_bin()
+
+
+
+
 
 HABITICA_API_URL: Final = "https://habitica.com/api/v3" # <-- ADD THIS LINE
 CHOOSING_ACCOUNT = "CHOOSING_ACCOUNT"   # use a string to avoid collisions
@@ -85,7 +143,8 @@ RK = ReplyKeyboardMarkup(
         [KeyboardButton("🌀 Habits"), KeyboardButton("📅 Dailys"),
          KeyboardButton("📝 Todos"), KeyboardButton("💰 Rewards")],
         [KeyboardButton("➕ New Todo")],
-        [KeyboardButton("📊 Status"), KeyboardButton("🧪 Buy Potion")],
+        [KeyboardButton("📊 Status"), KeyboardButton("🎭 Avatar"),
+         KeyboardButton("🧪 Buy Potion")],
         [KeyboardButton("🔄 Refresh Day")],
         [KeyboardButton("✅ Completed Todos"), KeyboardButton("🔁 Menu")],
     ],
@@ -782,6 +841,9 @@ async def handle_reply_keyboard(update: Update, context: ContextTypes.DEFAULT_TY
     if text == "📊 Status":
         return await get_status_command_handler(update, context)
 
+    if text == "🎭 Avatar":
+        return await avatar_command_handler(update, context)
+
     if text == "🧪 Buy Potion":
         return await buy_potion_command_handler(update, context)
 
@@ -814,6 +876,9 @@ def build_inline_launcher_kb():
         [
             InlineKeyboardButton("📊 Status", callback_data="cmd:status"),
             InlineKeyboardButton("🧪 Buy Potion", callback_data="cmd:buy_potion"),
+        ],
+        [
+            InlineKeyboardButton("🎭 Avatar", callback_data="cmd:avatar"),
         ],
         [
             InlineKeyboardButton("🔄 Refresh Day", callback_data="cmd:refresh_day"),
@@ -867,12 +932,48 @@ async def hide_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-async def send_inline_launcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_inline_launcher(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Show the inline shortcut menu.
+
+    If we have a cached avatar PNG, send it as a photo with caption.
+    Otherwise fall back to a plain text message.
+    """
+    chat_id = update.effective_chat.id
+    kb = build_inline_launcher_kb()
+
+    png_path = context.user_data.get("AVATAR_PNG_PATH")
+
+    # Try to send with avatar
+    if png_path and os.path.exists(png_path):
+        try:
+            with open(png_path, "rb") as img:
+                msg = await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=img,
+                    caption="🎯 Quick Commands:",
+                    reply_markup=kb,
+                )
+            # cache file_id for inline mode etc.
+            if msg.photo:
+                context.user_data["AVATAR_FILE_ID"] = msg.photo[-1].file_id
+            return
+        except Exception as e:
+            logging.warning(
+                "Failed to send inline launcher with avatar, falling back to text: %s",
+                e,
+            )
+
+    # Fallback: text-only
     await context.bot.send_message(
-        chat_id=update.effective_chat.id,
+        chat_id=chat_id,
         text="🎯 Quick Commands:",
-        reply_markup=build_inline_launcher_kb()
+        reply_markup=kb,
     )
+
 
 
 
@@ -936,6 +1037,8 @@ async def _register_commands(app: Application) -> None:
         BotCommand("cancel", "Cancel current action"),
         # Optional: expose /sync_commands itself in menu
         BotCommand("sync_commands", "Re-sync command list with Telegram"),
+        BotCommand("avatar", "Send your Habitica avatar image"),  # 👈 add this
+
     ]
 
     try:
@@ -1114,21 +1217,264 @@ async def refresh_menu_command_handler(update: Update, context: ContextTypes.DEF
         force=True,
     )
 
+
+
+
+
+
+async def ensure_avatar_png(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    force_refresh: bool = False,
+) -> str | None:
+    """
+    Make sure we have an up-to-date avatar PNG for this Habitica user.
+
+    - If force_refresh is False and context.user_data["AVATAR_PNG_PATH"] exists
+      and the file is still there, reuse it.
+    - Otherwise, fetch the user from Habitica, render via Node, save as
+      Avatar/<habitica_username>.png, store the path in context.user_data,
+      and return it.
+
+    Returns the absolute path to the PNG, or None on error (and sends a short
+    error message to the user).
+    """
+    user_id = context.user_data.get("USER_ID")
+    api_key = context.user_data.get("API_KEY")
+
+    if not user_id or not api_key:
+        await update.message.reply_text(
+            "Use /start to set USER_ID and API_KEY first."
+        )
+        return None
+
+    # Reuse existing avatar if we already rendered it and the file still exists,
+    # but only when we are NOT forcing a refresh.
+    existing_path = context.user_data.get("AVATAR_PNG_PATH")
+    if not force_refresh and existing_path and os.path.exists(existing_path):
+        return existing_path
+
+    # 1) Fetch user JSON from Habitica
+    user_data = get_status(user_id, api_key)
+    if not user_data:
+        await update.message.reply_text(
+            "❌ Could not fetch your Habitica profile. Please try again later."
+        )
+        return None
+
+    # --- Determine a safe Habitica username for the filename ---
+    username = ""
+
+    auth = user_data.get("auth") or {}
+    local_auth = auth.get("local") or {}
+    username = local_auth.get("username") or ""
+
+    if not username:
+        profile = user_data.get("profile") or {}
+        username = profile.get("name") or ""
+
+    if not username:
+        username = "habitica_user"
+
+    safe_username = "".join(
+        c if c.isalnum() or c in ("-", "_") else "_"
+        for c in username.strip()
+    ) or "habitica_user"
+
+    # 2) Render avatar via Node into a temp PNG and copy it to Avatar/<username>.png
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    node_script = os.path.join(base_dir, "render_avatar_from_json.js")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        user_json_path = os.path.join(tmpdir, "user.json")
+        tmp_png_path = os.path.join(tmpdir, "avatar.png")
+
+        with open(user_json_path, "w", encoding="utf-8") as f:
+            json.dump(user_data, f)
+
+        try:
+            proc = subprocess.run(
+                [NODE_BIN, node_script, user_json_path, tmp_png_path],
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            logging.error("Node.js binary not found. Tried NODE_BIN=%r", NODE_BIN)
+            await update.message.reply_text(
+                "❌ Node.js is not available on this server, so I can't render the avatar image."
+            )
+            return None
+
+
+        if proc.returncode != 0 or not os.path.exists(tmp_png_path):
+            logging.error(
+                "Avatar render failed (code=%s)\nSTDOUT:\n%s\nSTDERR:\n%s",
+                proc.returncode,
+                proc.stdout,
+                proc.stderr,
+            )
+            await update.message.reply_text(
+                "❌ Failed to generate avatar image. Check server logs for details."
+            )
+            return None
+
+        # 3) Ensure Avatar directory exists and copy the PNG there
+        avatar_dir = os.path.join(base_dir, "Avatar")
+        os.makedirs(avatar_dir, exist_ok=True)
+
+        final_png_path = os.path.join(avatar_dir, f"{safe_username}.png")
+
+        with open(tmp_png_path, "rb") as src, open(final_png_path, "wb") as dst:
+            dst.write(src.read())
+
+    # Store for reuse
+    context.user_data["AVATAR_PNG_PATH"] = final_png_path
+    return final_png_path
+
+
+async def send_avatar_photo(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    caption: str | None = None,
+) -> None:
+    """
+    Ensure the avatar PNG exists for this user and send it to the current chat.
+
+    - Always re‑render (force_refresh=True) so /avatar is up to date.
+    - Cache:
+        * AVATAR_FILE_ID        -> photo file_id (for photo-based panels etc.)
+        * AVATAR_DOC_FILE_ID    -> document file_id (for inline cached document)
+    """
+    png_path = await ensure_avatar_png(update, context, force_refresh=True)
+    if not png_path:
+        # ensure_avatar_png already sent an error message
+        return
+
+    chat_id = update.effective_chat.id
+
+    try:
+        # 1) Send as photo (normal /avatar behaviour)
+        with open(png_path, "rb") as img:
+            photo_msg = await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=img,
+                caption=caption,
+            )
+
+        if photo_msg.photo:
+            context.user_data["AVATAR_FILE_ID"] = photo_msg.photo[-1].file_id
+
+        # 2) Also send as document (quietly) to get a document_file_id for inline cached doc
+        try:
+            with open(png_path, "rb") as doc_fp:
+                doc_msg = await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=doc_fp,
+                    filename=os.path.basename(png_path),
+                    disable_notification=True,
+                )
+
+            if doc_msg.document:
+                context.user_data["AVATAR_DOC_FILE_ID"] = doc_msg.document.file_id
+
+        except Exception as e:
+            logging.warning("Failed to send avatar as document: %s", e)
+
+    except FileNotFoundError:
+        await update.message.reply_text(
+            "❌ I generated your avatar but couldn't find the saved file. Please try again."
+        )
+
+
+
+
+async def avatar_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate, save, and send the user's Habitica avatar as a PNG image."""
+    await send_avatar_photo(
+        update,
+        context,
+        caption="Here’s your Habitica avatar ✨",
+    )
+
+
+
+async def send_panel_with_saved_avatar(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    panel_text: str,
+    keyboard: InlineKeyboardMarkup | None = None,
+) -> None:
+    """
+    Send a single message consisting of:
+      - the saved avatar PNG (if available) as the photo
+      - `panel_text` as the caption
+      - `keyboard` as the inline keyboard
+
+    If no avatar PNG is cached yet, fall back to a normal text message with the same keyboard.
+    """
+    chat_id = update.effective_chat.id
+
+    png_path = context.user_data.get("AVATAR_PNG_PATH")
+    if png_path and os.path.exists(png_path):
+        try:
+            with open(png_path, "rb") as img:
+                msg = await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=img,
+                    caption=panel_text,
+                    parse_mode="HTML",
+                    reply_markup=keyboard,
+                )
+
+            # Cache file_id for inline avatar usage
+            if msg.photo:
+                context.user_data["AVATAR_FILE_ID"] = msg.photo[-1].file_id
+
+            return
+        except Exception as e:
+            logging.warning(
+                "Failed to send avatar photo, falling back to text-only panel: %s", e
+            )
+
+    # Fallback: no cached avatar => just send the text panel as before
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=panel_text,
+        parse_mode="HTML",
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+
+
+
+
 # Assume get_status is defined elsewhere
 # def get_status(user_id, api_key): ...
 
 async def get_status_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /status command."""
+    chat_id = update.effective_chat.id
+
+    # Force /status to forget any cached pin info for this chat
+    pinned_key = f"pinned_status_message_id_{chat_id}"
+    text_key = f"pinned_status_text_{chat_id}"
+    context.user_data.pop(pinned_key, None)
+    context.user_data.pop(text_key, None)
+    logging.info("STATUS DEBUG: cleared pinned status cache for chat %s", chat_id)
+
     # Send the temporary message and capture its message object
     temp_message = await update.message.reply_text("Updating status...")
 
     # Call the helper, passing the IDs of the messages to delete
     await update_and_pin_status(
         context,
-        chat_id=update.effective_chat.id,
+        chat_id=chat_id,
         user_command_message_id=update.message.message_id,
         bot_status_message_id=temp_message.message_id
     )
+
 
 
 async def buy_potion_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1214,18 +1560,44 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
     # --- Empty inline query: only "Show my options" ---
+    # --- Empty inline query: "Show my options" ---
+    # --- Empty inline query: just show a text launcher (no avatar in popup) ---
+    # --- Empty inline query: "Inline shortcuts" with avatar DOCUMENT if we have it ---
     if not query_type:
-        results = [
-            InlineQueryResultArticle(
-                id="show_options",
-                title="Show my options",
-                description="Open quick picker (Habits / Dailys / Todos / Rewards / Completed)",
-                input_message_content=InputTextMessageContent("Inline shortcuts:"),
-                reply_markup=build_inline_launcher_kb(),
-            ),
-        ]
+        results = []
+        avatar_doc_id = context.user_data.get("AVATAR_DOC_FILE_ID")
+
+        if avatar_doc_id:
+            # Use the avatar as a cached DOCUMENT so the shortcuts menu message
+            # has the avatar file + caption + shortcuts keyboard.
+            caption = "<b>Inline shortcuts</b>\n\n" + status_text
+
+            results.append(
+                InlineQueryResultCachedDocument(
+                    id="show_options_with_avatar_doc",
+                    title="Inline shortcuts",
+                    document_file_id=avatar_doc_id,
+                    description="Open quick picker (Habits / Dailys / Todos / Rewards / Completed)",
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=build_inline_launcher_kb(),
+                )
+            )
+        else:
+            # Fallback: old text-only behaviour if we don't yet have a cached avatar doc
+            results.append(
+                InlineQueryResultArticle(
+                    id="show_options",
+                    title="Show my options",
+                    description="Open quick picker (Habits / Dailys / Todos / Rewards / Completed)",
+                    input_message_content=InputTextMessageContent("Inline shortcuts:"),
+                    reply_markup=build_inline_launcher_kb(),
+                )
+            )
+
         await query.answer(results, cache_time=0, is_personal=True)
         return
+
 
     if not normalized_type:
         # User typed something that's not a known type
@@ -1251,7 +1623,8 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer(results, cache_time=0)
         return
 
-    results: list[InlineQueryResultArticle] = []
+    results: list = []
+
 
     # ------------------------------------------------------------------
     # "ALL" PANEL ARTICLE AT TOP, USING THE SAME LAYOUT AS /habits,/dailys,/todos,/rewards
@@ -1310,18 +1683,38 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             layout_mode=layout_mode,
         )
 
-        results.append(
-            InlineQueryResultArticle(
-                id="panel_habits_all",
-                title="🌀 All Habits",
-                description="Send a Habits panel with +/- buttons",
-                input_message_content=InputTextMessageContent(
-                    message_text=panel_text,
+        # ---- ALL HABITS INLINE RESULT ----
+        # Try to use cached DOCUMENT avatar if we have it, otherwise fall back to text article.
+        avatar_doc_id = context.user_data.get("AVATAR_DOC_FILE_ID")
+
+        if avatar_doc_id:
+            # Document tile in popup, document bubble + caption in chat
+            results.append(
+                InlineQueryResultCachedDocument(
+                    id="panel_habits_all_doc",
+                    title="🌀 All Habits",
+                    document_file_id=avatar_doc_id,
+                    description="Send a Habits panel with +/- buttons",
+                    caption=panel_text,
                     parse_mode="HTML",
-                ),
-                reply_markup=habits_markup,
+                    reply_markup=habits_markup,
+                )
             )
-        )
+        else:
+            # Fallback: text-only article (no avatar) if we haven't cached doc yet
+            results.append(
+                InlineQueryResultArticle(
+                    id="panel_habits_all",
+                    title="🌀 All Habits",
+                    description="Send a Habits panel with +/- buttons",
+                    input_message_content=InputTextMessageContent(
+                        message_text=panel_text,
+                        parse_mode="HTML",
+                    ),
+                    reply_markup=habits_markup,
+                )
+            )
+
 
 
 
@@ -1352,18 +1745,36 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         # Keyboard: one helper, no manual footer here
         dailys_markup = build_dailys_panel_keyboard(dailys, layout_mode)
 
-        results.append(
-            InlineQueryResultArticle(
-                id="panel_dailys_all",
-                title="📅 All Dailies",
-                description="Send a Dailies panel with ✔ / ✖ buttons",
-                input_message_content=InputTextMessageContent(
-                    message_text=panel_text,
+        avatar_doc_id = context.user_data.get("AVATAR_DOC_FILE_ID")
+
+        if avatar_doc_id:
+            # Document tile in popup, document bubble + caption in chat
+            results.append(
+                InlineQueryResultCachedDocument(
+                    id="panel_dailys_all_doc",
+                    title="📅 All Dailies",
+                    document_file_id=avatar_doc_id,
+                    description="Send a Dailies panel with ✔ / ✖ buttons",
+                    caption=panel_text,
                     parse_mode="HTML",
-                ),
-                reply_markup=dailys_markup,
+                    reply_markup=dailys_markup,
+                )
             )
-        )
+        else:
+            # Fallback: text-only article (no avatar) if we haven't cached doc yet
+            results.append(
+                InlineQueryResultArticle(
+                    id="panel_dailys_all",
+                    title="📅 All Dailies",
+                    description="Send a Dailies panel with ✔ / ✖ buttons",
+                    input_message_content=InputTextMessageContent(
+                        message_text=panel_text,
+                        parse_mode="HTML",
+                    ),
+                    reply_markup=dailys_markup,
+                )
+            )
+
 
 
 
@@ -1420,18 +1831,120 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         append_standard_footer(rows, "todos", layout_mode, include_potion=True)
         todos_markup = InlineKeyboardMarkup(rows)
 
-        results.append(
-            InlineQueryResultArticle(
-                id="panel_todos_all",
-                title="📝 All Todos",
-                description="Send a Todos panel with ✔ / ✖ buttons",
-                input_message_content=InputTextMessageContent(
-                    message_text=panel_text,
+        avatar_doc_id = context.user_data.get("AVATAR_DOC_FILE_ID")
+
+        if avatar_doc_id:
+            results.append(
+                InlineQueryResultCachedDocument(
+                    id="panel_todos_all_doc",
+                    title="📝 All Todos",
+                    document_file_id=avatar_doc_id,
+                    description="Send a Todos panel with ✔ / ✖ buttons",
+                    caption=panel_text,
                     parse_mode="HTML",
-                ),
-                reply_markup=todos_markup,
+                    reply_markup=todos_markup,
+                )
             )
+        else:
+            results.append(
+                InlineQueryResultArticle(
+                    id="panel_todos_all",
+                    title="📝 All Todos",
+                    description="Send a Todos panel with ✔ / ✖ buttons",
+                    input_message_content=InputTextMessageContent(
+                        message_text=panel_text,
+                        parse_mode="HTML",
+                    ),
+                    reply_markup=todos_markup,
+                )
+            )
+
+
+
+
+
+
+    elif normalized_type == "completedTodos":
+        completed = tasks  # tasks already fetched via get_tasks(...)
+
+        layout_mode = context.user_data.get("c_menu_layout", "full")
+
+        # Status (same as /completedTodos panel)
+        status_data = get_status(user_id, api_key) or {}
+        stats = status_data.get("stats", {}) or {}
+        status_html = build_status_block(stats)
+
+        cfg = PANEL_BEHAVIOUR["completedTodos"]
+        panel_text = build_tasks_panel_text(
+            kind="completedTodos",
+            tasks=completed,
+            status_text=status_html,
+            show_status=cfg["show_status"],
+            show_list=cfg["show_list"],
+            list_first=cfg["list_first"],
+            layout_mode=layout_mode,
         )
+
+        # Buttons (same layout as /completedTodos)
+        buttons_with_len: list[tuple[InlineKeyboardButton, int]] = []
+        MAX_LABEL_LEN = 28
+
+        for t in completed:
+            full_text = t.get("text", "(no title)")
+            short = (
+                full_text
+                if len(full_text) <= MAX_LABEL_LEN
+                else full_text[: MAX_LABEL_LEN - 1] + "…"
+            )
+
+            is_completed = bool(t.get("completed", True))
+            icon = "↩️" if is_completed else "✖️"
+            action = "down" if is_completed else "up"
+
+            task_id = t.get("id")
+            if not task_id:
+                continue
+
+            label = f"{icon} {short}"
+            btn = InlineKeyboardButton(
+                label,
+                callback_data=f"cMenu:{action}:{task_id}",
+            )
+            buttons_with_len.append((btn, len(label)))
+
+        rows = layout_buttons_for_mode(buttons_with_len, layout_mode)
+        append_standard_footer(rows, "completedTodos", layout_mode, include_potion=True)
+        completed_markup = InlineKeyboardMarkup(rows)
+
+        avatar_doc_id = context.user_data.get("AVATAR_DOC_FILE_ID")
+
+        if avatar_doc_id:
+            results.append(
+                InlineQueryResultCachedDocument(
+                    id="panel_completed_all_doc",
+                    title="✅ All Completed Todos",
+                    document_file_id=avatar_doc_id,
+                    description="Send a panel of completed Todos (tap to un-complete).",
+                    caption=panel_text,
+                    parse_mode="HTML",
+                    reply_markup=completed_markup,
+                )
+            )
+        else:
+            results.append(
+                InlineQueryResultArticle(
+                    id="panel_completed_all",
+                    title="✅ All Completed Todos",
+                    description="Send a panel of completed Todos (tap to un-complete).",
+                    input_message_content=InputTextMessageContent(
+                        message_text=panel_text,
+                        parse_mode="HTML",
+                    ),
+                    reply_markup=completed_markup,
+                )
+            )
+
+
 
 
 
@@ -1477,88 +1990,135 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
         rewards_markup = InlineKeyboardMarkup(rows)
-        results.append(
-            InlineQueryResultArticle(
-                id="panel_rewards_all",
-                title="💰 All Rewards",
-                description="Send a Rewards panel with buy buttons",
-                input_message_content=InputTextMessageContent(
-                    message_text=panel_text,
+        avatar_doc_id = context.user_data.get("AVATAR_DOC_FILE_ID")
+
+        if avatar_doc_id:
+            # Document tile in popup, document bubble + caption in chat
+            results.append(
+                InlineQueryResultCachedDocument(
+                    id="panel_rewards_all_doc",
+                    title="💰 All Rewards",
+                    document_file_id=avatar_doc_id,
+                    description="Send a Rewards panel with buy buttons",
+                    caption=panel_text,
                     parse_mode="HTML",
-                ),
-                reply_markup=rewards_markup,
+                    reply_markup=rewards_markup,
+                )
             )
-        )
+        else:
+            # Fallback: text-only article if we don't yet have a cached doc id
+            results.append(
+                InlineQueryResultArticle(
+                    id="panel_rewards_all",
+                    title="💰 All Rewards",
+                    description="Send a Rewards panel with buy buttons",
+                    input_message_content=InputTextMessageContent(
+                        message_text=panel_text,
+                        parse_mode="HTML",
+                    ),
+                    reply_markup=rewards_markup,
+                )
+            )
 
     # ------------------------------------------------------------------
-    # Per-task inline articles (same as you already had)
+    # Per-task inline results (single cards, with avatar document if we have it)
     # ------------------------------------------------------------------
+    avatar_doc_id = context.user_data.get("AVATAR_DOC_FILE_ID")
+
     for task in tasks[:10]:
-        task_text = html.escape(task.get('text', '(no title)'))
-        task_id = task.get('id')
+        task_text = html.escape(task.get("text", "(no title)"))
+        task_id = task.get("id")
+        if not task_id:
+            continue
+
         reply_markup = None
+        message_content = task_text
+        title_prefix = "🔹"
 
         if normalized_type == "habits":
-            up = task.get('up', False)
-            down = task.get('down', False)
-            counter_up = task.get('counterUp', 0)
-            counter_down = task.get('counterDown', 0)
-            keyboard = []
+            up = task.get("up", False)
+            down = task.get("down", False)
+            counter_up = task.get("counterUp", 0)
+            counter_down = task.get("counterDown", 0)
+
+            keyboard: list[InlineKeyboardButton] = []
             if up:
                 keyboard.append(
                     InlineKeyboardButton(
                         f"➕ {counter_up}",
-                        callback_data=f"habits:up:{task_id}:{counter_up}:{up}:{down}"
+                        callback_data=f"habits:up:{task_id}:{counter_up}:{up}:{down}",
                     )
                 )
             if down:
                 keyboard.append(
                     InlineKeyboardButton(
                         f"➖ {counter_down}",
-                        callback_data=f"habits:down:{task_id}:{counter_down}:{up}:{down}"
+                        callback_data=f"habits:down:{task_id}:{counter_down}:{up}:{down}",
                     )
                 )
             reply_markup = InlineKeyboardMarkup([keyboard]) if keyboard else None
 
             formatted_task_text = f"<blockquote>🌀<b><i>{task_text}</i></b></blockquote>"
             message_content = f"{formatted_task_text}\n{status_text}"
+            title_prefix = "🌀"
 
         elif normalized_type in ["dailys", "todos", "completedTodos"]:
-            is_completed = task.get('completed', False)
+            is_completed = task.get("completed", False)
             button_text = "✔️" if is_completed else "✖️"
             action = "down" if is_completed else "up"
             keyboard = [[InlineKeyboardButton(button_text, callback_data=f"{normalized_type}:{action}:{task_id}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
-            if normalized_type == 'dailys':
+            if normalized_type == "dailys":
                 formatted_task_text = f"<blockquote>📅<b><i>{task_text}</i></b></blockquote>"
-            elif normalized_type == 'todos':
+                title_prefix = "📅"
+            elif normalized_type == "todos":
                 formatted_task_text = f"<blockquote>📝<b><i>{task_text}</i></b></blockquote>"
-            else:
+                title_prefix = "📝"
+            else:  # completedTodos
                 formatted_task_text = f"<blockquote>✅<b><i>{task_text}</i></b></blockquote>"
+                title_prefix = "✅"
 
             message_content = f"{formatted_task_text}\n{status_text}"
 
         elif normalized_type == "rewards":
-            value = task.get('value', 0)
+            value = task.get("value", 0)
             keyboard = [[InlineKeyboardButton(f"Buy ({value} Gold)", callback_data=f"rewards:buy:{task_id}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             formatted_task_text = f"<blockquote>💰<b><i>{task_text}</i></b></blockquote>"
             message_content = f"{formatted_task_text}\n{status_text}"
+            title_prefix = "💰"
 
-        results.append(
-            InlineQueryResultArticle(
-                id=task_id,
-                title=task.get('text'),
-                description="Click to send to chat",
-                input_message_content=InputTextMessageContent(
-                    message_text=message_content,
-                    parse_mode='HTML'
-                ),
-                reply_markup=reply_markup
+        title = f"{title_prefix} {task_text}"
+
+        if avatar_doc_id:
+            # Send avatar PNG as document + caption with the task & buttons
+            results.append(
+                InlineQueryResultCachedDocument(
+                    id=f"{normalized_type}_doc_{task_id}",
+                    title=title,
+                    document_file_id=avatar_doc_id,
+                    description=task_text,
+                    caption=message_content,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                )
             )
-        )
+        else:
+            # Fallback: old text-only behaviour
+            results.append(
+                InlineQueryResultArticle(
+                    id=f"{normalized_type}_art_{task_id}",
+                    title=title,
+                    description=task_text,
+                    input_message_content=InputTextMessageContent(
+                        message_text=message_content,
+                        parse_mode="HTML",
+                    ),
+                    reply_markup=reply_markup,
+                )
+            )
 
     await query.answer(results, cache_time=10)
 
@@ -2083,34 +2643,75 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     async def edit_here(new_text: str, markup: InlineKeyboardMarkup | None = None):
         """
         Edit the current message in-place, preserving the current keyboard by default.
-        We only fall back to the inline launcher if there is *no* current keyboard.
+        Works for:
+          - normal messages (query.message exists)
+          - inline messages (query.inline_message_id exists, query.message is None)
         """
-        # Prefer an explicit markup; otherwise keep whatever is currently on the message.
         current_markup = markup
         if current_markup is None and query and query.message:
             current_markup = query.message.reply_markup
-
-        # Absolute last fallback (rare): inline launcher
         if current_markup is None:
             current_markup = build_inline_launcher_kb()
 
-        try:
+        def _is_not_modified(err: Exception) -> bool:
+            return "message is not modified" in str(err).lower()
+
+        async def _edit_caption() -> None:
+            await query.edit_message_caption(
+                caption=new_text,
+                parse_mode="HTML",
+                reply_markup=current_markup,
+            )
+
+        async def _edit_text() -> None:
             await query.edit_message_text(
                 new_text,
                 parse_mode="HTML",
                 reply_markup=current_markup,
                 disable_web_page_preview=True,
             )
-        except BadRequest as e:
-            # If only text didn't change, at least ensure keyboard is what we want.
-            if "message is not modified" in str(e).lower():
+
+        msg = query.message
+
+        # 1) Normal messages: we can reliably detect media vs text
+        if msg is not None:
+            try:
+                if msg.photo or msg.video or msg.animation or msg.document:
+                    await _edit_caption()
+                else:
+                    await _edit_text()
+            except BadRequest as e:
+                if _is_not_modified(e):
+                    try:
+                        await query.edit_message_reply_markup(reply_markup=current_markup)
+                    except Exception:
+                        pass
+                else:
+                    raise
+            return
+
+        # 2) Inline messages: query.message is missing, so we don't know if it's caption or text.
+        # Try caption first (works for cached avatar doc/photo panels), then fall back to text.
+        try:
+            await _edit_caption()
+        except BadRequest as e1:
+            if _is_not_modified(e1):
                 try:
                     await query.edit_message_reply_markup(reply_markup=current_markup)
                 except Exception:
                     pass
-            else:
-                # Re-raise so you can see unexpected issues in logs
-                raise
+                return
+
+            try:
+                await _edit_text()
+            except BadRequest as e2:
+                if _is_not_modified(e2):
+                    try:
+                        await query.edit_message_reply_markup(reply_markup=current_markup)
+                    except Exception:
+                        pass
+                else:
+                    raise
 
     # Whether this callback came from a private chat (useful for pinned status updates)
     chat = update.effective_chat
@@ -2539,9 +3140,7 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    # cron confirm / run / cancel
-    # cron confirm / run / cancel
-    # cron confirm / run / cancel
+
     # cron confirm / run / cancel
     if parts and parts[0] == "cron":
         action = parts[1] if len(parts) > 1 else ""
@@ -2613,42 +3212,40 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                     text = f"<b>❌ Failed to refresh day.</b>\n{_fmt_stats(old_stats)}"
                     await edit_here(text)
 
+            # Drop any cached refresh-day state so the next run starts fresh.
+            context.user_data.pop("cron_meta", None)
             context.user_data["cron_from_inline"] = False
             await query.answer(feedback, show_alert=not ok)
             return
 
         if action == "cancel":
-            if is_inline_refresh:
-                # Inline flow: restore Status + shortcuts and keep HUD in sync.
+            # Close refresh-day UI and return to the inline shortcut menu everywhere.
+            #
+            # NOTE: use edit_here so it works for BOTH text messages and avatar-photo
+            # messages (where the content lives in the caption).
+            try:
+                await edit_here("🎯 Quick Commands:", build_inline_launcher_kb())
+            except Exception:
+                # Last-resort fallback: at least replace the text/caption.
+                try:
+                    await edit_here("❌ Refresh cancelled.")
+                except Exception:
+                    pass
+
+            # Drop any cached refresh-day state so the next open starts fresh.
+            context.user_data.pop("cron_meta", None)
+            context.user_data["cron_from_inline"] = False
+
+            # Best-effort: keep the pinned HUD in the user's private chat in sync.
+            try:
                 current = get_status(user_id, api_key) or {}
                 stats = current.get("stats", {}) or {}
-                text = f"<b>📊 Status</b>\n{_fmt_stats(stats)}"
+                await update_and_pin_status(context, home_chat_id, stats_override=stats)
+            except Exception:
+                pass
 
-                try:
-                    await edit_here(text, build_inline_launcher_kb())  # Status + Inline shortcuts menu
-                except Exception:
-                    pass
-
-                await update_and_pin_status(
-                    context, home_chat_id, stats_override=stats
-                )
-                context.user_data["cron_from_inline"] = False
-            else:
-                # Normal /refresh_day message: keep old behaviour
-                try:
-                    await query.edit_message_text(
-                        "❌ Refresh cancelled.", parse_mode="HTML"
-                    )
-                except Exception:
-                    pass
-
-            # Just show a toast; no extra message body
             await query.answer("❌ Refresh cancelled.", show_alert=False)
             return
-
-
-
-
 
     # quick cmd actions (cmd:status / cmd:buy_potion)
     # quick cmd actions (cmd:status / cmd:buy_potion / cmd:refresh_day)
@@ -2664,6 +3261,15 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             await edit_here(text)
             await update_and_pin_status(context, home_chat_id, stats_override=stats)
             await query.answer("Status shown.", show_alert=False)
+            return
+
+        if len(parts) > 1 and parts[1] == "avatar":
+            # Re-render and send the user's avatar (photo + document) in this chat
+            await avatar_command_handler(update, context)
+            try:
+                await query.answer("Avatar updated.", show_alert=False)
+            except Exception:
+                pass
             return
 
         if len(parts) > 1 and parts[1] == "buy_potion":
@@ -2682,9 +3288,21 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             # 🔹 Case A: plain "cmd:buy_potion" from the inline shortcut menu
             # (the button in build_inline_launcher_kb)
             if len(parts) == 2:
-                # Make the shortcuts message show the fresh Status, just like cmd:status
-                text = f"<b>📊 Status</b>\n{_fmt_stats(new_stats)}"
-                await edit_here(text)
+                # Inline shortcut menu inserted into chats (inline_message_id exists)
+                if query.inline_message_id is not None:
+                    text = "<b>Inline shortcuts</b>\n\n" + _status_block(new_stats)
+                    await edit_here(text, build_inline_launcher_kb())
+                else:
+                    # Private launcher message ("🎯 Quick Commands:") → keep it unchanged.
+                    # Optional: if the message already contains a Status block, refresh it in-place:
+                    if query.message:
+                        orig = query.message.text or query.message.caption or ""
+                        if "<blockquote><b>Status</b>" in orig:
+                            await edit_here(
+                                _replace_status_in_text(orig, _status_block(new_stats)),
+                                query.message.reply_markup,
+                            )
+
 
             # 🔹 Case B: "cmd:buy_potion:<panel_hint>" from a panel footer,
             #            in an INLINE message (habits/dailys/todos/rewards panels)
@@ -2796,7 +3414,8 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                     header = "<b>💰 Rewards</b>"
 
                 # Inline message: update header+status text + keep same keyboard
-                await edit_here("\n".join([header, _status_block(new_stats)]), markup)
+                await _update_panel_text_if_needed(new_stats, markup)
+
 
             # 🔹 Case C: panel footer in a normal chat message
             else:
@@ -2815,108 +3434,73 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
 
-        if len(parts) > 1 and parts[1] == "refresh_day":
-            # Turn the *current inline shortcuts message* into the refresh-day panel,
-            # but only if Habitica says cron is needed.
-            user_id = context.user_data.get("USER_ID")
-            api_key = context.user_data.get("API_KEY")
-            if not user_id or not api_key:
-                # No credentials → just edit the inline message with an info text
-                try:
-                    await query.edit_message_text(
-                        "Use /start to set USER_ID and API_KEY first."
-                    )
-                except Exception:
-                    pass
-                return
-
-            user_data = get_status(user_id, api_key)
-            if not user_data:
-                try:
-                    await query.edit_message_text(
-                        "⚠️ Could not reach Habitica. Please try again."
-                    )
-                except Exception:
-                    pass
-                return
-
-            needs_cron = bool(user_data.get("needsCron", False))
-            if not needs_cron:
-                # Day is already refreshed – keep the shortcuts panel
-                # and just show a small toast.
-                try:
-                    await query.answer(
-                        "✨ Your day is already refreshed — no cron needed right now.",
-                        show_alert=False,
-                    )
-                except Exception:
-                    pass
-                return
-
-            # From this point on we really need cron → build the inline panel.
-            try:
-                await query.answer("Opening refresh-day menu…", show_alert=False)
-            except Exception:
-                pass
-
-            # Cron needed → fetch Dailies
-            dailies = get_tasks(user_id, api_key, "dailys") or []
-            yester_dailies: list[dict] = []
-
-            for task in dailies:
-                is_due = task.get("isDue", False)
-                completed = task.get("completed", False)
-                yester_flag = task.get("yesterDaily", True)  # safe default
-                if is_due and not completed and yester_flag:
-                    yester_dailies.append(task)
-
-            # --- Build metadata for the refresh-day UI -------------------------
-            cron_meta: dict[str, dict] = {}
-            for t in yester_dailies:
-                tid = t.get("id")
-                if not tid:
-                    continue
-                cron_meta[tid] = {
-                    "text": t.get("text", "(no title)"),
-                    "checked": False,
-                }
-
-            context.user_data["cron_meta"] = cron_meta
-            layout_mode = context.user_data.get("cron_layout_mode", "full")
-            context.user_data["cron_layout_mode"] = layout_mode
-
-            # Mark that this refresh-day came from the inline shortcuts
-            context.user_data["cron_from_inline"] = True
-
-            # Build the text (same style as /refresh_day panel)
-            lines: list[str] = []
-            if yester_dailies:
-                lines.append("<b>These Dailies were due yesterday and are still unchecked:</b>")
-                for t in yester_dailies:
-                    text = html.escape(t.get("text", "(no title)"))
-                    lines.append(f"• {text}")
-                lines.append("")
-                lines.append("Tap the buttons below to mark what you actually did yesterday,")
-                lines.append("then press <b>“Refresh day now”</b>.")
-            else:
-                lines.append(
-                    "No unfinished Dailies from yesterday were found.\n"
-                    "You can safely refresh your day now."
-                )
-
-            # Keyboard (✖️/✔️ + Refresh/Cancel + layout toggle)
-            keyboard = build_refresh_day_keyboard(cron_meta, layout_mode)
-
-            # Finally, EDIT the inline shortcuts message itself
-            try:
-                await query.edit_message_text(
-                    "\n".join(lines),
-                    parse_mode="HTML",
-                    reply_markup=keyboard,
-                )
-            except Exception as e:
-                logging.exception("Failed to edit inline message to refresh-day panel: %s", e)
+    if len(parts) > 1 and parts[1] == "refresh_day":
+        # "Refresh day" button – used from panels (/dailys, /habits, /todos, …)
+        # and from the inline shortcut menu.
+        if not user_id or not api_key:
+            await edit_here(
+                "Use /start to set USER_ID and API_KEY first.",
+                build_inline_launcher_kb(),
+            )
+            await query.answer(show_alert=True)
             return
+
+        if debug:
+            logging.info(
+                "Opening refresh-day menu from callback for user %s (inline=%s)",
+                user_id,
+                bool(query.inline_message_id),
+            )
+
+        # Always fetch a fresh list of yesterday’s unfinished Dailies
+        cron_meta = fetch_cron_meta(user_id, api_key)
+        if cron_meta is None:
+            await edit_here(
+                "⚠️ Could not reach Habitica. Please try again.",
+                build_inline_launcher_kb(),
+            )
+            await query.answer(show_alert=True)
+            return
+
+        context.user_data["cron_meta"] = cron_meta
+        layout_mode = context.user_data.get("cron_layout_mode", "full")
+
+        # Remember whether this came from an inline message so cron:run/cancel
+        # knows whether to restore the Status + shortcuts panel afterwards.
+        context.user_data["cron_from_inline"] = bool(query.inline_message_id)
+
+        lines: list[str] = []
+        if cron_meta:
+            lines.append(
+                "<b>These Dailies were due yesterday and are still unchecked:</b>"
+            )
+            for meta in cron_meta.values():
+                text = html.escape(meta.get("text", "(no title)"))
+                lines.append(f"• {text}")
+            lines.append("")
+            lines.append(
+                "Tap the buttons below to mark what you actually did yesterday,"
+            )
+            lines.append("then press <b>“Refresh day now”</b>.")
+        else:
+            lines.append(
+                "No unfinished Dailies from yesterday were found.\n"
+                "You can safely refresh your day now."
+            )
+
+        keyboard = build_refresh_day_keyboard(cron_meta, layout_mode)
+
+        try:
+            # Works for both text and photo+caption messages
+            await edit_here("\n".join(lines), keyboard)
+            await query.answer()
+        except Exception as e:
+            logging.exception(
+                "Failed to edit message to refresh-day panel: %s",
+                e,
+            )
+        return
+
 
     # -------------------------------------------------------------------------
     # Panel refresh (no scoring, just re-sync from Habitica)
@@ -3151,25 +3735,8 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         dailys_markup = build_dailys_panel_keyboard(dailys, layout_mode)
 
-        try:
-            await query.edit_message_text(
-                panel_text,
-                parse_mode="HTML",
-                reply_markup=dailys_markup,
-                disable_web_page_preview=True,
-            )
-        except BadRequest as e:
-            # Text might be unchanged; still refresh the keyboard
-            if "message is not modified" in str(e).lower():
-                try:
-                    await query.edit_message_reply_markup(reply_markup=dailys_markup)
-                except Exception:
-                    pass
-            else:
-                try:
-                    await query.edit_message_reply_markup(reply_markup=dailys_markup)
-                except Exception:
-                    pass
+        # Use the generic helper so this works for both text-only and photo+caption panels
+        await edit_here(panel_text, dailys_markup)
 
         # Keep pinned HUD in sync
         await update_and_pin_status(context, home_chat_id, stats_override=new_stats)
@@ -3179,10 +3746,6 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             show_alert=False,
         )
         return
-
-
-
-
 
     if len(parts) == 3 and parts[0] == "tMenu":
         _, action, task_id = parts
@@ -3435,24 +3998,22 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             layout_mode=layout_mode,
         )
 
-        try:
-            await query.edit_message_text(
-                panel_text,
-                parse_mode="HTML",
-                reply_markup=markup,
-                disable_web_page_preview=True,
-            )
-        except BadRequest as e:
-            if "message is not modified" in str(e).lower():
-                try:
-                    await query.edit_message_reply_markup(reply_markup=markup)
-                except Exception:
-                    pass
-            else:
-                try:
-                    await query.edit_message_reply_markup(reply_markup=markup)
-                except Exception:
-                    pass
+        # ... everything above stays the same up to panel_text = ...
+
+        cfg = PANEL_BEHAVIOUR["habits"]
+        status_html = build_status_block(new_stats)
+        panel_text = build_tasks_panel_text(
+            kind="habits",
+            tasks=habits,
+            status_text=status_html,
+            show_status=cfg["show_status"],
+            show_list=cfg["show_list"],
+            list_first=cfg["list_first"],
+            layout_mode=layout_mode,
+        )
+
+        # ✅ Use the generic helper – it will edit caption for the Habits photo panel
+        await edit_here(panel_text, markup)
 
         await update_and_pin_status(context, home_chat_id, stats_override=new_stats)
 
@@ -3461,6 +4022,7 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             show_alert=False,
         )
         return
+
 
 
     # -------------------------------------------------------------------------
@@ -3672,6 +4234,15 @@ async def update_and_pin_status(
     last_text = context.user_data.get(text_key)
     edit_was_successful = False
 
+    logging.info(
+        "STATUS DEBUG: entering update_and_pin_status for chat %s. "
+        "pinned_id=%s, last_text_len=%s",
+        chat_id,
+        pinned_id,
+        len(last_text) if last_text is not None else None,
+    )
+
+
     # If we *already* have a pinned message AND the text didn't change,
     # skip editing/pinning completely and just clean up the temp messages.
     if pinned_id and last_text == status_text:
@@ -3736,6 +4307,11 @@ async def update_and_pin_status(
         chat_id,
     )
     new_message = await context.bot.send_message(chat_id=chat_id, text=status_text)
+    logging.info(
+        "STATUS DEBUG: sent new status message %s in chat %s, now pinning it.",
+        new_message.message_id,
+        chat_id,
+    )
     try:
         # In private chats this is fine; in groups it may fail if bot has no rights.
         await context.bot.unpin_all_chat_messages(chat_id=chat_id)
@@ -3796,19 +4372,58 @@ def run_cron(user_id: str, api_key: str) -> bool:
 
 
 
+def fetch_cron_meta(user_id: str, api_key: str) -> dict[str, dict[str, object]] | None:
+    """
+    Build the 'cron_meta' dict used by the refresh-day UI.
+
+    Keys are task ids, values are {"text": title, "checked": bool}.
+    Only includes Dailies that Habitica considers candidates for
+    "Record Yesterday's Activity": they were due yesterday and are still
+    incomplete (yesterDaily == True and completed == False).
+    """
+    dailies = get_tasks(user_id, api_key, "dailys")
+    if dailies is None:
+        # Propagate network / API errors to the caller so it can show
+        # a proper error message instead of an empty list.
+        return None
+
+    cron_meta: dict[str, dict[str, object]] = {}
+
+    for task in dailies:
+        # Habitica marks Record-Yesterday-Activity candidates with yesterDaily=True.
+        if not task.get("yesterDaily", False):
+            continue
+        # Already checked off yesterday – nothing to recover.
+        if task.get("completed", False):
+            continue
+
+        tid = task.get("id")
+        if not tid:
+            continue
+
+        cron_meta[tid] = {
+            "text": task.get("text", "(no title)"),
+            "checked": False,
+        }
+
+    return cron_meta
+
+
+
 
 
 async def open_refresh_day_menu_for_chat(
+    update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
 ) -> None:
     """
-    Core logic for building & sending the refresh-day panel.
-
-    Used by both /refresh_day and the inline 'Refresh Day' button.
+    Build and send the refresh-day menu **with avatar** if available.
     """
-    user_id = context.user_data.get("USER_ID")
-    api_key = context.user_data.get("API_KEY")
+    user_data = context.user_data
+    user_id = user_data.get("USER_ID")
+    api_key = user_data.get("API_KEY")
+
     if not user_id or not api_key:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -3816,59 +4431,31 @@ async def open_refresh_day_menu_for_chat(
         )
         return
 
-    user_data = get_status(user_id, api_key)
-    if not user_data:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="⚠️ Could not reach Habitica. Please try again.",
-        )
-        return
+    # Fetch Dailies and build the same panel as the inline cron UI
+    # Fetch Dailies and build the same panel as the inline cron UI.
+    # We rely on Habitica's own `yesterDaily` flag instead of guessing
+    # from `isDue`, so the list matches the official Record Yesterday's
+    # Activity screen.
+    cron_meta = fetch_cron_meta(user_id, api_key) or {}
 
-    needs_cron = bool(user_data.get("needsCron", False))
-
-    if not needs_cron:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="✨ Your day is already refreshed — no cron needed right now.",
-        )
-        return
-
-    dailies = get_tasks(user_id, api_key, "dailys") or []
-    yester_dailies: list[dict] = []
-
-    for task in dailies:
-        is_due = task.get("isDue", False)
-        completed = task.get("completed", False)
-        yester_flag = task.get("yesterDaily", True)  # safe default
-        if is_due and not completed and yester_flag:
-            yester_dailies.append(task)
-
-    # --- Build metadata for the refresh-day UI -----------------------------
-    # One entry per Daily with a "checked" flag that controls the ✖️/✔️ icon.
-    cron_meta: dict[str, dict] = {}
-    for t in yester_dailies:
-        tid = t.get("id")
-        if not tid:
-            continue
-        cron_meta[tid] = {
-            "text": t.get("text", "(no title)"),
-            "checked": False,  # user hasn't said they did it yet
-        }
-
-    # Store metadata + layout mode so yester / yesterLayout can rebuild
     context.user_data["cron_meta"] = cron_meta
     layout_mode = context.user_data.get("cron_layout_mode", "full")
     context.user_data["cron_layout_mode"] = layout_mode
+    context.user_data["cron_from_inline"] = False  # comes from command
 
-    # --- Text --------------------------------------------------------------
+    # Build panel lines (same style as inline branch)
     lines: list[str] = []
-    if yester_dailies:
-        lines.append("<b>These Dailies were due yesterday and are still unchecked:</b>")
-        for t in yester_dailies:
-            text = html.escape(t.get("text", "(no title)"))
+    if cron_meta:
+        lines.append(
+            "<b>These Dailies were due yesterday and are still unchecked:</b>"
+        )
+        for meta in cron_meta.values():
+            text = html.escape(meta.get("text", "(no title)"))
             lines.append(f"• {text}")
         lines.append("")
-        lines.append("Tap the buttons below to mark what you actually did yesterday,")
+        lines.append(
+            "Tap the buttons below to mark what you actually did yesterday,"
+        )
         lines.append("then press <b>“Refresh day now”</b>.")
     else:
         lines.append(
@@ -3876,15 +4463,44 @@ async def open_refresh_day_menu_for_chat(
             "You can safely refresh your day now."
         )
 
-    # --- Keyboard (✖️/✔️ + Refresh/Cancel + layout toggle) ---------------
+    panel_text = "\n".join(lines)
     keyboard = build_refresh_day_keyboard(cron_meta, layout_mode)
 
+    # --- Try to send with avatar PNG ------------------------------------------
+    try:
+        png_path = await ensure_avatar_png(update, context, force_refresh=False)
+    except Exception as e:
+        logging.warning("ensure_avatar_png failed for refresh-day menu: %s", e)
+        png_path = context.user_data.get("AVATAR_PNG_PATH")
+
+    if png_path and os.path.exists(png_path):
+        try:
+            with open(png_path, "rb") as img:
+                msg = await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=img,
+                    caption=panel_text,
+                    parse_mode="HTML",
+                    reply_markup=keyboard,
+                )
+            if msg.photo:
+                context.user_data["AVATAR_FILE_ID"] = msg.photo[-1].file_id
+            context.user_data["AVATAR_PNG_PATH"] = png_path
+            return
+        except Exception as e:
+            logging.warning(
+                "Failed to send refresh-day menu with avatar, falling back to text: %s",
+                e,
+            )
+
+    # Fallback: text-only refresh-day menu
     await context.bot.send_message(
         chat_id=chat_id,
-        text="\n".join(lines),
+        text=panel_text,
         parse_mode="HTML",
         reply_markup=keyboard,
     )
+
 
 
 async def refresh_day_command_handler(
@@ -3917,7 +4533,8 @@ async def refresh_day_command_handler(
         )
         target_chat_id = user.id
 
-    await open_refresh_day_menu_for_chat(context, target_chat_id)
+    await open_refresh_day_menu_for_chat(update, context, target_chat_id)
+
 
 
 
@@ -3956,12 +4573,13 @@ async def show_dailys_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Keyboard (buttons) – reuse your panel keyboard helper
     keyboard = build_dailys_panel_keyboard(dailys, layout_mode)
 
-    await update.message.reply_text(
-        panel_text,
-        parse_mode="HTML",
-        reply_markup=keyboard,
+    # NEW: send as avatar+caption panel (like /habits)
+    await send_panel_with_saved_avatar(
+        update=update,
+        context=context,
+        panel_text=panel_text,
+        keyboard=keyboard,
     )
-
 
 
 
@@ -3987,7 +4605,7 @@ async def show_todos_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Text: use global behaviour config for "todos"
     cfg = PANEL_BEHAVIOUR["todos"]
-    text = build_tasks_panel_text(
+    panel_text = build_tasks_panel_text(
         kind="todos",
         tasks=todos,
         status_text=status_html,
@@ -4026,10 +4644,12 @@ async def show_todos_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = InlineKeyboardMarkup(rows)
 
-    await update.message.reply_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=keyboard,
+    # NEW: send as avatar+caption panel (like /habits)
+    await send_panel_with_saved_avatar(
+        update=update,
+        context=context,
+        panel_text=panel_text,
+        keyboard=keyboard,
     )
 
 
@@ -4154,8 +4774,9 @@ async def add_todo_difficulty_chosen(update: Update, context: ContextTypes.DEFAU
 
 
 
+
 async def show_completed_todos_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show recently completed Todos as a panel with buttons to un-complete them."""
+    """Show completed Todos as one big button panel with layout toggle."""
     user_id = context.user_data.get("USER_ID")
     api_key = context.user_data.get("API_KEY")
     if not user_id or not api_key:
@@ -4164,7 +4785,7 @@ async def show_completed_todos_menu(update: Update, context: ContextTypes.DEFAUL
 
     completed = get_tasks(user_id, api_key, "completedTodos") or []
     if not completed:
-        await update.message.reply_text("✅ You have no recently completed Todos.")
+        await update.message.reply_text("✅ You have no completed Todos.")
         return
 
     layout_mode = context.user_data.get("c_menu_layout", "full")
@@ -4213,12 +4834,13 @@ async def show_completed_todos_menu(update: Update, context: ContextTypes.DEFAUL
     append_standard_footer(rows, "completedTodos", layout_mode, include_potion=True)
     keyboard = InlineKeyboardMarkup(rows)
 
-    await update.message.reply_text(
-        panel_text,
-        parse_mode="HTML",
-        reply_markup=keyboard,
+    # NEW: send avatar + caption instead of a plain text message
+    await send_panel_with_saved_avatar(
+        update=update,
+        context=context,
+        panel_text=panel_text,
+        keyboard=keyboard,
     )
-
 
 
 async def show_rewards_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4276,18 +4898,19 @@ async def show_rewards_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     append_standard_footer(rows, "rewards", layout_mode, include_potion=True)
     keyboard = InlineKeyboardMarkup(rows)
 
-    await update.message.reply_text(
-        panel_text,
-        parse_mode="HTML",
-        reply_markup=keyboard,
+    # NEW: send avatar + caption instead of a plain text message
+    await send_panel_with_saved_avatar(
+        update=update,
+        context=context,
+        panel_text=panel_text,
+        keyboard=keyboard,
     )
 
 
 
 
-
 async def show_habits_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show all Habits as one big button panel."""
+    """Show all Habits as one big button panel (with avatar if available)."""
     user_id = context.user_data.get("USER_ID")
     api_key = context.user_data.get("API_KEY")
     if not user_id or not api_key:
@@ -4299,17 +4922,18 @@ async def show_habits_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🌀 You have no Habits.")
         return
 
-    # No layout toggle for habits yet, treat as "full" (short header)
+    # Habits panel uses a fixed "full" layout
     layout_mode = "full"
 
-    # Fresh status (for pinned status & optional panel text)
+    # Fresh status (for top-of-panel status block)
     status_data = get_status(user_id, api_key) or {}
     stats = status_data.get("stats", {}) or {}
     status_html = build_status_block(stats)
 
-    # Use shared behaviour config
+    # Shared behaviour config
     cfg = PANEL_BEHAVIOUR["habits"]
 
+    # Build the text that will become the *caption* of the photo
     panel_text = build_tasks_panel_text(
         kind="habits",
         tasks=habits,
@@ -4320,47 +4944,53 @@ async def show_habits_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         layout_mode=layout_mode,
     )
 
-    # Build the habits keyboard (same as before)
+    # Build +/- buttons for each habit, plus the standard footer
     rows: list[list[InlineKeyboardButton]] = []
     MAX_LABEL_LEN = 18
 
     for h in habits:
         full_text = h.get("text", "(no title)")
-        short = full_text if len(full_text) <= MAX_LABEL_LEN else full_text[:MAX_LABEL_LEN - 1] + "…"
+        short = (
+            full_text
+            if len(full_text) <= MAX_LABEL_LEN
+            else full_text[:MAX_LABEL_LEN - 1] + "…"
+        )
 
+        up_flag = bool(h.get("up", False))
+        down_flag = bool(h.get("down", False))
         counter_up = int(h.get("counterUp", 0))
         counter_down = int(h.get("counterDown", 0))
-        up = bool(h.get("up", False))
-        down = bool(h.get("down", False))
-        tid = h.get("id")
-        if not tid:
+        hid = h.get("id")
+        if not hid:
             continue
 
         row: list[InlineKeyboardButton] = []
-        if down:
+        if down_flag:
             row.append(
                 InlineKeyboardButton(
                     f"➖({counter_down}) {short}",
-                    callback_data=f"hMenu:down:{tid}",
+                    callback_data=f"hMenu:down:{hid}",
                 )
             )
-        if up:
+        if up_flag:
             row.append(
                 InlineKeyboardButton(
                     f"➕({counter_up}) {short}",
-                    callback_data=f"hMenu:up:{tid}",
+                    callback_data=f"hMenu:up:{hid}",
                 )
             )
         if row:
             rows.append(row)
 
-    append_standard_footer(rows, "habits", layout_mode=layout_mode, include_potion=True)
-    keyboard = InlineKeyboardMarkup(rows)
+    append_standard_footer(rows, "habits", layout_mode=layout_mode)
+    keyboard = InlineKeyboardMarkup(rows) if rows else None
 
-    await update.message.reply_text(
-        panel_text,
-        parse_mode="HTML",
-        reply_markup=keyboard,
+    # 🔥 Key part: one single message – avatar photo (if cached) + caption + buttons
+    await send_panel_with_saved_avatar(
+        update=update,
+        context=context,
+        panel_text=panel_text,
+        keyboard=keyboard,
     )
 
 
@@ -4455,7 +5085,7 @@ def build_application(*, register_commands: bool = False) -> Application:
 
     # Reply-keyboard buttons -> route to your existing handlers
     RK_BUTTONS_PATTERN = (
-        r"^(🔎 Inline Menu|🌀 Habits|📅 Dailys|📝 Todos|✅ Completed Todos|💰 Rewards|📊 Status|🧪 Buy Potion|🔄 Refresh Day|🔁 Menu)$"
+        r"^(🔎 Inline Menu|🌀 Habits|📅 Dailys|📝 Todos|✅ Completed Todos|💰 Rewards|📊 Status|🎭 Avatar|🧪 Buy Potion|🔄 Refresh Day|🔁 Menu)$"
     )
     app.add_handler(
         MessageHandler(filters.Regex(RK_BUTTONS_PATTERN), handle_reply_keyboard)
@@ -4483,6 +5113,8 @@ def build_application(*, register_commands: bool = False) -> Application:
     app.add_handler(CommandHandler("debug", debug_commands))
     app.add_handler(CommandHandler("refresh_day", refresh_day_command_handler))
     app.add_handler(CommandHandler("sync_commands", sync_commands_command_handler))
+    app.add_handler(CommandHandler("avatar", avatar_command_handler))
+
 
     # Inline picker
     app.add_handler(
