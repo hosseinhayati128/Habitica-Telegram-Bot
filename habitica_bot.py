@@ -7,6 +7,8 @@ import shutil
 from pathlib import Path
 
 
+from typing import Any, Callable, Awaitable, Optional
+
 import asyncio
 import html
 import logging
@@ -913,13 +915,16 @@ async def show_rk_if_needed(
         # We already sent RK for this chat (and haven't removed it).
         return False
 
-    await context.bot.send_message(
+    await topic_send(
+        update,
+        context.bot.send_message,
         chat_id=update.effective_chat.id,
         text=text,
         reply_markup=RK,
         disable_notification=True,
         disable_web_page_preview=True,
     )
+
     context.chat_data["rk_active"] = True
     return True
 
@@ -951,7 +956,9 @@ async def send_inline_launcher(
     if png_path and os.path.exists(png_path):
         try:
             with open(png_path, "rb") as img:
-                msg = await context.bot.send_photo(
+                msg = await topic_send(
+                    update,
+                    context.bot.send_photo,
                     chat_id=chat_id,
                     photo=img,
                     caption="🎯 Quick Commands:",
@@ -968,7 +975,9 @@ async def send_inline_launcher(
             )
 
     # Fallback: text-only
-    await context.bot.send_message(
+    await topic_send(
+        update,
+        context.bot.send_message,
         chat_id=chat_id,
         text="🎯 Quick Commands:",
         reply_markup=kb,
@@ -1357,7 +1366,9 @@ async def send_avatar_photo(
     try:
         # 1) Send as photo (normal /avatar behaviour)
         with open(png_path, "rb") as img:
-            photo_msg = await context.bot.send_photo(
+            photo_msg = await topic_send(
+                update,
+                context.bot.send_photo,
                 chat_id=chat_id,
                 photo=img,
                 caption=caption,
@@ -1369,7 +1380,9 @@ async def send_avatar_photo(
         # 2) Also send as document (quietly) to get a document_file_id for inline cached doc
         try:
             with open(png_path, "rb") as doc_fp:
-                doc_msg = await context.bot.send_document(
+                doc_msg = await topic_send(
+                    update,
+                    context.bot.send_document,
                     chat_id=chat_id,
                     document=doc_fp,
                     filename=os.path.basename(png_path),
@@ -1420,7 +1433,9 @@ async def send_panel_with_saved_avatar(
     if png_path and os.path.exists(png_path):
         try:
             with open(png_path, "rb") as img:
-                msg = await context.bot.send_photo(
+                msg = await topic_send(
+                    update,
+                    context.bot.send_photo,
                     chat_id=chat_id,
                     photo=img,
                     caption=panel_text,
@@ -1439,7 +1454,9 @@ async def send_panel_with_saved_avatar(
             )
 
     # Fallback: no cached avatar => just send the text panel as before
-    await context.bot.send_message(
+    await topic_send(
+        update,
+        context.bot.send_message,
         chat_id=chat_id,
         text=panel_text,
         parse_mode="HTML",
@@ -2297,9 +2314,7 @@ async def format_and_send_interactive_tasks(update: Update, context: ContextType
     chat_id = update.effective_chat.id
 
     # Group tasks by type for potential future summaries
-    task_groups = {
-        'habit': [], 'daily': [], 'todo': [], 'reward': []
-    }
+    task_groups = {'habit': [], 'daily': [], 'todo': [], 'reward': []}
     for task in tasks:
         task_groups.get(task.get('type'), []).append(task)
 
@@ -2309,59 +2324,129 @@ async def format_and_send_interactive_tasks(update: Update, context: ContextType
 
     # Send other tasks
     for task_type in ['daily', 'todo', 'reward']:
-        if task_groups[task_type]:
-            for task in task_groups[task_type]:
-                task_text = html.escape(task.get('text', '(no title)'))
-                if task_type == "daily":
-                    task_text = f"📅 <b><i>{task_text}</i></b>"
-                    api_type = "dailys"
-                elif task_type == "todo":
-                    task_text = f"📝 <b><i>{task_text}</i></b>"
-                    api_type = "todos"
-                elif task_type == "reward":
-                    task_text = f"💰 <b><i>{task_text}</i></b>"
-                    api_type = "rewards"
+        if not task_groups[task_type]:
+            continue
 
-                task_id = task.get('id')
-                is_completed = task.get('completed', False)
+        for task in task_groups[task_type]:
+            task_text = html.escape(task.get('text', '(no title)'))
 
-                # Determine button text and action
-                if is_completed:
-                    button_text = "✔️"
-                    action = "down"  # Clicking to un-complete
-                else:
-                    button_text = "✖️"
-                    action = "up"  # Clicking to complete
+            if task_type == "daily":
+                task_text = f"📅 <b><i>{task_text}</i></b>"
+                api_type = "dailys"
+            elif task_type == "todo":
+                task_text = f"📝 <b><i>{task_text}</i></b>"
+                api_type = "todos"
+            else:  # reward
+                task_text = f"💰 <b><i>{task_text}</i></b>"
+                api_type = "rewards"
 
-                # Rewards are not scoreable, so no button
-                if task_type == 'reward':
-                    reply_markup = None
-                else:
-                    # FIX: Include the task type in the callback data
-                    keyboard = [[InlineKeyboardButton(button_text, callback_data=f"{api_type}:{action}:{task_id}")]]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=task_text,
-                    reply_markup=reply_markup,
-                    parse_mode='HTML'
-                )
+            task_id = task.get('id')
+            is_completed = task.get('completed', False)
+
+            # Determine button text and action
+            if is_completed:
+                button_text = "✔️"
+                action = "down"  # Clicking to un-complete
+            else:
+                button_text = "✖️"
+                action = "up"  # Clicking to complete
+
+            # Rewards are not scoreable, so no button
+            if task_type == 'reward':
+                reply_markup = None
+            else:
+                keyboard = [[InlineKeyboardButton(button_text, callback_data=f"{api_type}:{action}:{task_id}")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await topic_send(
+                update,
+                context.bot.send_message,
+                chat_id=chat_id,
+                text=task_text,
+                reply_markup=reply_markup,
+                parse_mode='HTML',
+            )
+
+
+
+
+def _topic_thread_id(update: "Update") -> Optional[int]:
+    """
+    Return the forum topic thread id for this update, or None if not in a topic.
+
+    IMPORTANT: We skip thread_id==1 (General topic). For General, omit message_thread_id.
+    """
+    msg = update.effective_message
+    if not msg:
+        return None
+
+    # Only treat message_thread_id as a forum-topic id if this is a topic message
+    if not getattr(msg, "is_topic_message", False):
+        return None
+
+    tid = getattr(msg, "message_thread_id", None)
+    if not tid:
+        return None
+
+    # General topic is special; sending with message_thread_id=1 can error.
+    if tid == 1:
+        return None
+
+    return tid
+
+
+async def topic_send(
+    update: "Update",
+    send_func: Callable[..., Awaitable[Any]],
+    /,
+    *args,
+    **kwargs,
+):
+    """
+    Wrapper around bot.send_* methods that keeps the response inside the same forum topic.
+    Only injects message_thread_id when sending to the same chat as the update.
+    """
+    tid = _topic_thread_id(update)
+
+    # Only inject if caller is sending to the current chat (avoid DMs, other chats, etc.)
+    chat_id = kwargs.get("chat_id")
+    eff_chat = update.effective_chat
+    if tid is not None and eff_chat is not None and chat_id == eff_chat.id:
+        kwargs.setdefault("message_thread_id", tid)
+
+    return await send_func(*args, **kwargs)
+
+
+
 
 
 async def format_and_send_habits(update: Update, context: ContextTypes.DEFAULT_TYPE, habits: list):
     """Sends a summary and then individual interactive messages for each habit."""
     chat_id = update.effective_chat.id
+
     total_positive = sum(h.get('counterUp', 0) for h in habits)
     total_negative = sum(h.get('counterDown', 0) for h in habits)
 
-    # 1. Send the summary message
-    summary_text = f"<b>📊 Habit Summary</b>\n➕ <code>Total Positive: {total_positive}</code> | ➖ <code>Total Negative: {total_negative}</code>"
-    await context.bot.send_message(chat_id=chat_id, text=summary_text, parse_mode='HTML')
+    # 1) Send the summary message
+    summary_text = (
+        f"<b>📊 Habit Summary</b>\n"
+        f"➕ <code>Total Positive: {total_positive}</code> | "
+        f"➖ <code>Total Negative: {total_negative}</code>"
+    )
 
-    # 2. Send a message for each habit with its keyboard
+    await topic_send(
+        update,
+        context.bot.send_message,
+        chat_id=chat_id,
+        text=summary_text,
+        parse_mode='HTML',
+    )
+
+    # 2) Send a message for each habit with its keyboard
     for task in habits:
         task_text = html.escape(task.get('text', '(no title)'))
         task_text = f"🌀 <b><i>{task_text}</i></b>"
+
         task_id = task.get('id')
         up = task.get('up', False)
         down = task.get('down', False)
@@ -2369,22 +2454,31 @@ async def format_and_send_habits(update: Update, context: ContextTypes.DEFAULT_T
         counter_down = task.get('counterDown', 0)
 
         keyboard = []
-        # --- KEY FIX: Add "habits:" to the callback data to match the handler's expectation ---
         if up:
             keyboard.append(
-                InlineKeyboardButton(f"➕ {counter_up}", callback_data=f"habits:up:{task_id}:{counter_up}:{up}:{down}"))
+                InlineKeyboardButton(
+                    f"➕ {counter_up}",
+                    callback_data=f"habits:up:{task_id}:{counter_up}:{up}:{down}"
+                )
+            )
         if down:
             keyboard.append(
-                InlineKeyboardButton(f"➖ {counter_down}", callback_data=f"habits:down:{task_id}:{counter_down}:{up}:{down}"))
+                InlineKeyboardButton(
+                    f"➖ {counter_down}",
+                    callback_data=f"habits:down:{task_id}:{counter_down}:{up}:{down}"
+                )
+            )
 
         reply_markup = InlineKeyboardMarkup([keyboard]) if keyboard else None
-        await context.bot.send_message(
+
+        await topic_send(
+            update,
+            context.bot.send_message,
             chat_id=chat_id,
             text=task_text,
             reply_markup=reply_markup,
-            parse_mode='HTML'
+            parse_mode='HTML',
         )
-
 
 def extract_stats_from_score_response(score_data: Optional[dict]) -> dict:
     """
@@ -4425,7 +4519,9 @@ async def open_refresh_day_menu_for_chat(
     api_key = user_data.get("API_KEY")
 
     if not user_id or not api_key:
-        await context.bot.send_message(
+        await topic_send(
+            update,
+            context.bot.send_message,
             chat_id=chat_id,
             text="Use /start to set USER_ID and API_KEY first.",
         )
@@ -4476,7 +4572,9 @@ async def open_refresh_day_menu_for_chat(
     if png_path and os.path.exists(png_path):
         try:
             with open(png_path, "rb") as img:
-                msg = await context.bot.send_photo(
+                msg = await topic_send(
+                    update,
+                    context.bot.send_photo,
                     chat_id=chat_id,
                     photo=img,
                     caption=panel_text,
@@ -4494,7 +4592,9 @@ async def open_refresh_day_menu_for_chat(
             )
 
     # Fallback: text-only refresh-day menu
-    await context.bot.send_message(
+    await topic_send(
+        update,
+        context.bot.send_message,
         chat_id=chat_id,
         text=panel_text,
         parse_mode="HTML",
@@ -4523,8 +4623,10 @@ async def refresh_day_command_handler(
     if chat.type == "private":
         target_chat_id = chat.id
     else:
-        # Tell the user and open the menu in their private chat
-        await context.bot.send_message(
+        # Tell the user (IN THE SAME TOPIC) and open the menu in their private chat
+        await topic_send(
+            update,
+            context.bot.send_message,
             chat_id=chat.id,
             text=(
                 "The refresh-day menu only opens in our private chat. "
