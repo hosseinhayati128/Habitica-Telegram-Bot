@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import shutil
 from pathlib import Path
+from io import BytesIO
 
 
 from typing import Any, Callable, Awaitable, Optional
@@ -15,6 +16,10 @@ import logging
 import os
 
 import shutil
+
+from datetime import datetime, timedelta, timezone, time as dtime
+import time as time_mod
+
 
 
 import httpx
@@ -66,6 +71,7 @@ from Habitica_API import (
     get_status,
     get_task_by_id,
     get_tasks,
+
 )
 
 import json
@@ -132,6 +138,26 @@ CHOOSING_ACCOUNT = "CHOOSING_ACCOUNT"   # use a string to avoid collisions
 
 persistence = PicklePersistence(filepath="botdata.pkl")
 
+
+# --- Reminder / notification user_data keys ---
+UD_NOTIFY_CHAT_ID = "notify_chat_id"
+UD_NOTIFY_THREAD_ID = "notify_thread_id"
+UD_REMINDERS_ENABLED = "reminders_enabled"
+UD_REMINDER_SHOW_STATUS = "reminder_show_status"
+# --- Reply-keyboard button labels ---
+RK_BTN_REMINDER_SETTINGS = "⏰ Reminder Settings"
+RK_BTN_REMINDER_STATUS_BASE = "🧾 Status"
+RK_BTN_REMINDER_NOTIFY_HERE = "🔔 Notify Here"
+RK_BTN_REMINDER_BACK = "⬅️ Back"
+
+
+UD_TZ_OFFSET = "tz_offset"              # Habitica preferences.timezoneOffset (minutes)
+UD_TZ_OFFSET_UPDATED_AT = "tz_offset_updated_at"
+
+UD_SENT_REMINDERS = "sent_reminders"    # dict: key -> unix_ts (for de-dupe)
+
+
+
 CATEGORY, PHOTO, DESCRIPTION = range(3)
 USER_ID, API_KEY, STATUS = range(3)
 
@@ -144,7 +170,7 @@ RK = ReplyKeyboardMarkup(
         [KeyboardButton("🔎 Inline Menu")],
         [KeyboardButton("🌀 Habits"), KeyboardButton("📅 Dailys"),
          KeyboardButton("📝 Todos"), KeyboardButton("💰 Rewards")],
-        [KeyboardButton("➕ New Todo")],
+        [KeyboardButton("➕ New Todo"), KeyboardButton(RK_BTN_REMINDER_SETTINGS)],
         [KeyboardButton("📊 Status"), KeyboardButton("🎭 Avatar"),
          KeyboardButton("🧪 Buy Potion")],
         [KeyboardButton("🔄 Refresh Day")],
@@ -158,6 +184,21 @@ RK = ReplyKeyboardMarkup(
 
 
 
+def build_reminder_settings_rk(user_data: dict) -> ReplyKeyboardMarkup:
+    """Build the Reminder settings reply keyboard for the current user."""
+    show_status = bool(user_data.get(UD_REMINDER_SHOW_STATUS, False))
+    status_label = RK_BTN_REMINDER_STATUS_BASE + (" ✔️" if show_status else "")
+
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(status_label)],
+            [KeyboardButton(RK_BTN_REMINDER_NOTIFY_HERE)],
+            [KeyboardButton(RK_BTN_REMINDER_BACK)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        one_time_keyboard=False,
+    )
 
 
 
@@ -222,7 +263,7 @@ def build_cron_keyboard_for_user(
 
     # Row: Refresh + Cancel
     rows.append([
-        InlineKeyboardButton("🔄 Refresh", callback_data="cron:run"),
+        InlineKeyboardButton("🔄 Sync", callback_data="cron:run"),
         InlineKeyboardButton("❌ Cancel",  callback_data="cron:cancel"),
     ])
 
@@ -329,7 +370,7 @@ def build_actions_footer(
     - Otherwise: all buttons stay in one row (current behaviour).
     """
     refresh_button = InlineKeyboardButton(
-        "🔄 Refresh",
+        "🔄 Sync",
         callback_data=f"panelRefresh:{kind}",
     )
     refresh_day_button = InlineKeyboardButton(
@@ -821,6 +862,47 @@ def build_refresh_day_keyboard(
 async def handle_reply_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
+    # --- Reminder settings (Reply Keyboard) ---
+    if text == RK_BTN_REMINDER_SETTINGS:
+        await topic_send(
+            update,
+            context.bot.send_message,
+            chat_id=update.effective_chat.id,
+            text="⏰ Reminder settings:",
+            reply_markup=build_reminder_settings_rk(context.user_data),
+            disable_notification=True,
+            disable_web_page_preview=True,
+        )
+        context.chat_data["rk_active"] = True
+        return
+
+    if text == RK_BTN_REMINDER_NOTIFY_HERE:
+        await notify_here_command_handler(update, context)
+        return
+
+    if text in (RK_BTN_REMINDER_STATUS_BASE, f"{RK_BTN_REMINDER_STATUS_BASE} ✔️"):
+        cur = bool(context.user_data.get(UD_REMINDER_SHOW_STATUS, False))
+        context.user_data[UD_REMINDER_SHOW_STATUS] = not cur
+
+        msg = f"✅ Status in reminders: {'ON' if not cur else 'OFF'}"
+        await topic_send(
+            update,
+            context.bot.send_message,
+            chat_id=update.effective_chat.id,
+            text=msg,
+            reply_markup=build_reminder_settings_rk(context.user_data),
+            disable_notification=True,
+            disable_web_page_preview=True,
+        )
+        context.chat_data["rk_active"] = True
+        return
+
+    if text == RK_BTN_REMINDER_BACK:
+        # Force swap back to the default reply keyboard
+        await show_rk_if_needed(update, context, text="⬅️ Back to menu.", force=True)
+        return
+
+
     if text == "🌀 Habits":
         return await habits_command_handler(update, context)
 
@@ -1043,6 +1125,8 @@ async def _register_commands(app: Application) -> None:
         BotCommand("task_list", "List tasks (short/long)"),
         BotCommand("rewards", "Show rewards"),
         BotCommand("refresh_day", "Review yesterday’s dailies and refresh your day"),
+        BotCommand("notify_here", "Send task reminders in this chat/topic"),
+        BotCommand("reminder_status", "Status block in reminders (on/off)"),
         BotCommand("cancel", "Cancel current action"),
         # Optional: expose /sync_commands itself in menu
         BotCommand("sync_commands", "Re-sync command list with Telegram"),
@@ -1196,9 +1280,110 @@ async def get_user_id_command_handler(update: Update, context: ContextTypes.DEFA
     )
     return API_KEY
 
+
+
+def ensure_avatar_png_no_update(
+    *,
+    habitica_user_id: str,
+    habitica_api_key: str,
+    user_data: dict,
+    force_refresh: bool = False,
+    preloaded_user_json: dict | None = None,
+) -> str | None:
+    """
+    A tick-safe version of ensure_avatar_png:
+    - No Update / no Context
+    - Uses your existing Node renderer (render_avatar_from_json.js)
+    - Caches AVATAR_PNG_PATH in user_data
+    """
+    existing_path = user_data.get("AVATAR_PNG_PATH")
+    if not force_refresh and existing_path and os.path.exists(existing_path):
+        return existing_path
+
+    # 1) Fetch user JSON from Habitica (or reuse what the tick already fetched)
+    user_json = preloaded_user_json or get_status(habitica_user_id, habitica_api_key)
+    if not user_json:
+        logging.warning("ensure_avatar_png_no_update: could not fetch Habitica user JSON")
+        return None
+
+    # 2) Pick a stable, safe filename from Habitica username/profile
+    username = ""
+    auth = user_json.get("auth") or {}
+    local_auth = auth.get("local") or {}
+    username = local_auth.get("username") or ""
+
+    if not username:
+        profile = user_json.get("profile") or {}
+        username = profile.get("name") or ""
+
+    if not username:
+        username = "habitica_user"
+
+    safe_username = "".join(
+        c if c.isalnum() or c in ("-", "_") else "_"
+        for c in username.strip()
+    ) or "habitica_user"
+
+    # 3) Render avatar via Node into temp PNG, copy to Avatar/<username>.png
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    node_script = os.path.join(base_dir, "render_avatar_from_json.js")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        user_json_path = os.path.join(tmpdir, "user.json")
+        tmp_png_path = os.path.join(tmpdir, "avatar.png")
+
+        with open(user_json_path, "w", encoding="utf-8") as f:
+            json.dump(user_json, f)
+
+        try:
+            proc = subprocess.run(
+                [NODE_BIN, node_script, user_json_path, tmp_png_path],
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            logging.error("Node.js binary not found. Tried NODE_BIN=%r", NODE_BIN)
+            return None
+
+        if proc.returncode != 0 or not os.path.exists(tmp_png_path):
+            logging.error(
+                "Avatar render failed (code=%s)\nSTDOUT:\n%s\nSTDERR:\n%s",
+                proc.returncode,
+                proc.stdout,
+                proc.stderr,
+            )
+            return None
+
+        avatar_dir = os.path.join(base_dir, "Avatar")
+        os.makedirs(avatar_dir, exist_ok=True)
+
+        final_png_path = os.path.join(avatar_dir, f"{safe_username}.png")
+        with open(tmp_png_path, "rb") as src, open(final_png_path, "wb") as dst:
+            dst.write(src.read())
+
+    user_data["AVATAR_PNG_PATH"] = final_png_path
+    return final_png_path
+
+
+
+
+
 async def get_API_key_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     api_key = update.effective_message.text.strip()
     context.user_data["API_KEY"] = api_key
+
+    # Default notifications: DM the user (private chat id == user id)
+    context.user_data.setdefault(UD_NOTIFY_CHAT_ID, update.effective_user.id)
+    context.user_data.setdefault(UD_NOTIFY_THREAD_ID, None)
+
+    # Reminders on by default
+    context.user_data.setdefault(UD_REMINDERS_ENABLED, True)
+
+    context.user_data.setdefault(UD_REMINDER_SHOW_STATUS, False)
+
+    # De-dupe store
+    context.user_data.setdefault(UD_SENT_REMINDERS, {})
+
     await send_inline_launcher(update, context)
     await show_rk_if_needed(update, context)
     return ConversationHandler.END
@@ -1226,6 +1411,26 @@ async def refresh_menu_command_handler(update: Update, context: ContextTypes.DEF
         force=True,
     )
 
+
+
+
+
+async def notify_here_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Save the current chat + topic (message_thread_id) as the destination
+    for reminder notifications for THIS user.
+    """
+    context.user_data[UD_NOTIFY_CHAT_ID] = update.effective_chat.id
+    context.user_data[UD_NOTIFY_THREAD_ID] = getattr(update.effective_message, "message_thread_id", None)
+
+    # Use topic_send so the confirmation message stays in the same topic
+    await topic_send(
+        update,
+        context.bot.send_message,
+        chat_id=update.effective_chat.id,
+        text="✅ Got it. I’ll send your reminders *here* (in this chat/topic).",
+        parse_mode="Markdown",
+    )
 
 
 
@@ -2087,13 +2292,13 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             if normalized_type == "dailys":
-                formatted_task_text = f"<blockquote>📅<b><i>{task_text}</i></b></blockquote>"
+                formatted_task_text = f"<blockquote>📅 <b><i>{task_text}</i></b></blockquote>"
                 title_prefix = "📅"
             elif normalized_type == "todos":
-                formatted_task_text = f"<blockquote>📝<b><i>{task_text}</i></b></blockquote>"
+                formatted_task_text = f"<blockquote>📝 <b><i>{task_text}</i></b></blockquote>"
                 title_prefix = "📝"
             else:  # completedTodos
-                formatted_task_text = f"<blockquote>✅<b><i>{task_text}</i></b></blockquote>"
+                formatted_task_text = f"<blockquote>✅ <b><i>{task_text}</i></b></blockquote>"
                 title_prefix = "✅"
 
             message_content = f"{formatted_task_text}\n{status_text}"
@@ -2103,7 +2308,7 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             keyboard = [[InlineKeyboardButton(f"Buy ({value} Gold)", callback_data=f"rewards:buy:{task_id}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
-            formatted_task_text = f"<blockquote>💰<b><i>{task_text}</i></b></blockquote>"
+            formatted_task_text = f"<blockquote>💰 <b><i>{task_text}</i></b></blockquote>"
             message_content = f"{formatted_task_text}\n{status_text}"
             title_prefix = "💰"
 
@@ -4198,7 +4403,7 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             new_action = "down" if is_completed else "up"
             reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton(btn, callback_data=f"{ttype}:{new_action}:{task_id}")]])
 
-            icon = "📅" if ttype == "dailys" else ("📝" if ttype == "todos" else "✅")
+            icon = "📅 " if ttype == "dailys" else ("📝 " if ttype == "todos" else "✅ ")
             task_text = html.escape(updated_task.get('text', '(no title)'))
             body = (
                 f"<blockquote>{icon}<b><i>{task_text}</i></b></blockquote>\n"
@@ -4603,6 +4808,48 @@ async def open_refresh_day_menu_for_chat(
 
 
 
+async def reminder_status_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Control whether reminder messages include the Status block in the caption.
+
+    Usage:
+      /reminder_status on
+      /reminder_status off
+      /reminder_status toggle
+    """
+    arg = (context.args[0].lower().strip() if getattr(context, "args", None) else "")
+
+    if arg in ("on", "yes", "true", "1", "enable", "enabled"):
+        context.user_data[UD_REMINDER_SHOW_STATUS] = True
+        msg = "✅ Status in reminders: ON"
+    elif arg in ("off", "no", "false", "0", "disable", "disabled"):
+        context.user_data[UD_REMINDER_SHOW_STATUS] = False
+        msg = "✅ Status in reminders: OFF"
+    elif arg in ("toggle", "switch"):
+        cur = bool(context.user_data.get(UD_REMINDER_SHOW_STATUS, False))
+        context.user_data[UD_REMINDER_SHOW_STATUS] = not cur
+        msg = f"✅ Status in reminders: {'ON' if not cur else 'OFF'}"
+    else:
+        cur = bool(context.user_data.get(UD_REMINDER_SHOW_STATUS, False))
+        msg = (
+            f"Status in reminders is currently: {'ON' if cur else 'OFF'}\n\n"
+            "Use:\n"
+            "/reminder_status on\n"
+            "/reminder_status off"
+        )
+
+    # Reply in the same topic if this was run inside a forum topic
+    await topic_send(
+        update,
+        context.bot.send_message,
+        chat_id=update.effective_chat.id,
+        text=msg,
+    )
+
+
+
+
+
 async def refresh_day_command_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -4762,17 +5009,35 @@ async def add_todo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Entry point for /add_todo or the reply-keyboard button.
     Asks the user for the todo title.
     """
+
+    logging.info(
+        "add_todo_start chat=%s thread=%s user=%s",
+        update.effective_chat.id if update.effective_chat else None,
+        getattr(update.effective_message, "message_thread_id", None),
+        update.effective_user.id if update.effective_user else None,
+    )
+
     user_id = context.user_data.get("USER_ID")
     api_key = context.user_data.get("API_KEY")
 
+    # Clear any stale partial state from a previous interrupted run
+    context.user_data.pop("new_todo_title", None)
+
     if not user_id or not api_key:
-        await update.message.reply_text("Use /start to set USER_ID and API_KEY first.")
+        await topic_send(
+            update,
+            context.bot.send_message,
+            chat_id=update.effective_chat.id,
+            text="Use /start to set USER_ID and API_KEY first.",
+        )
         return ConversationHandler.END
 
-    await update.message.reply_text(
-        "Send me the title of your new To‑Do.\n\n"
-        "You can /cancel to abort."
-    )
+    await topic_send(
+        update,
+        context.bot.send_message,
+        chat_id = update.effective_chat.id,
+        text = "Send me the title of your new To‑Do.\n\nYou can /cancel to abort.",
+        )
     return ADD_TODO_TITLE
 
 
@@ -4782,7 +5047,12 @@ async def add_todo_title_received(update: Update, context: ContextTypes.DEFAULT_
     """
     title = (update.message.text or "").strip()
     if not title:
-        await update.message.reply_text("Please send a non‑empty title, or /cancel.")
+        await topic_send(
+            update,
+            context.bot.send_message,
+            context.bot.send_message,
+            text="Please send a non‑empty title, or /cancel.",
+        )
         return ADD_TODO_TITLE
 
     context.user_data["new_todo_title"] = title
@@ -4798,10 +5068,14 @@ async def add_todo_title_received(update: Update, context: ContextTypes.DEFAULT_
         ],
     ])
 
-    await update.message.reply_text(
-        f"Title:\n<b>{html.escape(title)}</b>\n\nChoose difficulty:",
+    await topic_send(
+        update,
+        context.bot.send_message,
+        chat_id=update.effective_chat.id,
+        text=f"Title:\n<b>{html.escape(title)}</b>\n\nChoose difficulty:",
         parse_mode="HTML",
         reply_markup=keyboard,
+        disable_web_page_preview=True,
     )
     return ADD_TODO_DIFFICULTY
 
@@ -4860,13 +5134,14 @@ async def add_todo_difficulty_chosen(update: Update, context: ContextTypes.DEFAU
         await query.edit_message_text(text, parse_mode="HTML")
     except Exception:
         # Fallback if editing fails
-        await context.bot.send_message(
+        await topic_send(
+            update,
+            context.bot.send_message,
             chat_id=query.message.chat_id,
             text=text,
             parse_mode="HTML",
         )
-
-    # Update pinned status in the user's private chat (like other actions)
+        # Update pinned status in the user's private chat (like other actions)
     try:
         await update_and_pin_status(context, chat_id=query.from_user.id)
     except Exception as e:
@@ -5096,6 +5371,419 @@ async def show_habits_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+
+async def run_reminder_tick(application: Application) -> dict:
+    """
+    Runs one reminder check for ALL users stored in PicklePersistence (botdata.pkl).
+    Intended to be called from a Flask /tick endpoint.
+    """
+    utc_now = datetime.utcnow()
+    window_seconds = int(os.environ.get("REMINDER_WINDOW_SECONDS", "60"))
+    window = timedelta(seconds=window_seconds)
+
+    sent_count = 0
+    users_checked = 0
+    errors = 0
+
+    # application.user_data is loaded from PicklePersistence when the app initializes
+    for telegram_user_id, ud in (application.user_data or {}).items():
+        try:
+            if not ud.get(UD_REMINDERS_ENABLED, True):
+                continue
+
+            habitica_user_id = ud.get("USER_ID")
+            habitica_api_key = ud.get("API_KEY")
+            if not habitica_user_id or not habitica_api_key:
+                continue
+
+            # --- timezoneOffset caching (minutes) ---
+            # Habitica stores timezoneOffset like JS getTimezoneOffset (UTC+10 is -600) :contentReference[oaicite:8]{index=8}
+            tz_offset = ud.get(UD_TZ_OFFSET)
+            age = int(time_mod.time()) - int(ud.get(UD_TZ_OFFSET_UPDATED_AT, 0) or 0)
+            if tz_offset is None or age > 24 * 3600:
+                status = get_status(habitica_user_id, habitica_api_key) or {}
+                tz_offset = (status.get("preferences") or {}).get("timezoneOffset", 0)
+                try:
+                    ud[UD_TZ_OFFSET] = int(tz_offset)
+                except Exception:
+                    ud[UD_TZ_OFFSET] = 0
+                ud[UD_TZ_OFFSET_UPDATED_AT] = int(time_mod.time())
+
+            tz_offset = int(ud.get(UD_TZ_OFFSET, 0))
+            now_local = utc_now - timedelta(minutes=tz_offset)
+            today_local = now_local.date()
+
+            chat_id, thread_id = _get_notify_target(int(telegram_user_id), ud)
+
+            avatar_doc_id = ud.get("AVATAR_DOC_FILE_ID")
+            avatar_png_path = ud.get("AVATAR_PNG_PATH")
+            status_text_cache: str | None = None
+
+            # Fetch tasks
+            dailys = get_tasks(habitica_user_id, habitica_api_key, "dailys") or []
+            todos = get_tasks(habitica_user_id, habitica_api_key, "todos") or []
+
+            # --- DAILIES ---
+            for t in dailys:
+                if t.get("completed"):
+                    continue
+                if t.get("isDue") is False:
+                    continue
+
+                for rem in (t.get("reminders") or []):
+                    if not isinstance(rem, dict):
+                        continue
+
+                    # Habitica reminders include id/startDate/time :contentReference[oaicite:9]{index=9}
+                    rem_time = _parse_time_of_day(rem.get("time"))
+                    if not rem_time:
+                        continue
+
+                    when = datetime.combine(today_local, rem_time)
+                    if not (when <= now_local < when + window):
+                        continue
+
+                    rem_id = rem.get("id") or rem_time.strftime("%H:%M")
+                    key = f"rem:dailys:{t.get('id')}:{rem_id}:{today_local.isoformat()}:{rem_time.strftime('%H:%M')}"
+
+                    sent_map = ud.setdefault(UD_SENT_REMINDERS, {})
+                    if key in sent_map:
+                        continue
+
+                    show_status = bool(ud.get(UD_REMINDER_SHOW_STATUS, False))
+
+                    status_html = ""
+                    if show_status:
+                        status_data = get_status(habitica_user_id, habitica_api_key) or {}
+                        stats = status_data.get("stats", {}) or {}
+                        status_html = build_status_block(stats)
+
+                    await _send_task_reminder(
+                        application.bot,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        normalized_type="dailys",
+                        task=t,
+                        user_data=ud,
+                        habitica_user_id=habitica_user_id,
+                        habitica_api_key=habitica_api_key,
+                        status_html=status_html,
+                    )
+
+                    sent_map[key] = int(time_mod.time())
+                    sent_count += 1
+
+            # --- TODOS ---
+            for t in todos:
+                if t.get("completed"):
+                    continue
+
+                reminders = t.get("reminders") or []
+                if reminders:
+                    for rem in reminders:
+                        if not isinstance(rem, dict):
+                            continue
+
+                        rem_time = _parse_time_of_day(rem.get("time"))
+                        if not rem_time:
+                            continue
+
+                        when = datetime.combine(today_local, rem_time)
+                        if not (when <= now_local < when + window):
+                            continue
+
+                        rem_id = rem.get("id") or rem_time.strftime("%H:%M")
+                        key = f"rem:todos:{t.get('id')}:{rem_id}:{today_local.isoformat()}:{rem_time.strftime('%H:%M')}"
+
+                        sent_map = ud.setdefault(UD_SENT_REMINDERS, {})
+                        if key in sent_map:
+                            continue
+
+                        show_status = bool(ud.get(UD_REMINDER_SHOW_STATUS, False))
+
+                        status_html = ""
+                        if show_status:
+                            status_data = get_status(habitica_user_id, habitica_api_key) or {}
+                            stats = status_data.get("stats", {}) or {}
+                            status_html = build_status_block(stats)
+
+                        await _send_task_reminder(
+                            application.bot,
+                            chat_id=chat_id,
+                            thread_id=thread_id,
+                            normalized_type="todos",
+                            task=t,
+                            user_data=ud,
+                            habitica_user_id=habitica_user_id,
+                            habitica_api_key=habitica_api_key,
+                            status_html=status_html,
+                        )
+
+                        sent_map[key] = int(time_mod.time())
+                        sent_count += 1
+                else:
+                    # Optional fallback: todo due datetime in `date` (only if no reminders)
+                    due_dt = _parse_iso_dt(t.get("date"))
+                    if due_dt:
+                        # convert due to UTC naive, then to local
+                        if due_dt.tzinfo is not None:
+                            due_utc = due_dt.astimezone(timezone.utc).replace(tzinfo=None)
+                            due_local = due_utc - timedelta(minutes=tz_offset)
+                        else:
+                            due_local = due_dt
+
+                        if due_local <= now_local < due_local + window:
+                            key = f"due:todos:{t.get('id')}:{due_local.strftime('%Y-%m-%dT%H:%M')}"
+                            sent_map = ud.setdefault(UD_SENT_REMINDERS, {})
+                            if key not in sent_map:
+
+                                show_status = bool(ud.get(UD_REMINDER_SHOW_STATUS, False))
+
+                                status_html = ""
+                                if show_status:
+                                    status_data = get_status(habitica_user_id, habitica_api_key) or {}
+                                    stats = status_data.get("stats", {}) or {}
+                                    status_html = build_status_block(stats)
+
+                                await _send_task_reminder(
+                                    application.bot,
+                                    chat_id=chat_id,
+                                    thread_id=thread_id,
+                                    normalized_type="todos",
+                                    task=t,
+                                    user_data=ud,
+                                    habitica_user_id=habitica_user_id,
+                                    habitica_api_key=habitica_api_key,
+                                    status_html=status_html,
+                                )
+
+                                sent_map[key] = int(time_mod.time())
+                                sent_count += 1
+
+            _sent_key_prune(ud)
+
+            users_checked += 1
+
+        except Exception:
+            errors += 1
+            logging.exception("Reminder tick failed for telegram_user_id=%s", telegram_user_id)
+
+    # Make sure persistence sees our updated user_data maps
+    try:
+        await application.update_persistence()
+    except Exception:
+        pass
+
+    return {
+        "sent": sent_count,
+        "users_checked": users_checked,
+        "errors": errors,
+        "window_seconds": window_seconds,
+    }
+
+
+def _parse_time_of_day(value) -> dtime | None:
+    """Accepts 'HH:MM', 'HH:MM:SS', ISO datetime, or minutes since midnight."""
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        s = value.strip()
+        # ISO datetime string?
+        if "T" in s:
+            try:
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                return dt.time().replace(second=0, microsecond=0)
+            except Exception:
+                pass
+
+        for fmt in ("%H:%M", "%H:%M:%S"):
+            try:
+                return datetime.strptime(s, fmt).time()
+            except Exception:
+                pass
+
+        # "1200" -> 12:00
+        if s.isdigit() and len(s) == 4:
+            return dtime(hour=int(s[:2]), minute=int(s[2:]))
+
+    if isinstance(value, (int, float)):
+        mins = int(value)
+        if 0 <= mins < 24 * 60:
+            return dtime(hour=mins // 60, minute=mins % 60)
+
+    return None
+
+
+def _parse_iso_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _get_notify_target(telegram_user_id: int, user_data: dict) -> tuple[int, int | None]:
+    chat_id = user_data.get(UD_NOTIFY_CHAT_ID) or telegram_user_id
+    thread_id = user_data.get(UD_NOTIFY_THREAD_ID)
+    return int(chat_id), (int(thread_id) if thread_id is not None else None)
+
+
+def _sent_key_prune(user_data: dict, *, keep_seconds: int = 7 * 24 * 3600) -> None:
+    sent = user_data.get(UD_SENT_REMINDERS)
+    if not isinstance(sent, dict):
+        return
+    cutoff = int(time_mod.time()) - keep_seconds
+    for k, ts in list(sent.items()):
+        if not isinstance(ts, int) or ts < cutoff:
+            sent.pop(k, None)
+
+
+async def _send_task_reminder(
+    bot,
+    *,
+    chat_id: int,
+    thread_id: int | None,
+    normalized_type: str,   # "habits" / "dailys" / "todos" / "completedTodos" / "rewards"
+    task: dict,
+    user_data: dict,
+    habitica_user_id: str,
+    habitica_api_key: str,
+    status_html: str = "",
+):
+    """
+    Reminder message styled like inline single-task cards:
+      - avatar attached as DOCUMENT
+      - caption:
+          <blockquote>ICON <b><i>task</i></b></blockquote>
+          <blockquote>Status ...</blockquote>   (optional toggle)
+      - buttons match existing callback formats
+    """
+
+    # Avoid thread_id=1 (General topic) issues
+    if thread_id in (None, 1):
+        thread_id = None
+
+    # --- caption (task blockquote + optional status) ---
+    task_text = html.escape(task.get("text", "(no title)"))
+
+    icon_map = {
+        "habits": "🌀",
+        "dailys": "📅",
+        "todos": "📝",
+        "completedTodos": "✅",
+        "rewards": "💰",
+    }
+    icon = icon_map.get(normalized_type, "🔔")
+
+    caption = f"<blockquote>{icon} <b><i>{task_text}</i></b></blockquote>"
+
+    show_status = bool(user_data.get(UD_REMINDER_SHOW_STATUS, False))
+    if show_status and status_html:
+        caption = f"{caption}\n{status_html}"
+
+    # --- buttons (same formats you already handle) ---
+    task_id = task.get("id")
+    if not task_id:
+        return
+
+    reply_markup = None
+
+    if normalized_type == "habits":
+        up = bool(task.get("up", False))
+        down = bool(task.get("down", False))
+        counter_up = int(task.get("counterUp", 0))
+        counter_down = int(task.get("counterDown", 0))
+
+        keyboard: list[InlineKeyboardButton] = []
+        if up:
+            keyboard.append(
+                InlineKeyboardButton(
+                    f"➕ {counter_up}",
+                    callback_data=f"habits:up:{task_id}:{counter_up}:{up}:{down}",
+                )
+            )
+        if down:
+            keyboard.append(
+                InlineKeyboardButton(
+                    f"➖ {counter_down}",
+                    callback_data=f"habits:down:{task_id}:{counter_down}:{up}:{down}",
+                )
+            )
+        reply_markup = InlineKeyboardMarkup([keyboard]) if keyboard else None
+
+    elif normalized_type in ("dailys", "todos", "completedTodos"):
+        is_completed = bool(task.get("completed", False))
+        button_text = "✔️" if is_completed else "✖️"
+        action = "down" if is_completed else "up"
+        reply_markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(button_text, callback_data=f"{normalized_type}:{action}:{task_id}")]]
+        )
+
+    elif normalized_type == "rewards":
+        value = int(task.get("value", 0) or 0)
+        reply_markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(f"Buy ({value} Gold)", callback_data=f"rewards:buy:{task_id}")]]
+        )
+
+    # --- send as photo (avatar) ---
+    photo_kwargs = dict(
+        chat_id=chat_id,
+        caption=caption,
+        parse_mode="HTML",
+        reply_markup=reply_markup,
+    )
+    if thread_id is not None:
+        photo_kwargs["message_thread_id"] = thread_id
+
+    # 1) Fast path: cached Telegram PHOTO file_id
+    avatar_photo_id = user_data.get("AVATAR_FILE_ID")
+    if avatar_photo_id:
+        try:
+            await bot.send_photo(photo=avatar_photo_id, **photo_kwargs)
+            return
+        except Exception:
+            # If Telegram rejects old/invalid file_id, drop it and fall back to PNG
+            user_data.pop("AVATAR_FILE_ID", None)
+
+    # 2) Next: existing PNG on disk (maybe created by /avatar or other panels)
+    png_path = user_data.get("AVATAR_PNG_PATH")
+    if not (png_path and os.path.exists(png_path)):
+        # 3) Fallback: render avatar via Node (no export_avatar_png)
+        png_path = ensure_avatar_png_no_update(
+            habitica_user_id=habitica_user_id,
+            habitica_api_key=habitica_api_key,
+            user_data=user_data,
+            force_refresh=False,
+            preloaded_user_json=None,
+        )
+
+    if png_path and os.path.exists(png_path):
+        try:
+            with open(png_path, "rb") as fp:
+                msg = await bot.send_photo(photo=fp, **photo_kwargs)
+            if getattr(msg, "photo", None):
+                # Cache the biggest size photo file_id
+                user_data["AVATAR_FILE_ID"] = msg.photo[-1].file_id
+            return
+        except Exception:
+            # Fall through to text-only fallback below
+            pass
+
+    # 4) Final fallback (if avatar render failed): text-only
+    msg_kwargs = dict(
+        chat_id=chat_id,
+        text=caption,
+        parse_mode="HTML",
+        reply_markup=reply_markup,
+    )
+    if thread_id is not None:
+        msg_kwargs["message_thread_id"] = thread_id
+    await bot.send_message(**msg_kwargs)
+
+
+
 def build_application(*, register_commands: bool = False) -> Application:
     """
     Create and configure the PTB Application.
@@ -5178,8 +5866,13 @@ def build_application(*, register_commands: bool = False) -> Application:
                 ),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel_command_handler)],
+        fallbacks=[
+            CommandHandler("cancel", cancel_command_handler),
+            # let user “restart” if they got stuck mid-flow
+            CommandHandler("add_todo", add_todo_start),
+        ],
         per_message=False,
+        allow_reentry=True,
         name="add_todo",  # <--- ADD THIS
         persistent=True,  # <--- AND THIS
     )
@@ -5187,8 +5880,9 @@ def build_application(*, register_commands: bool = False) -> Application:
 
     # Reply-keyboard buttons -> route to your existing handlers
     RK_BUTTONS_PATTERN = (
-        r"^(🔎 Inline Menu|🌀 Habits|📅 Dailys|📝 Todos|✅ Completed Todos|💰 Rewards|📊 Status|🎭 Avatar|🧪 Buy Potion|🔄 Refresh Day|🔁 Menu)$"
+        r"^(🔎 Inline Menu|🌀 Habits|📅 Dailys|📝 Todos|✅ Completed Todos|💰 Rewards|📊 Status|🎭 Avatar|🧪 Buy Potion|🔄 Refresh Day|🔁 Menu|⏰ Reminder Settings|🧾 Status(?: ✔️)?|🔔 Notify Here|⬅️ Back)$"
     )
+
     app.add_handler(
         MessageHandler(filters.Regex(RK_BUTTONS_PATTERN), handle_reply_keyboard)
     )
@@ -5214,9 +5908,10 @@ def build_application(*, register_commands: bool = False) -> Application:
     app.add_handler(CommandHandler("buy_potion", buy_potion_command_handler))
     app.add_handler(CommandHandler("debug", debug_commands))
     app.add_handler(CommandHandler("refresh_day", refresh_day_command_handler))
+    app.add_handler(CommandHandler("notify_here", notify_here_command_handler))
     app.add_handler(CommandHandler("sync_commands", sync_commands_command_handler))
     app.add_handler(CommandHandler("avatar", avatar_command_handler))
-
+    app.add_handler(CommandHandler("reminder_status", reminder_status_command_handler))
 
     # Inline picker
     app.add_handler(

@@ -1,17 +1,28 @@
 import asyncio
 from http import HTTPStatus
 
-from flask import Flask, request
+import os
+from flask import Flask, request, jsonify
+
 from telegram import Update
+
 
 # ⬅️ replace `your_bot_module` with the *actual* filename of the big bot file,
 # WITHOUT the `.py` extension.
 # For example, if your file is `habitica_bot.py`, use:
 #   from habitica_bot import build_application
-from habitica_bot import build_application
+from habitica_bot import build_application, run_reminder_tick
+
 
 flask_app = Flask(__name__)
 
+async def _run_tick() -> dict:
+    application = build_application(register_commands=False)
+
+    async with application:
+        result = await run_reminder_tick(application)
+
+    return result
 
 async def _handle_update(update_json: dict) -> None:
     """
@@ -23,6 +34,16 @@ async def _handle_update(update_json: dict) -> None:
     async with application:
         update = Update.de_json(update_json, application.bot)
         await application.process_update(update)
+
+@flask_app.get("/tick")
+def tick():
+    # Simple shared-secret protection for cron-job.org
+    token = request.args.get("token")
+    if not token or token != os.environ.get("TICK_TOKEN"):
+        return "Forbidden", HTTPStatus.FORBIDDEN
+
+    result = asyncio.run(_run_tick())
+    return jsonify(result), HTTPStatus.OK
 
 
 @flask_app.post("/telegram-webhook")  # you can change this path to something secret-ish
