@@ -47,6 +47,12 @@ You can try the running bot here: **[@HHabitica_bot](https://t.me/HHabitica_bot)
     * then runs Habitica cron for you
   * Inline version from the **Inline Menu** too
 
+* ⏰ **Habitica task reminders → Telegram notifications**
+
+  * Sends reminders for Dailys and Todos (based on the reminders you set in Habitica)
+  * Use `/notify_here` to choose where the reminders are sent (DM, group, or topic)
+  * `/reminder_status` toggles showing your status block inside reminders
+
 * 📝 **Add Todos from Telegram**
 
   * `/add_todo` or **➕ New Todo** button
@@ -76,6 +82,7 @@ You can try the running bot here: **[@HHabitica_bot](https://t.me/HHabitica_bot)
     * ➕ New Todo
     * 📊 Status / 🧪 Buy Potion
     * 🔄 Refresh Day
+    * ⏰ Reminder Settings
     * ✅ Completed Todos / 🔁 Menu
   * `/menu` and `/menu_rk` control how/when it’s shown
 
@@ -166,6 +173,8 @@ Common commands you’ll see in the bot:
 | `/add_todo`       | Add a new Todo via conversation                                 |
 | `/inline`         | Show inline launcher helper message                             |
 | `/menu`           | Show / rebuild the reply keyboard menu                          |
+| `/notify_here`    | Send task reminders in this chat/topic                           |
+| `/reminder_status`| Status block in reminders (on/off)                               |
 | `/task_list`      | Text-only grouped task list (Habits / Dailys / Todos / Rewards) |
 | `/avatar`         | Generate and send your Habitica avatar as a PNG image           |
 | `/debug`          | Debug info (intended for dev/testing)                           |
@@ -295,6 +304,7 @@ The repo also contains:
 * `webhook_app.py` – a small Flask app that:
 
   * exposes `/telegram-webhook`
+  * exposes `/tick` (used for reminder checks)
   * builds an `Application` via `build_application(register_commands=False)`
   * processes **one** Telegram update per HTTP request (no long-running tasks)
 * `wsgi.py` (or similar) – example WSGI entry file that imports the Flask app and sets `TELEGRAM_BOT_TOKEN` in the environment.
@@ -308,6 +318,8 @@ Typical high‑level steps:
    ```bash
    https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=https://your-domain/telegram-webhook
    ```
+
+If you want task reminders, set up an external cron ping (e.g. with [cron-job.org](https://cron-job.org)) to call `https://your-domain/tick` every minute.
 
 This approach works well on platforms that don’t allow long‑running background processes.
 
