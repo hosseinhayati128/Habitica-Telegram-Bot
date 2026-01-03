@@ -146,6 +146,11 @@ UD_REMINDERS_ENABLED = "reminders_enabled"
 UD_REMINDER_SHOW_STATUS = "reminder_show_status"
 # --- Reply-keyboard button labels ---
 RK_BTN_REMINDER_SETTINGS = "⏰ Reminder Settings"
+
+RK_BTN_REMINDERS_ON = "🔈 Reminders are ON"
+RK_BTN_REMINDERS_OFF = "🔈 Reminders are OFF"
+
+RK_BTN_REMINDERS_BASE = "🔔 Reminders"
 RK_BTN_REMINDER_STATUS_BASE = "🧾 Status"
 RK_BTN_REMINDER_NOTIFY_HERE = "🔔 Notify Here"
 RK_BTN_REMINDER_BACK = "⬅️ Back"
@@ -183,14 +188,17 @@ RK = ReplyKeyboardMarkup(
 
 
 
-
 def build_reminder_settings_rk(user_data: dict) -> ReplyKeyboardMarkup:
     """Build the Reminder settings reply keyboard for the current user."""
+    reminders_enabled = bool(user_data.get(UD_REMINDERS_ENABLED, True))
+    reminders_label = RK_BTN_REMINDERS_ON if reminders_enabled else RK_BTN_REMINDERS_OFF
+
     show_status = bool(user_data.get(UD_REMINDER_SHOW_STATUS, False))
     status_label = RK_BTN_REMINDER_STATUS_BASE + (" ✔️" if show_status else "")
 
     return ReplyKeyboardMarkup(
         [
+            [KeyboardButton(reminders_label)],
             [KeyboardButton(status_label)],
             [KeyboardButton(RK_BTN_REMINDER_NOTIFY_HERE)],
             [KeyboardButton(RK_BTN_REMINDER_BACK)],
@@ -199,7 +207,6 @@ def build_reminder_settings_rk(user_data: dict) -> ReplyKeyboardMarkup:
         is_persistent=True,
         one_time_keyboard=False,
     )
-
 
 
 def build_cron_keyboard_for_user(
@@ -670,17 +677,6 @@ def build_status_block(stats: dict | None) -> str:
     )
 
 
-def build_status_block(stats: dict) -> str:
-    """Build the HTML status block from a stats dict."""
-    return (
-        "<blockquote>"
-        "<b>Status</b>\n"
-        f"HP: {int(stats.get('hp', 0))} ♥\n"
-        f"MP: {int(stats.get('mp', 0))} 💧\n"
-        f"Gold: {int(stats.get('gp', 0))} 💰"
-        "</blockquote>"
-    )
-
 
 def build_tasks_panel_text(
     kind: str,
@@ -876,9 +872,48 @@ async def handle_reply_keyboard(update: Update, context: ContextTypes.DEFAULT_TY
         context.chat_data["rk_active"] = True
         return
 
+    if text in (
+            f"{RK_BTN_REMINDERS_BASE} ✔️",
+            f"{RK_BTN_REMINDERS_BASE} ✖️",
+            RK_BTN_REMINDERS_BASE,  # optional fallback if you ever use it without icon
+    ):
+        cur = bool(context.user_data.get(UD_REMINDERS_ENABLED, True))
+        context.user_data[UD_REMINDERS_ENABLED] = not cur
+
+        msg = f"✅ Reminders: {'ON' if not cur else 'OFF'}"
+        await topic_send(
+            update,
+            context.bot.send_message,
+            chat_id=update.effective_chat.id,
+            text=msg,
+            reply_markup=build_reminder_settings_rk(context.user_data),
+            disable_notification=True,
+            disable_web_page_preview=True,
+        )
+        context.chat_data["rk_active"] = True
+        return
+
     if text == RK_BTN_REMINDER_NOTIFY_HERE:
         await notify_here_command_handler(update, context)
         return
+
+    if text in (RK_BTN_REMINDERS_ON, RK_BTN_REMINDERS_OFF):
+        cur = bool(context.user_data.get(UD_REMINDERS_ENABLED, True))
+        context.user_data[UD_REMINDERS_ENABLED] = not cur
+
+        msg = RK_BTN_REMINDERS_ON if not cur else RK_BTN_REMINDERS_OFF
+        await topic_send(
+            update,
+            context.bot.send_message,
+            chat_id=update.effective_chat.id,
+            text=msg,
+            reply_markup=build_reminder_settings_rk(context.user_data),
+            disable_notification=True,
+            disable_web_page_preview=True,
+        )
+        context.chat_data["rk_active"] = True
+        return
+
 
     if text in (RK_BTN_REMINDER_STATUS_BASE, f"{RK_BTN_REMINDER_STATUS_BASE} ✔️"):
         cur = bool(context.user_data.get(UD_REMINDER_SHOW_STATUS, False))
@@ -1772,14 +1807,7 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     # Get current status to include in messages
     status_data = get_status(user_id, api_key)
     stats = status_data.get("stats", {}) if status_data else {}
-    status_text = (
-        f"<blockquote>"
-        f"<b>Status</b>\n"
-        f"HP: {int(stats.get('hp', 0))} ♥\n"
-        f"MP: {int(stats.get('mp', 0))} 💧\n"
-        f"Gold: {int(stats.get('gp', 0))} 💰"
-        f"</blockquote>"
-    )
+    status_text = build_status_block(stats)
 
     # --- Empty inline query: only "Show my options" ---
     # --- Empty inline query: "Show my options" ---
@@ -2897,14 +2925,7 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     def _status_block(stats: dict) -> str:
         """Return HTML fragment used in inline panels for the status block."""
-        return (
-            "<blockquote>"
-            "<b>Status</b>\n"
-            f"HP: {int(stats.get('hp', 0))} ♥\n"
-            f"MP: {int(stats.get('mp', 0))} 💧\n"
-            f"Gold: {int(stats.get('gp', 0))} 💰"
-            "</blockquote>"
-        )
+        return build_status_block(stats)
 
     def _replace_status_in_text(orig_text: Optional[str], new_status_html: str) -> str:
         """
@@ -3465,11 +3486,11 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
                 if is_inline_refresh:
                     # Inline panel: show Status + shortcuts again
-                    text = f"<b>📊 Status</b>\n{_fmt_stats(old_stats)}"
+                    text = build_status_block(old_stats)
                     await edit_here(text)  # uses Inline shortcuts keyboard as default
                     context.user_data["cron_from_inline"] = False
                 else:
-                    text = f"<b>🔄 Day already refreshed</b>\n{_fmt_stats(old_stats)}"
+                    text = f"<b>🔄 Day already refreshed</b>\n\n{build_status_block(old_stats)}"
                     await edit_here(text, build_inline_launcher_kb())
 
                 await query.answer(feedback, show_alert=False)
@@ -3488,11 +3509,11 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
                 if is_inline_refresh:
                     # Inline panel: turn back into "Status + shortcuts"
-                    text = f"<b>📊 Status</b>\n{_fmt_stats(new_stats)}"
+                    text = build_status_block(new_stats)
                     await edit_here(text, build_inline_launcher_kb())
 
                 else:
-                    text = f"<b>🔄 Day refreshed!</b>\n{_fmt_stats(new_stats)}"
+                    text = f"<b>🔄 Day refreshed!</b>\n\n{build_status_block(new_stats)}"
                     await edit_here(text)
 
                 # Update pinned HUD in the user's private chat
@@ -3504,11 +3525,12 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
                 if is_inline_refresh:
                     # Inline panel: also go back to "Status + shortcuts", but with old stats
-                    text = f"<b>📊 Status</b>\n{_fmt_stats(old_stats)}"
+                    text = build_status_block(old_stats)
                     await edit_here(text, build_inline_launcher_kb())
 
+
                 else:
-                    text = f"<b>❌ Failed to refresh day.</b>\n{_fmt_stats(old_stats)}"
+                    text = f"<b>❌ Failed to refresh day.</b>\n\n{build_status_block(old_stats)}"
                     await edit_here(text)
 
             # Drop any cached refresh-day state so the next run starts fresh.
@@ -3555,7 +3577,8 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         if len(parts) > 1 and parts[1] == "status":
             data_status = get_status(user_id, api_key) or {}
             stats = data_status.get("stats", {}) or {}
-            text = f"<b>📊 Status</b>\n{_fmt_stats(stats)}"
+            text = build_status_block(stats)
+
 
             await edit_here(text)
             await update_and_pin_status(context, home_chat_id, stats_override=stats)
@@ -4362,8 +4385,8 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         task_text = html.escape(updated_task.get('text', '(no title)'))
         body = (
-            f"<blockquote>🌀<b><i>{task_text}</i></b></blockquote>\n"
-            f"<blockquote><b>Status</b>\n{_fmt_stats(new_stats)}</blockquote>"
+                f"<blockquote>🌀<b><i>{task_text}</i></b></blockquote>\n"
+                + build_status_block(new_stats)
         )
 
         if query.message is not None:
@@ -4404,17 +4427,18 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton(btn, callback_data=f"{ttype}:{new_action}:{task_id}")]])
 
             icon = "📅 " if ttype == "dailys" else ("📝 " if ttype == "todos" else "✅ ")
-            task_text = html.escape(updated_task.get('text', '(no title)'))
-            body = (
-                f"<blockquote>{icon}<b><i>{task_text}</i></b></blockquote>\n"
-                f"<blockquote><b>Status</b>\n{_fmt_stats(new_stats)}</blockquote>"
-            )
+            task_text = html.escape(updated_task.get("text", "(no title)"))
 
-            # edit the message and update pinned status
-            # Update the message’s Status block if it exists; keep the rest of the text unchanged.
-            await _update_panel_text_if_needed(new_stats, reply_markup)
+            show_status = bool(context.user_data.get(UD_REMINDER_SHOW_STATUS, False))
 
-            # Replace the whole message body for this single task
+            if show_status:
+                # Status ON -> quoted task title + quoted status below
+                body = f"<blockquote>{icon}<b>{task_text}</b></blockquote>\n{_status_block(new_stats)}"
+            else:
+                # Status OFF -> unquoted bold task title only
+                body = f"{icon}<b>{task_text}</b>"
+
+            # IMPORTANT: edit only once (prevents the “flash” / overwrite)
             await edit_here(body, reply_markup)
 
             await update_and_pin_status(context, home_chat_id, stats_override=new_stats)
@@ -4441,7 +4465,7 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             new = get_status(user_id, api_key)
             new_stats = new.get("stats", {}) if new else {}
             delta = _delta_text(old_stats, new_stats)
-            text = f"<b>{'💰 Reward bought!' if ok else '❌ Reward failed.'}</b>\n{_fmt_stats(new_stats)}"
+            text = f"<b>{'💰 Reward bought!' if ok else '❌ Reward failed.'}</b>\n\n{build_status_block(new_stats)}"
 
             await edit_here(text)
             await query.answer(f"💰 {'Reward bought' if ok else 'Reward failed'} ({delta})", show_alert=not ok)
@@ -4506,24 +4530,8 @@ async def update_and_pin_status(
             return
         stats = status_data.get("stats", {}) or {}
 
-    def _fmt(v) -> str:
-        """Show up to 1 decimal place, strip trailing .0."""
-        try:
-            f = float(v)
-        except (TypeError, ValueError):
-            return "0"
-        s = f"{f:.1f}"
-        if s.endswith(".0"):
-            s = s[:-2]
-        return s
+    status_text = build_status_block(stats)
 
-    status_text = (
-        f"HP: {_fmt(stats.get('hp', 0))} ♥\n"
-        f" --- \n"
-        f"MP: {_fmt(stats.get('mp', 0))} 💧\n"
-        f" --- \n"
-        f"Gold: {_fmt(stats.get('gp', 0))} 💰"
-    )
 
     # --- Keys we use in user_data for this chat ---
     pinned_key = f"pinned_status_message_id_{chat_id}"
@@ -4559,6 +4567,7 @@ async def update_and_pin_status(
                 chat_id=chat_id,
                 message_id=pinned_id,
                 text=status_text,
+                parse_mode="HTML",
             )
             logging.info(
                 "Successfully edited pinned message %s in chat %s.",
@@ -4605,7 +4614,12 @@ async def update_and_pin_status(
         "Creating and pinning a new status message.",
         chat_id,
     )
-    new_message = await context.bot.send_message(chat_id=chat_id, text=status_text)
+    new_message = await context.bot.send_message(
+        chat_id=chat_id,
+        text=status_text,
+        parse_mode="HTML",
+    )
+
     logging.info(
         "STATUS DEBUG: sent new status message %s in chat %s, now pinning it.",
         new_message.message_id,
@@ -5677,11 +5691,16 @@ async def _send_task_reminder(
     }
     icon = icon_map.get(normalized_type, "🔔")
 
-    caption = f"<blockquote>{icon} <b><i>{task_text}</i></b></blockquote>"
-
     show_status = bool(user_data.get(UD_REMINDER_SHOW_STATUS, False))
-    if show_status and status_html:
-        caption = f"{caption}\n{status_html}"
+
+    if show_status:
+        # When ON: task name in quote, and Status below in quote
+        caption = f"<blockquote>{icon} <b>{task_text}</b></blockquote>"
+        if status_html:
+            caption = f"{caption}\n{status_html}"
+    else:
+        # When OFF: just show unquoted task name (bold)
+        caption = f"{icon} <b>{task_text}</b>"
 
     # --- buttons (same formats you already handle) ---
     task_id = task.get("id")
@@ -5880,7 +5899,7 @@ def build_application(*, register_commands: bool = False) -> Application:
 
     # Reply-keyboard buttons -> route to your existing handlers
     RK_BUTTONS_PATTERN = (
-        r"^(🔎 Inline Menu|🌀 Habits|📅 Dailys|📝 Todos|✅ Completed Todos|💰 Rewards|📊 Status|🎭 Avatar|🧪 Buy Potion|🔄 Refresh Day|🔁 Menu|⏰ Reminder Settings|🧾 Status(?: ✔️)?|🔔 Notify Here|⬅️ Back)$"
+        r"^(🔎 Inline Menu|🌀 Habits|📅 Dailys|📝 Todos|✅ Completed Todos|💰 Rewards|📊 Status|🎭 Avatar|🧪 Buy Potion|🔄 Refresh Day|🔁 Menu|⏰ Reminder Settings|🔈 Reminders are ON|🔈 Reminders are OFF|🧾 Status(?: ✔️)?|🔔 Notify Here|⬅️ Back)$"
     )
 
     app.add_handler(
