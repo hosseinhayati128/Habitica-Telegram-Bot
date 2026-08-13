@@ -45,11 +45,12 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
-from avatar_renderer import is_valid_png, render_avatar_png
+from avatar_renderer import cache_avatar_png, is_valid_png, render_avatar_png
 from Habitica_API import (
     buy_potion,
     buy_reward,
     create_todo_task,
+    export_avatar_png,
     get_status,
     get_task_by_id,
     get_tasks,
@@ -1314,26 +1315,40 @@ def ensure_avatar_png_no_update(
     force_refresh: bool = False,
     preloaded_user_json: dict | None = None,
 ) -> str | None:
-    """Tick-safe avatar rendering with no Telegram Update or Context."""
+    """Tick-safe avatar rendering/export with no Telegram Update or Context."""
     existing_path = user_data.get("AVATAR_PNG_PATH")
     if not force_refresh and existing_path and is_valid_png(existing_path):
         return existing_path
     if existing_path and not is_valid_png(existing_path):
         user_data.pop("AVATAR_PNG_PATH", None)
 
-    user_json = preloaded_user_json or get_status(habitica_user_id, habitica_api_key)
-    if not isinstance(user_json, dict):
-        logger.warning("Could not fetch profile data for avatar rendering")
-        return None
-
     base_dir = Path(__file__).resolve().parent
-    rendered_path = render_avatar_png(
-        user_json,
-        cache_key=habitica_user_id,
-        cache_dir=base_dir / "Avatar",
-        renderer_path=base_dir / "render_avatar_from_json.js",
-        force_refresh=force_refresh,
+    user_json = (
+        preloaded_user_json
+        if preloaded_user_json is not None
+        else get_status(habitica_user_id, habitica_api_key)
     )
+    rendered_path = None
+    if isinstance(user_json, dict):
+        rendered_path = render_avatar_png(
+            user_json,
+            cache_key=habitica_user_id,
+            cache_dir=base_dir / "Avatar",
+            renderer_path=base_dir / "render_avatar_from_json.js",
+            force_refresh=force_refresh,
+        )
+    else:
+        logger.warning("Could not fetch profile data for local avatar rendering")
+
+    if not rendered_path:
+        exported_png = export_avatar_png(habitica_user_id, habitica_api_key)
+        if exported_png is not None:
+            rendered_path = cache_avatar_png(
+                exported_png,
+                cache_key=habitica_user_id,
+                cache_dir=base_dir / "Avatar",
+            )
+
     if rendered_path:
         user_data["AVATAR_PNG_PATH"] = rendered_path
     return rendered_path
@@ -1447,7 +1462,7 @@ async def ensure_avatar_png(
     *,
     force_refresh: bool = False,
 ) -> str | None:
-    """Return a valid cached avatar PNG, rendering it off the event loop."""
+    """Return a cached avatar, preferring local rendering over API export."""
     user_id = context.user_data.get("USER_ID")
     api_key = context.user_data.get("API_KEY")
     message = update.effective_message
@@ -1464,22 +1479,30 @@ async def ensure_avatar_png(
         context.user_data.pop("AVATAR_PNG_PATH", None)
 
     user_data = await asyncio.to_thread(get_status, user_id, api_key)
-    if not isinstance(user_data, dict):
-        if message:
-            await message.reply_text(
-                "❌ Could not fetch your Habitica profile. Please try again later."
-            )
-        return None
-
     base_dir = Path(__file__).resolve().parent
-    rendered_path = await asyncio.to_thread(
-        render_avatar_png,
-        user_data,
-        cache_key=user_id,
-        cache_dir=base_dir / "Avatar",
-        renderer_path=base_dir / "render_avatar_from_json.js",
-        force_refresh=force_refresh,
-    )
+    rendered_path = None
+    if isinstance(user_data, dict):
+        rendered_path = await asyncio.to_thread(
+            render_avatar_png,
+            user_data,
+            cache_key=user_id,
+            cache_dir=base_dir / "Avatar",
+            renderer_path=base_dir / "render_avatar_from_json.js",
+            force_refresh=force_refresh,
+        )
+    else:
+        logger.warning("Could not fetch profile data for local avatar rendering")
+
+    if not rendered_path:
+        exported_png = await asyncio.to_thread(export_avatar_png, user_id, api_key)
+        if exported_png is not None:
+            rendered_path = await asyncio.to_thread(
+                cache_avatar_png,
+                exported_png,
+                cache_key=user_id,
+                cache_dir=base_dir / "Avatar",
+            )
+
     if not rendered_path:
         if message:
             await message.reply_text(
@@ -5674,7 +5697,7 @@ async def _send_task_reminder(
     # 2) Next: existing PNG on disk (maybe created by /avatar or other panels)
     png_path = user_data.get("AVATAR_PNG_PATH")
     if not (png_path and is_valid_png(png_path)):
-        # 3) Fallback: render avatar via Node (no export_avatar_png)
+        # 3) Fallback: render locally, then use Habitica's PNG export if needed
         png_path = await asyncio.to_thread(
             ensure_avatar_png_no_update,
             habitica_user_id=habitica_user_id,

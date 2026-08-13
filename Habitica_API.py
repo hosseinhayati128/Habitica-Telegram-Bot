@@ -264,6 +264,7 @@ def export_avatar_png(user_id: str, api_key: str) -> bytes | None:
             headers=headers,
             timeout=REQUEST_TIMEOUT,
             stream=True,
+            allow_redirects=False,
         )
         response.raise_for_status()
 

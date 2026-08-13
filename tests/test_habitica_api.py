@@ -342,6 +342,7 @@ def test_avatar_export_returns_valid_bounded_png(monkeypatch):
     assert args == ("GET", "https://habitica.com/export/avatar-plain.png")
     assert kwargs["timeout"] == api.REQUEST_TIMEOUT
     assert kwargs["stream"] is True
+    assert kwargs["allow_redirects"] is False
     assert kwargs["headers"]["x-api-user"] == USER_ID
     assert kwargs["headers"]["x-api-key"] == API_KEY
     assert kwargs["headers"]["x-client"] == api.CLIENT_ID

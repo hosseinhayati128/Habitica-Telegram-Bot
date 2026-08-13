@@ -30,6 +30,7 @@ def block_unmocked_backends(monkeypatch):
         "buy_potion",
         "buy_reward",
         "create_todo_task",
+        "export_avatar_png",
         "get_status",
         "get_task_by_id",
         "get_tasks",
@@ -168,6 +169,139 @@ def _credential_update(text):
         effective_chat=SimpleNamespace(id=101),
         effective_user=SimpleNamespace(id=101),
     )
+
+
+def _avatar_update_and_context():
+    message = SimpleNamespace(reply_text=AsyncMock())
+    update = SimpleNamespace(effective_message=message)
+    context = SimpleNamespace(
+        user_data={
+            "USER_ID": "habitica-user",
+            "API_KEY": "habitica-key",
+        }
+    )
+    return update, context, message
+
+
+async def _call_inline(function, *args, **kwargs):
+    return function(*args, **kwargs)
+
+
+def test_avatar_local_render_success_skips_export(monkeypatch):
+    update, context, message = _avatar_update_and_context()
+    profile = {"preferences": {}, "items": {}, "stats": {}}
+    local_renderer = Mock(return_value="/private/cache/local-avatar.png")
+    exporter = Mock()
+    export_cache = Mock()
+    monkeypatch.setattr(bot, "get_status", Mock(return_value=profile))
+    monkeypatch.setattr(bot, "render_avatar_png", local_renderer)
+    monkeypatch.setattr(bot, "export_avatar_png", exporter)
+    monkeypatch.setattr(bot, "cache_avatar_png", export_cache)
+    monkeypatch.setattr(bot.asyncio, "to_thread", _call_inline)
+
+    result = run(bot.ensure_avatar_png(update, context, force_refresh=True))
+
+    assert result == "/private/cache/local-avatar.png"
+    assert context.user_data["AVATAR_PNG_PATH"] == result
+    local_renderer.assert_called_once()
+    exporter.assert_not_called()
+    export_cache.assert_not_called()
+    message.reply_text.assert_not_awaited()
+
+
+def test_avatar_local_render_failure_falls_back_to_export(monkeypatch):
+    update, context, message = _avatar_update_and_context()
+    exported_png = b"exported-png"
+    local_renderer = Mock(return_value=None)
+    exporter = Mock(return_value=exported_png)
+    export_cache = Mock(return_value="/private/cache/exported-avatar.png")
+    monkeypatch.setattr(
+        bot,
+        "get_status",
+        Mock(return_value={"preferences": {}, "items": {}, "stats": {}}),
+    )
+    monkeypatch.setattr(bot, "render_avatar_png", local_renderer)
+    monkeypatch.setattr(bot, "export_avatar_png", exporter)
+    monkeypatch.setattr(bot, "cache_avatar_png", export_cache)
+    monkeypatch.setattr(bot.asyncio, "to_thread", _call_inline)
+
+    result = run(bot.ensure_avatar_png(update, context, force_refresh=True))
+
+    assert result == "/private/cache/exported-avatar.png"
+    local_renderer.assert_called_once()
+    exporter.assert_called_once_with("habitica-user", "habitica-key")
+    assert export_cache.call_args.args == (exported_png,)
+    assert export_cache.call_args.kwargs["cache_key"] == "habitica-user"
+    assert export_cache.call_args.kwargs["cache_dir"].name == "Avatar"
+    message.reply_text.assert_not_awaited()
+
+
+def test_avatar_profile_fetch_failure_falls_back_to_export(monkeypatch):
+    update, context, message = _avatar_update_and_context()
+    exported_png = b"exported-png"
+    local_renderer = Mock()
+    monkeypatch.setattr(bot, "get_status", Mock(return_value=None))
+    monkeypatch.setattr(bot, "render_avatar_png", local_renderer)
+    monkeypatch.setattr(bot, "export_avatar_png", Mock(return_value=exported_png))
+    monkeypatch.setattr(
+        bot,
+        "cache_avatar_png",
+        Mock(return_value="/private/cache/exported-avatar.png"),
+    )
+    monkeypatch.setattr(bot.asyncio, "to_thread", _call_inline)
+
+    result = run(bot.ensure_avatar_png(update, context, force_refresh=True))
+
+    assert result == "/private/cache/exported-avatar.png"
+    local_renderer.assert_not_called()
+    message.reply_text.assert_not_awaited()
+
+
+def test_avatar_local_and_export_failure_sends_one_error(monkeypatch):
+    update, context, message = _avatar_update_and_context()
+    monkeypatch.setattr(
+        bot,
+        "get_status",
+        Mock(return_value={"preferences": {}, "items": {}, "stats": {}}),
+    )
+    monkeypatch.setattr(bot, "render_avatar_png", Mock(return_value=None))
+    monkeypatch.setattr(bot, "export_avatar_png", Mock(return_value=None))
+    export_cache = Mock()
+    monkeypatch.setattr(bot, "cache_avatar_png", export_cache)
+    monkeypatch.setattr(bot.asyncio, "to_thread", _call_inline)
+
+    result = run(bot.ensure_avatar_png(update, context, force_refresh=True))
+
+    assert result is None
+    assert "AVATAR_PNG_PATH" not in context.user_data
+    export_cache.assert_not_called()
+    message.reply_text.assert_awaited_once_with(
+        "❌ Failed to generate avatar image. Please try again later."
+    )
+
+
+def test_avatar_no_update_uses_export_when_profile_fetch_fails(monkeypatch):
+    user_data = {}
+    exported_png = b"exported-png"
+    local_renderer = Mock()
+    exporter = Mock(return_value=exported_png)
+    export_cache = Mock(return_value="/private/cache/exported-avatar.png")
+    monkeypatch.setattr(bot, "get_status", Mock(return_value=None))
+    monkeypatch.setattr(bot, "render_avatar_png", local_renderer)
+    monkeypatch.setattr(bot, "export_avatar_png", exporter)
+    monkeypatch.setattr(bot, "cache_avatar_png", export_cache)
+
+    result = bot.ensure_avatar_png_no_update(
+        habitica_user_id="habitica-user",
+        habitica_api_key="habitica-key",
+        user_data=user_data,
+    )
+
+    assert result == "/private/cache/exported-avatar.png"
+    assert user_data["AVATAR_PNG_PATH"] == result
+    local_renderer.assert_not_called()
+    exporter.assert_called_once_with("habitica-user", "habitica-key")
+    assert export_cache.call_args.args == (exported_png,)
 
 
 def test_cancelled_relink_keeps_final_credentials_unchanged():

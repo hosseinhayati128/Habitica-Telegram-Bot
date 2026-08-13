@@ -96,6 +96,67 @@ def _cache_path(cache_dir: Path, cache_key: str) -> Path:
     return cache_dir / f"avatar-{digest}.png"
 
 
+def cache_avatar_png(
+    png_data: bytes,
+    *,
+    cache_key: str,
+    cache_dir: str | os.PathLike[str],
+) -> str | None:
+    """Validate and atomically cache exported avatar bytes.
+
+    The destination naming and process-wide lock intentionally match the local
+    renderer so an API fallback cannot race a render for the same cache file.
+    """
+    if (
+        not isinstance(png_data, bytes)
+        or not cache_key
+        or len(png_data) <= len(PNG_SIGNATURE)
+        or len(png_data) > MAX_AVATAR_BYTES
+        or not png_data.startswith(PNG_SIGNATURE)
+    ):
+        logger.warning("Avatar export was not a valid bounded PNG")
+        return None
+
+    cache_directory = Path(cache_dir).resolve()
+    final_path = _cache_path(cache_directory, cache_key)
+
+    with _render_lock:
+        try:
+            cache_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(cache_directory, 0o700)
+        except OSError:
+            logger.exception("Could not prepare the private avatar cache directory")
+            return None
+
+        staged_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=cache_directory,
+                prefix=".avatar-",
+                suffix=".tmp",
+                delete=False,
+            ) as staged:
+                staged_path = Path(staged.name)
+                staged.write(png_data)
+                staged.flush()
+                os.fsync(staged.fileno())
+
+            os.chmod(staged_path, 0o600)
+            os.replace(staged_path, final_path)
+            staged_path = None
+        except OSError:
+            logger.exception("Could not atomically cache an exported avatar")
+            return None
+        finally:
+            if staged_path is not None:
+                try:
+                    staged_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Could not remove a temporary avatar file")
+
+    return str(final_path) if is_valid_png(final_path) else None
+
+
 def render_avatar_png(
     user_data: Mapping[str, Any],
     *,
