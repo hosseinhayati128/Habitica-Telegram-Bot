@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en" data-theme-mode="auto">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="color-scheme" content="light dark">
+    <meta name="theme-color" content="#271b3d">
+    <title>Habitica Companion</title>
+    <script src="https://telegram.org/js/telegram-web-app.js?63"></script>
+    <script src="{{ url_for('static', filename='miniapp/theme-init.js') }}"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='miniapp/app.css') }}">
+    <script defer src="{{ url_for('static', filename='miniapp/app.js') }}"></script>
+  </head>
+  <body>
+    <div class="safe-area-shell">
+      <div class="app-shell">
+        <header class="app-header">
+          <a class="brand" href="#home" aria-label="Habitica Companion home">
+            <span class="brand-mark" aria-hidden="true">
+              <svg viewBox="0 0 24 24" role="img">
+                <path d="M4 3.75h16v14.5l-4 2-4-2-4 2-4-2z"/>
+                <path class="brand-mark-cut" d="M8.2 7.2 12 5l3.8 2.2v4.4L12 14l-3.8-2.4z"/>
+              </svg>
+            </span>
+            <span>Habitica</span>
+          </a>
+
+          <div class="header-actions">
+            <button class="icon-button" id="refresh-button" type="button" aria-label="Refresh profile and avatar">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M19.2 7.1A8 8 0 1 0 20 15h-2.4a5.7 5.7 0 1 1-.2-6.3L14 12h7V5z"/>
+              </svg>
+            </button>
+            <div class="theme-control">
+              <button class="icon-button" id="theme-button" type="button" aria-label="Choose appearance" aria-expanded="false" aria-controls="theme-menu">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9Zm0 15.7A6.7 6.7 0 0 1 9.4 5.8 9.3 9.3 0 0 0 18.2 15a6.7 6.7 0 0 1-6.2 3.7Z"/>
+                </svg>
+              </button>
+              <div class="theme-menu" id="theme-menu" role="menu" aria-label="Appearance" hidden>
+                <p class="theme-menu-title">Appearance</p>
+                <button class="theme-option" type="button" role="menuitemradio" data-theme-choice="auto" aria-checked="true">
+                  <span class="theme-option-icon theme-option-auto" aria-hidden="true"></span>
+                  <span><strong>Auto</strong><small>Follow Telegram</small></span>
+                  <span class="theme-option-check" aria-hidden="true">✓</span>
+                </button>
+                <button class="theme-option" type="button" role="menuitemradio" data-theme-choice="light" aria-checked="false">
+                  <span class="theme-option-icon theme-option-light" aria-hidden="true"></span>
+                  <span><strong>Light</strong><small>Bright and clear</small></span>
+                  <span class="theme-option-check" aria-hidden="true">✓</span>
+                </button>
+                <button class="theme-option" type="button" role="menuitemradio" data-theme-choice="dark" aria-checked="false">
+                  <span class="theme-option-icon theme-option-dark" aria-hidden="true"></span>
+                  <span><strong>Dark</strong><small>Easy on the eyes</small></span>
+                  <span class="theme-option-check" aria-hidden="true">✓</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </header>
+
+        <main class="app-content" id="main-content">
+          <section class="view is-active" id="home-view" data-view="home" role="tabpanel" aria-labelledby="home-tab">
+            <div class="welcome-copy">
+              <p class="eyebrow">Your adventure</p>
+              <h1>Character overview</h1>
+              <p>One clear look at your progress before the next quest.</p>
+            </div>
+
+            <article class="profile-card" id="profile-card" aria-busy="true">
+              <div class="profile-glow" aria-hidden="true"></div>
+              <div class="avatar-column">
+                <div class="avatar-frame" id="avatar-frame">
+                  <div class="avatar-backdrop" aria-hidden="true"></div>
+                  <img id="avatar-image" alt="" hidden>
+                  <div class="avatar-placeholder" id="avatar-placeholder" aria-label="Avatar loading">
+                    <div class="avatar-silhouette" aria-hidden="true"></div>
+                    <span>Loading avatar</span>
+                  </div>
+                </div>
+                <div class="gold-chip" id="gold-chip" hidden>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9 8h4.2a3 3 0 0 1 0 6H9m3-8v12m-4-7h5"/></svg>
+                  <span id="gold-value">—</span>
+                </div>
+              </div>
+
+              <div class="profile-details">
+                <div class="identity-block">
+                  <div class="identity-heading">
+                    <div class="class-medallion skeleton-pulse" id="class-medallion" aria-hidden="true">
+                      <span id="class-symbol">◆</span>
+                    </div>
+                    <div class="identity-copy">
+                      <div class="skeleton-line skeleton-name" id="name-skeleton"></div>
+                      <h2 id="display-name" hidden>Habitican</h2>
+                      <div class="identity-meta" id="identity-meta" hidden>
+                        <span id="username"></span>
+                        <span class="meta-dot" aria-hidden="true">•</span>
+                        <span>Level <strong id="level-value">0</strong> <span id="class-label">Adventurer</span></span>
+                      </div>
+                      <div class="skeleton-line skeleton-meta" id="meta-skeleton"></div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="stats-list" aria-label="Character stats">
+                  <div class="stat-row stat-health" id="health-row">
+                    <div class="stat-icon" aria-hidden="true">
+                      <svg viewBox="0 0 24 24"><path d="m12 21-1.5-1.35C5.2 14.9 2 12 2 8.45A4.45 4.45 0 0 1 6.5 4 4.9 4.9 0 0 1 12 7.1 4.9 4.9 0 0 1 17.5 4 4.45 4.45 0 0 1 22 8.45c0 3.55-3.2 6.45-8.5 11.2z"/></svg>
+                    </div>
+                    <div class="stat-content">
+                      <div class="stat-label"><span><span class="stat-short">HP</span><span class="stat-long">Health</span></span><span id="health-value">— / —</span></div>
+                      <div class="progress-track"><div class="progress-fill" id="health-progress"></div></div>
+                    </div>
+                  </div>
+
+                  <div class="stat-row stat-experience" id="experience-row">
+                    <div class="stat-icon" aria-hidden="true">
+                      <svg viewBox="0 0 24 24"><path d="m12 1.8 2.3 7.9 7.9 2.3-7.9 2.3-2.3 7.9-2.3-7.9L1.8 12l7.9-2.3z"/></svg>
+                    </div>
+                    <div class="stat-content">
+                      <div class="stat-label"><span><span class="stat-short">XP</span><span class="stat-long">Experience</span></span><span id="experience-value">— / —</span></div>
+                      <div class="progress-track"><div class="progress-fill" id="experience-progress"></div></div>
+                    </div>
+                  </div>
+
+                  <div class="stat-row stat-mana" id="mana-row">
+                    <div class="stat-icon" aria-hidden="true">
+                      <svg viewBox="0 0 24 24"><path d="m12 1.5 7 10.5-7 10.5L5 12z"/><path class="stat-icon-cut" d="m12 6 3.8 6-3.8 6z"/></svg>
+                    </div>
+                    <div class="stat-content">
+                      <div class="stat-label"><span><span class="stat-short">MP</span><span class="stat-long">Mana</span></span><span id="mana-value">— / —</span></div>
+                      <div class="progress-track"><div class="progress-fill" id="mana-progress"></div></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="profile-loading-overlay" id="profile-loading-overlay" aria-hidden="true"></div>
+            </article>
+
+            <div class="notice" id="notice" role="status" aria-live="polite" hidden>
+              <div class="notice-icon" aria-hidden="true">!</div>
+              <div><strong id="notice-title">Couldn’t load your profile</strong><p id="notice-message"></p></div>
+              <button id="notice-retry" type="button">Try again</button>
+            </div>
+
+            <section class="coming-next" aria-labelledby="coming-next-title">
+              <div>
+                <p class="eyebrow">Milestone one</p>
+                <h2 id="coming-next-title">Your command center is taking shape</h2>
+                <p>Task views arrive next. For now, your live character is always close at hand.</p>
+              </div>
+              <div class="quest-orbit" aria-hidden="true"><span></span><span></span><span></span></div>
+            </section>
+          </section>
+
+          <section class="view placeholder-view" id="habits-view" data-view="habits" role="tabpanel" aria-labelledby="habits-tab" hidden>
+            <div class="placeholder-art placeholder-habits" aria-hidden="true"><span>＋</span></div>
+            <p class="eyebrow">Coming next</p><h1>Habits</h1><p>Build momentum with every positive choice.</p>
+          </section>
+          <section class="view placeholder-view" id="dailies-view" data-view="dailies" role="tabpanel" aria-labelledby="dailies-tab" hidden>
+            <div class="placeholder-art placeholder-dailies" aria-hidden="true"><span>✓</span></div>
+            <p class="eyebrow">Coming next</p><h1>Dailies</h1><p>Keep your recurring quests on track.</p>
+          </section>
+          <section class="view placeholder-view" id="todos-view" data-view="todos" role="tabpanel" aria-labelledby="todos-tab" hidden>
+            <div class="placeholder-art placeholder-todos" aria-hidden="true"><span>◆</span></div>
+            <p class="eyebrow">Coming next</p><h1>Todos</h1><p>Turn your next goal into experience.</p>
+          </section>
+        </main>
+
+        <nav class="bottom-nav" aria-label="Primary" role="tablist">
+          <button class="nav-item is-active" id="home-tab" type="button" role="tab" aria-selected="true" aria-controls="home-view" data-tab="home">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"/></svg><span>Home</span>
+          </button>
+          <button class="nav-item" id="habits-tab" type="button" role="tab" aria-selected="false" aria-controls="habits-view" data-tab="habits" tabindex="-1">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M3 12h18"/></svg><span>Habits</span>
+          </button>
+          <button class="nav-item" id="dailies-tab" type="button" role="tab" aria-selected="false" aria-controls="dailies-view" data-tab="dailies" tabindex="-1">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v16H4zM8 2v6m8-6v6M7 13l3 3 7-7"/></svg><span>Dailies</span>
+          </button>
+          <button class="nav-item" id="todos-tab" type="button" role="tab" aria-selected="false" aria-controls="todos-view" data-tab="todos" tabindex="-1">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v17H5zM8 2h8v4H8zm1 9h6m-6 4h6"/></svg><span>Todos</span>
+          </button>
+        </nav>
+      </div>
+    </div>
+  </body>
+</html>

@@ -6,7 +6,7 @@
   "main": "render_avatar_from_json.js",
   "scripts": {
     "build:avatar": "browserify node_modules/habitica-avatar/habitica-avatar.js --standalone habiticaAvatar --outfile habitica-avatar.bundle.js",
-    "check:js": "node --check habitica-avatar.js && node --check habitica-avatar.bundle.js && node --check render_avatar.js && node --check render_avatar_from_json.js",
+    "check:js": "node --check habitica-avatar.js && node --check habitica-avatar.bundle.js && node --check render_avatar.js && node --check render_avatar_from_json.js && node --check static/miniapp/theme-init.js && node --check static/miniapp/app.js",
     "test": "npm run check:js"
   },
   "keywords": [
