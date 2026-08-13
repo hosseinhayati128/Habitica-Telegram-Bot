@@ -7,8 +7,9 @@ development and a synchronous Flask/WSGI deployment designed for PythonAnywhere.
 Try the public instance at [@HHabitica_bot](https://t.me/HHabitica_bot). This is a
 fan project and is not affiliated with or endorsed by Habitica.
 
-This repository currently contains the existing Telegram bot only. A Telegram Mini
-App is intentionally outside this stabilization milestone.
+The same Flask application also serves a first-milestone Telegram Mini App with a
+live character overview, authenticated avatar, three appearance modes, and placeholder
+navigation for Habits, Dailies, and Todos.
 
 ## Features and commands
 
@@ -20,6 +21,8 @@ App is intentionally outside this stabilization milestone.
 - Habitica task reminders delivered to a DM, group, or forum topic.
 - Local avatar rendering through Node.js, Puppeteer, and a tracked browser bundle.
 - Flask webhook and authenticated reminder-tick endpoints for PythonAnywhere.
+- Telegram Mini App Home view with signed Telegram authentication and read-only access
+  to the existing linked Habitica account.
 
 | Command | Purpose |
 | --- | --- |
@@ -90,13 +93,18 @@ load a `.env` file.
 | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | Yes | BotFather token used by polling and WSGI. |
 | `BOT_DATA_PATH` | Recommended in production | `botdata.pkl` in the process working directory. Use an absolute path on WSGI hosts. |
-| `TELEGRAM_WEBHOOK_SECRET` | Optional for compatibility; strongly recommended | When set, `/telegram-webhook` requires Telegram's matching `X-Telegram-Bot-Api-Secret-Token` header. If unset, legacy webhook requests remain accepted. |
+| `TELEGRAM_WEBHOOK_SECRET` | Required for webhook delivery | `/telegram-webhook` requires Telegram's matching `X-Telegram-Bot-Api-Secret-Token` header and fails closed when this value is absent. |
+| `ALLOW_INSECURE_WEBHOOK_WITHOUT_SECRET` | Migration only | Defaults to `false`. A temporary `true` preserves legacy secretless delivery while `setWebhook(secret_token=...)` is configured. Never leave it enabled on an internet-facing deployment. |
 | `TICK_TOKEN` | Required to use `/tick` | Shared secret for the reminder endpoint. An unset value denies every tick request. |
 | `ALLOW_LEGACY_TICK_QUERY_TOKEN` | Migration only | Defaults to `true`, allowing legacy `/tick?token=...`. Set to `false` after moving the scheduler to a header. |
 | `RUNTIME_LOCK_TIMEOUT_SECONDS` | No | `2.0`. Nonnegative seconds to wait for the cross-process persistence lock, capped at 30. Invalid values use the default. |
 | `REMINDER_WINDOW_SECONDS` | No | `60`, constrained to 1–3600 seconds. Controls the reminder matching window. |
 | `AVATAR_RENDER_TIMEOUT_SECONDS` | No | `45`; positive values are capped at 120 seconds. |
 | `NODE_BIN` | No | Explicit Node executable name/path. Otherwise `node`, `nodejs`, and common NVM paths are searched. |
+| `MINIAPP_AUTH_MAX_AGE_SECONDS` | No | `3600`, capped at 86400. Maximum age of signed Telegram Mini App init data. |
+| `MINIAPP_DEV_MODE` | Local development only | Disabled. Set exactly `1` together with `MINIAPP_DEV_TELEGRAM_USER_ID` to open the Mini App outside Telegram. Never enable this in production. |
+| `MINIAPP_DEV_TELEGRAM_USER_ID` | Local development only | Existing linked Telegram user ID used only when development mode is explicitly enabled and the auth header is absent. |
+| `MINIAPP_AVATAR_REFRESH_COOLDOWN_SECONDS` | No | `30`, capped at 300. Reuses a recently rendered avatar instead of repeatedly launching Puppeteer for authenticated refresh replays. |
 
 Never commit real values. `.gitignore` excludes common secret files, pickle data,
 runtime locks, caches, and avatar output.
@@ -130,14 +138,43 @@ reminders require the WSGI deployment or another deliberate tick integration.
 
 Do not run polling and WSGI simultaneously against the same `BOT_DATA_PATH`.
 
+## Mini App local development
+
+The Mini App is served by the existing Flask application; it does not need a frontend
+build step or a second web server. To preview it in an ordinary browser, use a copy of
+development persistence that already contains a linked Telegram account:
+
+```bash
+export TELEGRAM_BOT_TOKEN='replace-with-your-development-token'
+export BOT_DATA_PATH="$PWD/.runtime/dev-botdata.pkl"
+export MINIAPP_DEV_MODE=1
+export MINIAPP_DEV_TELEGRAM_USER_ID='your-linked-telegram-numeric-id'
+
+flask --app webhook_app:flask_app run --debug
+```
+
+Open `http://127.0.0.1:5000/miniapp/`. Local dev mode is considered only when the
+`Authorization` header is absent; an invalid signed header never falls back to the
+development identity. Keep the mode off when testing production authentication.
+
+The browser uses separate authenticated requests for profile JSON and the PNG, showing
+the status before it begins potentially expensive avatar work. A first avatar request
+can take up to the configured render timeout while Puppeteer builds the cached image;
+subsequent requests reuse the existing opaque avatar cache. The refresh button requests
+`/miniapp/api/avatar?refresh=1` and requests regeneration, subject to the short
+server-side refresh cooldown.
+
 ## PythonAnywhere Flask/WSGI deployment
 
 The WSGI entry point is `webhook_app.flask_app`. It exposes:
 
 - `POST /telegram-webhook` for Telegram JSON updates (maximum body: 1 MiB).
 - `GET /tick` for authenticated reminder checks.
+- `GET /miniapp/` for the Mini App frontend.
+- `GET /miniapp/api/me` for a signed, normalized Habitica character summary.
+- `GET /miniapp/api/avatar` for the signed user's locally rendered PNG.
 
-Both routes serialize their complete persistence transaction with a Linux advisory
+The webhook and tick routes serialize their complete persistence transaction with a Linux advisory
 lock next to the pickle file. Lock contention returns HTTP 503 rather than allowing
 two workers to overwrite each other's state.
 
@@ -160,6 +197,20 @@ chmod 700 /home/<username>/.local/share/habitica-telegram-bot
 Use the Python version actually enabled for the PythonAnywhere web app if it is newer
 than 3.10. Configure the web app to use this virtual environment.
 
+For an existing checkout, do not clone again. Update or upload the reviewed source
+files in place, activate the virtual environment already attached to the web app, and
+refresh the bounded dependencies:
+
+```bash
+cd /home/<username>/Habitica-Telegram-Bot
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+npm ci
+```
+
+Then open PythonAnywhere's **Web** tab and press **Reload** for the existing web app.
+Do not start polling against the same `BOT_DATA_PATH` while WSGI is active.
+
 ### 2. Configure the private WSGI file
 
 Set secrets in PythonAnywhere's private WSGI configuration or another host-provided
@@ -180,6 +231,7 @@ os.environ["BOT_DATA_PATH"] = (
 os.environ["TELEGRAM_WEBHOOK_SECRET"] = "replace-on-host"
 os.environ["TICK_TOKEN"] = "replace-on-host"
 os.environ["ALLOW_LEGACY_TICK_QUERY_TOKEN"] = "false"
+os.environ["MINIAPP_AUTH_MAX_AGE_SECONDS"] = "3600"
 
 from webhook_app import flask_app as application
 ```
@@ -212,6 +264,25 @@ For an existing deployment, a low-interruption migration is:
 
 If the application variable is configured but Telegram's webhook is not updated with
 the same value, every webhook request receives HTTP 403.
+
+### 4. Configure the Telegram Mini App
+
+After the HTTPS web app is reloaded and `https://<username>.pythonanywhere.com/miniapp/`
+opens successfully, configure the launch point in [@BotFather](https://t.me/BotFather):
+
+Telegram requires the production Mini App URL to use HTTPS; local HTTP is only for
+ordinary-browser development.
+
+1. Run `/setmenubutton`, select the bot, and use a label such as `Open App`.
+2. Enter `https://<username>.pythonanywhere.com/miniapp/` as the Web App URL.
+3. Optionally enable the same URL as the Main Mini App under `/mybots` → the bot →
+   **Bot Settings** → **Configure Mini App**.
+
+Telegram supplies signed `initData` when the app is launched through its Menu Button
+or Main Mini App. The client sends the untouched value as
+`Authorization: tma <initData>`; the server verifies Telegram's bot-token HMAC and
+freshness before reading persistence. No user ID from a URL, query parameter,
+`initDataUnsafe`, or browser storage is accepted for authorization.
 
 ## Reminder tick authentication and migration
 
@@ -254,6 +325,13 @@ The WSGI routes use `<BOT_DATA_PATH>.lock` to serialize webhook and tick transac
 across worker processes on the same Linux host. This does not make pickle a distributed
 database and does not coordinate another machine or an independently started polling
 process.
+
+Mini App credential lookup creates a fresh `PicklePersistence` adapter and uses the
+same lock only long enough to read and copy one user's linked credentials. It never
+flushes or rewrites the pickle. The lock is released before the bounded Habitica HTTP
+request or avatar render begins, so a slow renderer cannot block webhook persistence.
+This is a deliberately small read-only bridge for the current trusted server-side
+pickle; it should be replaced behind the adapter if persistence is migrated later.
 
 For a consistent backup, stop or quiesce webhook/tick processing first, copy the file
 to a private non-web directory, restrict it to `0600`, then resume processing. Do not
@@ -323,6 +401,11 @@ payload, or runtime output is staged.
   query authentication was disabled, `?token=` is intentionally ignored.
 - **State resets after reload:** set an absolute `BOT_DATA_PATH`, ensure its parent is
   writable by the web app, and confirm polling/WSGI are not using different files.
+- **Mini App says “Open from Telegram”:** launch it through the bot's configured Menu
+  Button/Main Mini App. Ordinary browsers have no signed `initData`; use the explicit
+  two-variable development mode only on a local machine.
+- **Mini App says “Connect Habitica first”:** send `/start` to the bot in a private chat
+  and link the same Telegram account that opened the Mini App.
 - **Avatar says Node is unavailable:** run `npm ci`, set `NODE_BIN` to an executable
   Node path if auto-detection fails, and verify Puppeteer's Chromium can start.
 - **Avatar times out or returns no PNG:** check host resource limits and optionally
@@ -341,7 +424,7 @@ payload, or runtime output is staged.
   retry of non-idempotent mutations.
 - Webhook and tick secrets use timing-safe comparisons.
 - Raw Telegram updates and raw Habitica response bodies are not normal log content.
-- The bot intentionally remains a local-pickle deployment for this milestone. Protect
+- The bot and Mini App intentionally remain a local-pickle deployment for this milestone. Protect
   the host account, backups, WSGI file, and state directory accordingly.
 
 ## Known limitations

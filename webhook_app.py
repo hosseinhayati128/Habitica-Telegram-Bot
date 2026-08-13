@@ -13,6 +13,7 @@ from flask import Flask, jsonify, make_response, request
 from telegram import Update
 
 from habitica_bot import build_application, run_reminder_tick
+from miniapp_backend import miniapp_blueprint
 from runtime_lock import RuntimeLockUnavailable, acquire_runtime_lock
 
 LOGGER = logging.getLogger(__name__)
@@ -23,6 +24,7 @@ MAX_RECENT_UPDATE_IDS = 512
 
 flask_app = Flask(__name__)
 flask_app.config["MAX_CONTENT_LENGTH"] = DEFAULT_MAX_WEBHOOK_BODY_BYTES
+flask_app.register_blueprint(miniapp_blueprint)
 
 
 class InvalidTelegramUpdate(ValueError):
@@ -57,9 +59,14 @@ def _secure_equals(provided: str | None, expected: str | None) -> bool:
 def _webhook_secret_is_valid() -> bool:
     expected = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
     if not expected:
-        # Compatibility mode for existing deployments. Configure the variable
-        # and pass the same value as Telegram's setWebhook(secret_token=...).
-        return True
+        # Fail closed by default.  The compatibility escape hatch exists only
+        # for a short migration window while setWebhook(secret_token=...) is
+        # being configured; never enable it on an internet-facing steady state.
+        compatibility = os.environ.get(
+            "ALLOW_INSECURE_WEBHOOK_WITHOUT_SECRET",
+            "false",
+        )
+        return compatibility.strip().lower() in {"1", "true", "yes", "on"}
     return _secure_equals(
         request.headers.get("X-Telegram-Bot-Api-Secret-Token"),
         expected,

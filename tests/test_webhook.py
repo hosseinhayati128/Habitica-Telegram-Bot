@@ -99,6 +99,7 @@ def webhook_module(monkeypatch, tmp_path):
     monkeypatch.setenv("BOT_DATA_PATH", str(tmp_path / "botdata.pkl"))
     monkeypatch.setenv("RUNTIME_LOCK_TIMEOUT_SECONDS", "0")
     monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET", raising=False)
+    monkeypatch.setenv("ALLOW_INSECURE_WEBHOOK_WITHOUT_SECRET", "true")
     monkeypatch.delenv("TICK_TOKEN", raising=False)
     monkeypatch.delenv("ALLOW_LEGACY_TICK_QUERY_TOKEN", raising=False)
 
@@ -137,7 +138,7 @@ def test_webhook_accepts_json_with_charset_and_persists_update_id(webhook_module
     assert state.build_calls == [{"register_commands": False, "persistence_on_flush": True}]
 
 
-def test_webhook_secret_is_optional_but_enforced_when_configured(webhook_module, monkeypatch):
+def test_webhook_secret_is_enforced_when_configured(webhook_module, monkeypatch):
     module, state = webhook_module
     client = module.flask_app.test_client()
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "expected-secret")
@@ -159,6 +160,23 @@ def test_webhook_secret_is_optional_but_enforced_when_configured(webhook_module,
         headers={"X-Telegram-Bot-Api-Secret-Token": "expected-secret"},
     )
     assert response.status_code == 200
+    assert len(state.process_attempts) == 1
+
+
+def test_webhook_without_secret_fails_closed_unless_compatibility_is_explicit(
+    webhook_module,
+    monkeypatch,
+):
+    module, state = webhook_module
+    client = module.flask_app.test_client()
+    monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET", raising=False)
+    monkeypatch.delenv("ALLOW_INSECURE_WEBHOOK_WITHOUT_SECRET", raising=False)
+
+    assert _post_update(client, 2).status_code == 403
+    assert state.build_calls == []
+
+    monkeypatch.setenv("ALLOW_INSECURE_WEBHOOK_WITHOUT_SECRET", "true")
+    assert _post_update(client, 2).status_code == 200
     assert len(state.process_attempts) == 1
 
 

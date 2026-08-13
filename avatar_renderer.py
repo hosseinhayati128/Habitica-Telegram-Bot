@@ -91,9 +91,15 @@ def _avatar_payload(user_data: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _cache_path(cache_dir: Path, cache_key: str) -> Path:
+def get_avatar_cache_path(
+    cache_dir: str | os.PathLike[str],
+    cache_key: str,
+) -> Path:
+    """Return the renderer's opaque deterministic cache path."""
+
+    cache_directory = Path(cache_dir).resolve()
     digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:24]
-    return cache_dir / f"avatar-{digest}.png"
+    return cache_directory / f"avatar-{digest}.png"
 
 
 def render_avatar_png(
@@ -114,7 +120,7 @@ def render_avatar_png(
     cache_directory = Path(cache_dir).resolve()
     renderer = Path(renderer_path).resolve()
     bundle = renderer.with_name("habitica-avatar.bundle.js")
-    final_path = _cache_path(cache_directory, cache_key)
+    final_path = get_avatar_cache_path(cache_directory, cache_key)
 
     if not force_refresh and is_valid_png(final_path):
         return str(final_path)
@@ -139,8 +145,11 @@ def render_avatar_png(
         try:
             cache_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             os.chmod(cache_directory, 0o700)
-        except OSError:
-            logger.exception("Could not prepare the private avatar cache directory")
+        except OSError as exc:
+            logger.error(
+                "Could not prepare the private avatar cache directory (%s)",
+                type(exc).__name__,
+            )
             return None
 
         staged_path: Path | None = None
@@ -202,8 +211,11 @@ def render_avatar_png(
                 os.chmod(staged_path, 0o600)
                 os.replace(staged_path, final_path)
                 staged_path = None
-        except (OSError, TypeError, ValueError):
-            logger.exception("Avatar rendering failed while handling local files")
+        except (OSError, TypeError, ValueError) as exc:
+            logger.error(
+                "Avatar rendering failed while handling local files (%s)",
+                type(exc).__name__,
+            )
             return None
         finally:
             if staged_path is not None:
