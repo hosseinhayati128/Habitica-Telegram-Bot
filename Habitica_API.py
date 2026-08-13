@@ -21,11 +21,6 @@ CLIENT_ID = "habitica-telegram-bot"
 # important when a caller delegates them from an async Telegram handler.
 REQUEST_TIMEOUT = (5.0, 30.0)
 
-MAX_AVATAR_BYTES = 10 * 1024 * 1024
-PNG_CONTENT_TYPE = "image/png"
-PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-AVATAR_CHUNK_SIZE = 64 * 1024
-
 logger = logging.getLogger(__name__)
 
 
@@ -247,73 +242,3 @@ def run_cron(user_id: str, api_key: str) -> bool:
     """Run Habitica's daily cron and require an explicit success response."""
     response_data = _make_request("POST", "/cron", user_id, api_key)
     return response_data is not None and response_data.get("success") is True
-
-
-def export_avatar_png(user_id: str, api_key: str) -> bytes | None:
-    """Return a bounded, validated PNG export for the authenticated user."""
-    base = BASE_URL.split("/api/", 1)[0]
-    url = f"{base}/export/avatar-plain.png"
-    headers = _headers(user_id, api_key)
-    headers["Accept"] = PNG_CONTENT_TYPE
-
-    response = None
-    try:
-        response = requests.request(
-            "GET",
-            url,
-            headers=headers,
-            timeout=REQUEST_TIMEOUT,
-            stream=True,
-            allow_redirects=False,
-        )
-        response.raise_for_status()
-
-        content_type = response.headers.get("Content-Type", "")
-        media_type = content_type.split(";", 1)[0].strip().lower()
-        if media_type != PNG_CONTENT_TYPE:
-            logger.warning("Habitica avatar export returned an invalid content type")
-            return None
-
-        content_length = response.headers.get("Content-Length")
-        if content_length is not None:
-            try:
-                declared_size = int(content_length)
-            except (TypeError, ValueError):
-                logger.warning("Habitica avatar export returned an invalid content length")
-                return None
-            if declared_size < 0 or declared_size > MAX_AVATAR_BYTES:
-                logger.warning("Habitica avatar export exceeded the size limit")
-                return None
-
-        chunks = []
-        total_size = 0
-        for chunk in response.iter_content(chunk_size=AVATAR_CHUNK_SIZE):
-            if not chunk:
-                continue
-            total_size += len(chunk)
-            if total_size > MAX_AVATAR_BYTES:
-                logger.warning("Habitica avatar export exceeded the size limit")
-                return None
-            chunks.append(chunk)
-
-        content = b"".join(chunks)
-        if not content.startswith(PNG_SIGNATURE):
-            logger.warning("Habitica avatar export returned invalid PNG data")
-            return None
-        return content
-    except requests.exceptions.HTTPError as exc:
-        status_code = getattr(exc.response, "status_code", None)
-        logger.warning(
-            "Habitica avatar export failed status=%s",
-            status_code,
-        )
-        return None
-    except requests.exceptions.RequestException as exc:
-        logger.warning(
-            "Habitica avatar export request failed error=%s",
-            type(exc).__name__,
-        )
-        return None
-    finally:
-        if response is not None:
-            response.close()

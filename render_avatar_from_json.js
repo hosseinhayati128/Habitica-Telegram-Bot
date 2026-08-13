@@ -139,7 +139,10 @@ async function main() {
       return Array.from(imgs).every(
         (img) => img.complete && img.naturalWidth > 0
       );
-    }, { timeout: 10000 });
+    }, { timeout: 10000 }).catch(() => {
+      // Some optional layers may be missing or slow. Keep the original
+      // renderer behavior and capture the layers that did load.
+    });
 
     // Tiny extra buffer to let layout settle
     await new Promise((resolve) => setTimeout(resolve, 300));

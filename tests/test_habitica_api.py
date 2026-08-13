@@ -16,18 +16,13 @@ class FakeResponse:
         *,
         payload=None,
         status_code=200,
-        headers=None,
-        chunks=None,
         json_error=None,
         error_message="raw-response-secret",
     ):
         self._payload = payload
         self.status_code = status_code
-        self.headers = headers or {}
-        self._chunks = chunks or []
         self._json_error = json_error
         self._error_message = error_message
-        self.closed = False
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -40,14 +35,6 @@ class FakeResponse:
         if self._json_error is not None:
             raise self._json_error
         return self._payload
-
-    def iter_content(self, chunk_size):
-        assert chunk_size == api.AVATAR_CHUNK_SIZE
-        yield from self._chunks
-
-    def close(self):
-        self.closed = True
-
 
 @pytest.fixture(autouse=True)
 def block_unmocked_requests(monkeypatch):
@@ -322,88 +309,3 @@ def test_run_cron_requires_explicit_success(monkeypatch, payload, expected):
     assert result is expected
     assert type(result) is bool
     assert calls[0][0] == ("POST", f"{api.BASE_URL}/cron")
-
-
-def test_avatar_export_returns_valid_bounded_png(monkeypatch):
-    png = api.PNG_SIGNATURE + b"png-data"
-    response = FakeResponse(
-        headers={
-            "Content-Type": "image/png; charset=binary",
-            "Content-Length": str(len(png)),
-        },
-        chunks=[png[:3], b"", png[3:]],
-    )
-    calls = install_response(monkeypatch, response)
-
-    assert api.export_avatar_png(USER_ID, API_KEY) == png
-    assert response.closed is True
-
-    args, kwargs = calls[0]
-    assert args == ("GET", "https://habitica.com/export/avatar-plain.png")
-    assert kwargs["timeout"] == api.REQUEST_TIMEOUT
-    assert kwargs["stream"] is True
-    assert kwargs["allow_redirects"] is False
-    assert kwargs["headers"]["x-api-user"] == USER_ID
-    assert kwargs["headers"]["x-api-key"] == API_KEY
-    assert kwargs["headers"]["x-client"] == api.CLIENT_ID
-    assert kwargs["headers"]["Accept"] == "image/png"
-
-
-@pytest.mark.parametrize(
-    ("headers", "chunks"),
-    [
-        ({"Content-Type": "text/html"}, [api.PNG_SIGNATURE]),
-        ({"Content-Type": "image/png"}, [b"not-a-png"]),
-        ({"Content-Type": "image/png", "Content-Length": "invalid"}, [api.PNG_SIGNATURE]),
-    ],
-)
-def test_avatar_export_rejects_invalid_metadata_or_signature(
-    monkeypatch,
-    headers,
-    chunks,
-):
-    response = FakeResponse(headers=headers, chunks=chunks)
-    install_response(monkeypatch, response)
-
-    assert api.export_avatar_png(USER_ID, API_KEY) is None
-    assert response.closed is True
-
-
-def test_avatar_export_rejects_declared_oversize(monkeypatch):
-    response = FakeResponse(
-        headers={
-            "Content-Type": "image/png",
-            "Content-Length": str(api.MAX_AVATAR_BYTES + 1),
-        },
-        chunks=[api.PNG_SIGNATURE],
-    )
-    install_response(monkeypatch, response)
-
-    assert api.export_avatar_png(USER_ID, API_KEY) is None
-    assert response.closed is True
-
-
-def test_avatar_export_stops_when_stream_exceeds_limit(monkeypatch):
-    monkeypatch.setattr(api, "MAX_AVATAR_BYTES", len(api.PNG_SIGNATURE))
-    response = FakeResponse(
-        headers={"Content-Type": "image/png"},
-        chunks=[api.PNG_SIGNATURE, b"x"],
-    )
-    install_response(monkeypatch, response)
-
-    assert api.export_avatar_png(USER_ID, API_KEY) is None
-    assert response.closed is True
-
-
-def test_avatar_request_error_logs_only_exception_class(monkeypatch, caplog):
-    def fail_request(*args, **kwargs):
-        raise requests.exceptions.Timeout(f"{USER_ID} {API_KEY} raw-response-secret")
-
-    monkeypatch.setattr(api.requests, "request", fail_request)
-    caplog.set_level(logging.WARNING, logger=api.__name__)
-
-    assert api.export_avatar_png(USER_ID, API_KEY) is None
-    assert "Timeout" in caplog.text
-    assert USER_ID not in caplog.text
-    assert API_KEY not in caplog.text
-    assert "raw-response-secret" not in caplog.text
