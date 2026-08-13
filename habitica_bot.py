@@ -1,29 +1,14 @@
-from typing import Final, Optional
-
-import json
-import subprocess
-import tempfile
-import shutil
-from pathlib import Path
-from io import BytesIO
-
-
-from typing import Any, Callable, Awaitable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import asyncio
 import html
 import logging
+import math
 import os
-
-import shutil
-
-from datetime import datetime, timedelta, timezone, time as dtime
+from datetime import date, datetime, timedelta, timezone, time as dtime
+from pathlib import Path
 import time as time_mod
 
-
-
-import httpx
-import requests
 from telegram import (
     BotCommand,
     BotCommandScopeAllGroupChats,
@@ -32,9 +17,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
-    InlineQueryResultCachedPhoto,
     InlineQueryResultCachedDocument,
-    InlineQueryResultPhoto,
     InputTextMessageContent,
     KeyboardButton,
     MenuButtonCommands,
@@ -44,7 +27,6 @@ from telegram import (
 )
 from telegram.error import (
     BadRequest,
-    Forbidden,
     NetworkError,
     TelegramError,
     TimedOut,
@@ -61,9 +43,9 @@ from telegram.ext import (
     PicklePersistence,
     filters,
 )
-from telegram.helpers import escape_markdown
 from telegram.request import HTTPXRequest
 
+from avatar_renderer import is_valid_png, render_avatar_png
 from Habitica_API import (
     buy_potion,
     buy_reward,
@@ -71,72 +53,22 @@ from Habitica_API import (
     get_status,
     get_task_by_id,
     get_tasks,
-
+    run_cron,
+    score_task,
 )
+from runtime_lock import get_bot_data_path
 
-import json
-import subprocess
-import tempfile
-
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-)
+logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 debug = False
-
-BOT_TOKEN: Final = os.environ.get("TELEGRAM_BOT_TOKEN")
-
-if not BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
-
-
-def _detect_node_bin() -> str:
-    """
-    Try to find a usable 'node' binary.
-
-    Order:
-    1) Explicit env override: NODE_BIN
-    2) Whatever is on PATH (shutil.which)
-    3) Common nvm locations under ~/.nvm/versions/node/*/bin/node
-    4) Plain 'node' as a last resort (may still fail)
-    """
-    # 1) Explicit override
-    env_bin = os.environ.get("NODE_BIN")
-    if env_bin and os.path.exists(env_bin):
-        return env_bin
-
-    # 2) PATH lookup
-    found = shutil.which("node")
-    if found:
-        return found
-
-    # 3) Look for nvm-installed node
-    home = Path.home()
-    nvm_root = home / ".nvm" / "versions" / "node"
-    if nvm_root.is_dir():
-        # pick "highest" version folder
-        candidates = sorted(nvm_root.glob("v*/bin/node"), reverse=True)
-        for candidate in candidates:
-            if candidate.is_file():
-                return str(candidate)
-
-    # 4) Last resort: let subprocess try plain 'node'
-    return "node"
-
-
-NODE_BIN = _detect_node_bin()
-
-
-
-
-
-HABITICA_API_URL: Final = "https://habitica.com/api/v3" # <-- ADD THIS LINE
 CHOOSING_ACCOUNT = "CHOOSING_ACCOUNT"   # use a string to avoid collisions
+UD_PENDING_USER_ID = "_pending_habitica_user_id"
 
 
-persistence = PicklePersistence(filepath="botdata.pkl")
+def _escape_html(value: object, default: str = "(no title)") -> str:
+    return html.escape(str(value)) if value is not None else html.escape(default)
 
 
 # --- Reminder / notification user_data keys ---
@@ -390,7 +322,7 @@ def build_actions_footer(
     if include_potion:
         buy_potion_button = InlineKeyboardButton(
             "🧪 Buy Potion",
-            callback_data=f"cmd:buy_potion:{kind}",  # <--- add panel hint
+            callback_data=f"cmd:buy_potion:{kind}",
         )
         buttons.append(buy_potion_button)
 
@@ -456,7 +388,7 @@ def build_panel_header_lines(kind: str, layout_mode: str | None = None) -> list[
     if not title:
         return []
 
-    lines: list[str] = [f"<b>{html.escape(title)}</b>"]
+    lines: list[str] = [f"<b>{_escape_html(title)}</b>"]
 
     if layout_mode != "full":
         hint = PANEL_HINTS.get(kind)
@@ -550,7 +482,7 @@ def build_panel_header(kind: str, layout_mode: str | None) -> list[str]:
 
     # Fallback if we have no special header config
     title = PANEL_TITLES.get(kind, kind.title())
-    return [f"<b>{html.escape(title)}</b>"]
+    return [f"<b>{_escape_html(title)}</b>"]
 
 
 
@@ -567,10 +499,10 @@ def build_tasks_summary_lines(kind: str, tasks: list[dict]) -> list[str]:
         lines.append("")
         for h in tasks:
             full_text = h.get("text", "(no title)")
-            safe_full = html.escape(full_text)
+            safe_full = _escape_html(full_text)
 
-            counter_up = int(h.get("counterUp", 0))
-            counter_down = int(h.get("counterDown", 0))
+            counter_up = int(_safe_number(h.get("counterUp")))
+            counter_down = int(_safe_number(h.get("counterDown")))
 
             badge_parts: list[str] = []
             if counter_up:
@@ -599,7 +531,7 @@ def build_tasks_summary_lines(kind: str, tasks: list[dict]) -> list[str]:
 
         for t in tasks:
             full_text = t.get("text", "(no title)")
-            safe_full = html.escape(full_text)
+            safe_full = _escape_html(full_text)
 
             is_completed = bool(t.get("completed", False))
             icon = "✔️" if is_completed else "✖️"
@@ -617,7 +549,7 @@ def build_tasks_summary_lines(kind: str, tasks: list[dict]) -> list[str]:
         lines.append("")  # spacer after header
         for t in tasks:
             full_text = t.get("text", "(no title)")
-            safe_full = html.escape(full_text)
+            safe_full = _escape_html(full_text)
             is_completed = bool(t.get("completed", False))
             icon = "✔️" if is_completed else "✖️"
             lines.append(f"{icon} {safe_full}")
@@ -628,8 +560,8 @@ def build_tasks_summary_lines(kind: str, tasks: list[dict]) -> list[str]:
         lines.append("")  # spacer after header
         for t in tasks:
             full_text = t.get("text", "(no title)")
-            safe_full = html.escape(full_text)
-            value = int(t.get("value", 0))
+            safe_full = _escape_html(full_text)
+            value = int(_safe_number(t.get("value")))
             lines.append(f"{safe_full} ({value}g)")
         return lines
 
@@ -638,16 +570,24 @@ def build_tasks_summary_lines(kind: str, tasks: list[dict]) -> list[str]:
         lines.append("")  # spacer after header
         for t in tasks:
             full_text = t.get("text", "(no title)")
-            safe_full = html.escape(full_text)
+            safe_full = _escape_html(full_text)
             lines.append(f"↩️ {safe_full}")
         return lines
 
     # Fallback
     for t in tasks:
         full_text = t.get("text", "(no title)")
-        lines.append(html.escape(full_text))
+        lines.append(_escape_html(full_text))
 
     return lines
+
+
+def _safe_number(value: object, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
 
 
 def build_status_block(stats: dict | None) -> str:
@@ -660,19 +600,22 @@ def build_status_block(stats: dict | None) -> str:
     if not stats:
         return ""
 
-    hp = stats.get("hp", 0.0)
-    mp = stats.get("mp", 0.0)
-    gp = stats.get("gp", 0.0)
-    lvl = stats.get("lvl", 0)
-    exp = stats.get("exp", 0.0)
-    to_next = stats.get("toNextLevel", 0.0)
+    if not isinstance(stats, dict):
+        return ""
+
+    hp = _safe_number(stats.get("hp"))
+    mp = _safe_number(stats.get("mp"))
+    gp = _safe_number(stats.get("gp"))
+    lvl = _safe_number(stats.get("lvl"))
+    exp = _safe_number(stats.get("exp"))
+    to_next = _safe_number(stats.get("toNextLevel"))
 
     return (
         "<blockquote><b>Status</b>\n"
         f"❤️ HP: {hp:.0f}\n"
         f"🔮 MP: {mp:.0f}\n"
         f"💰 Gold: {gp:.0f}\n"
-        f"⭐ Level: {lvl} ({exp:.0f}/{to_next:.0f})"
+        f"⭐ Level: {lvl:.0f} ({exp:.0f}/{to_next:.0f})"
         "</blockquote>"
     )
 
@@ -947,7 +890,7 @@ async def handle_reply_keyboard(update: Update, context: ContextTypes.DEFAULT_TY
     if text == "📝 Todos":
         return await todos_command_handler(update, context)
 
-    if text == "✅ Completed Todos":  # <-- ADD THIS
+    if text == "✅ Completed Todos":
         return await completed_todos_command_handler(update, context)
 
     if text == "➕ New Todo":
@@ -1085,10 +1028,10 @@ async def send_inline_launcher(
             if msg.photo:
                 context.user_data["AVATAR_FILE_ID"] = msg.photo[-1].file_id
             return
-        except Exception as e:
-            logging.warning(
-                "Failed to send inline launcher with avatar, falling back to text: %s",
-                e,
+        except Exception as exc:
+            logger.warning(
+                "Failed to send inline launcher with avatar; using text (%s)",
+                type(exc).__name__,
             )
 
     # Fallback: text-only
@@ -1109,11 +1052,17 @@ async def on_error(update, context):
 
     # Ignore the noisy "query is too old" errors from Telegram
     if isinstance(err, BadRequest) and "query is too old" in str(err).lower():
-        logging.warning("Ignoring old callback/inline query: %s", err)
+        logger.warning("Ignoring an expired callback or inline query")
         return
 
-    # Everything else: log as before
-    logging.exception("Unhandled exception in update: %s", update, exc_info=err)
+    update_id = getattr(update, "update_id", None)
+    logger.error(
+        "Unhandled %s while processing update_id=%s",
+        type(err).__name__,
+        update_id,
+    )
+    if debug:
+        logger.debug("Unhandled update traceback", exc_info=err)
 
 
 
@@ -1125,22 +1074,26 @@ def _signed(x: float) -> str:
     return f"{'+' if x > 0 else ''}{x:.1f}"
 
 def format_stats_delta(old_stats: dict, new_stats: dict) -> str:
-    hp  = float(new_stats.get('hp',  0)) - float(old_stats.get('hp',  0))
-    mp  = float(new_stats.get('mp',  0)) - float(old_stats.get('mp',  0))
-    gp  = float(new_stats.get('gp',  0)) - float(old_stats.get('gp',  0))
-    exp = float(new_stats.get('exp', 0)) - float(old_stats.get('exp', 0))
+    hp = _safe_number(new_stats.get("hp")) - _safe_number(old_stats.get("hp"))
+    mp = _safe_number(new_stats.get("mp")) - _safe_number(old_stats.get("mp"))
+    gp = _safe_number(new_stats.get("gp")) - _safe_number(old_stats.get("gp"))
+    exp = _safe_number(new_stats.get("exp")) - _safe_number(old_stats.get("exp"))
 
     parts = []
-    if abs(hp)  >= 0.05: parts.append(f"♥ {_signed(hp)}")
-    if abs(mp)  >= 0.05: parts.append(f"💧 {_signed(mp)}")
-    if abs(gp)  >= 0.05: parts.append(f"💰 {_signed(gp)}")
-    if abs(exp) >= 0.05: parts.append(f"📈 {_signed(exp)}")
+    if abs(hp) >= 0.05:
+        parts.append(f"♥ {_signed(hp)}")
+    if abs(mp) >= 0.05:
+        parts.append(f"💧 {_signed(mp)}")
+    if abs(gp) >= 0.05:
+        parts.append(f"💰 {_signed(gp)}")
+    if abs(exp) >= 0.05:
+        parts.append(f"📈 {_signed(exp)}")
     return ", ".join(parts) if parts else "no change"
 
 
 
 
-async def _register_commands(app: Application) -> None:
+async def _register_commands(app: Application) -> bool:
     """
     Called at startup (post_init) and optionally from /sync_commands.
 
@@ -1165,7 +1118,7 @@ async def _register_commands(app: Application) -> None:
         BotCommand("cancel", "Cancel current action"),
         # Optional: expose /sync_commands itself in menu
         BotCommand("sync_commands", "Re-sync command list with Telegram"),
-        BotCommand("avatar", "Send your Habitica avatar image"),  # 👈 add this
+        BotCommand("avatar", "Send your Habitica avatar image"),
 
     ]
 
@@ -1183,24 +1136,29 @@ async def _register_commands(app: Application) -> None:
         # 3) ensure the menu button opens the commands list
         await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
-        logging.info("✅ Bot commands registered / synced successfully.")
+        logger.info("Bot commands registered successfully")
+        return True
 
-    except (TimedOut, NetworkError) as e:
-        logging.warning(
-            "⚠️ Could not register commands with Telegram (network issue): %s",
-            e
+    except (TimedOut, NetworkError) as exc:
+        logger.warning(
+            "Could not register commands with Telegram (%s)",
+            type(exc).__name__,
         )
-        # Do NOT re-raise – bot should still start and run handlers.
-    except TelegramError as e:
-        logging.error(
-            "TelegramError while registering commands: %s",
-            e
+    except TelegramError as exc:
+        logger.error(
+            "Telegram rejected command registration (%s)",
+            type(exc).__name__,
         )
-    except Exception as e:
-        logging.exception("Unexpected error while registering commands: %s", e)
+    except Exception as exc:
+        logger.error(
+            "Unexpected command-registration failure (%s)",
+            type(exc).__name__,
+        )
+    return False
 
 
 async def start_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop(UD_PENDING_USER_ID, None)
     args = context.args or []
 
     # Deep-link start (/start habits|dailys|todos|rewards)
@@ -1257,30 +1215,34 @@ async def sync_commands_command_handler(update: Update, context: ContextTypes.DE
 
     try:
         # context.application is the running Application instance
-        await _register_commands(context.application)
-        await update.message.reply_text("✅ Commands synced successfully.")
-    except (TimedOut, NetworkError) as e:
-        logging.warning("Network problem in /sync_commands: %s", e)
+        registered = await _register_commands(context.application)
+        if registered:
+            await update.message.reply_text("✅ Commands synced successfully.")
+        else:
+            await update.message.reply_text(
+                "❌ I couldn't sync commands with Telegram. Please try again later."
+            )
+    except (TimedOut, NetworkError) as exc:
+        logger.warning("Network problem in /sync_commands (%s)", type(exc).__name__)
         await update.message.reply_text(
             "⌛ I couldn’t reach Telegram to sync commands (timeout).\n"
             "Please try /sync_commands again in a bit."
         )
-    except TelegramError as e:
-        logging.error("TelegramError in /sync_commands: %s", e)
+    except TelegramError as exc:
+        logger.error("Telegram error in /sync_commands (%s)", type(exc).__name__)
         await update.message.reply_text(
             "❌ Telegram API error while syncing commands. Check logs."
         )
-    except Exception as e:
-        logging.exception("Unexpected error in /sync_commands: %s", e)
+    except Exception as exc:
+        logger.error("Unexpected /sync_commands failure (%s)", type(exc).__name__)
         await update.message.reply_text(
             "❌ Unexpected error while syncing commands. Check logs."
         )
 
 
-
 async def account_choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    # await query.answer()
+    await query.answer()
     action = (query.data or "")
 
     if action == "acct:keep":
@@ -1289,9 +1251,7 @@ async def account_choice_handler(update: Update, context: ContextTypes.DEFAULT_T
         return ConversationHandler.END
 
     if action == "acct:change":
-        # Optional: clear old creds now or after the new ones are saved
-        # context.user_data.pop("USER_ID", None)
-        # context.user_data.pop("API_KEY", None)
+        context.user_data.pop(UD_PENDING_USER_ID, None)
         await query.message.reply_text("Alright. Please send your new USER_ID. or /cancel")
         return USER_ID
 
@@ -1301,20 +1261,49 @@ async def account_choice_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def relink_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop(UD_PENDING_USER_ID, None)
     await update.message.reply_text("Let’s link a different account. Please send your new USER_ID or /cancel")
     return USER_ID
 
 
+async def account_link_private_only_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Keep Habitica credentials out of group and forum-topic history."""
+    del context
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "For your security, link your Habitica account in a private chat with me."
+        )
+
+
+async def _delete_credential_message(update: Update) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    try:
+        await message.delete()
+    except TelegramError:
+        logger.warning("Could not delete a credential message from Telegram")
+
+
 async def get_user_id_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_message.text.strip()
-    context.user_data["USER_ID"] = user_id
+    if not user_id:
+        await _delete_credential_message(update)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="USER_ID cannot be empty. Please try again or /cancel.",
+        )
+        return USER_ID
+    context.user_data[UD_PENDING_USER_ID] = user_id
+    await _delete_credential_message(update)
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text="Enter API_KEY",
-        reply_to_message_id=update.effective_message.id,
     )
     return API_KEY
-
 
 
 def ensure_avatar_png_no_update(
@@ -1325,87 +1314,68 @@ def ensure_avatar_png_no_update(
     force_refresh: bool = False,
     preloaded_user_json: dict | None = None,
 ) -> str | None:
-    """
-    A tick-safe version of ensure_avatar_png:
-    - No Update / no Context
-    - Uses your existing Node renderer (render_avatar_from_json.js)
-    - Caches AVATAR_PNG_PATH in user_data
-    """
+    """Tick-safe avatar rendering with no Telegram Update or Context."""
     existing_path = user_data.get("AVATAR_PNG_PATH")
-    if not force_refresh and existing_path and os.path.exists(existing_path):
+    if not force_refresh and existing_path and is_valid_png(existing_path):
         return existing_path
+    if existing_path and not is_valid_png(existing_path):
+        user_data.pop("AVATAR_PNG_PATH", None)
 
-    # 1) Fetch user JSON from Habitica (or reuse what the tick already fetched)
     user_json = preloaded_user_json or get_status(habitica_user_id, habitica_api_key)
-    if not user_json:
-        logging.warning("ensure_avatar_png_no_update: could not fetch Habitica user JSON")
+    if not isinstance(user_json, dict):
+        logger.warning("Could not fetch profile data for avatar rendering")
         return None
 
-    # 2) Pick a stable, safe filename from Habitica username/profile
-    username = ""
-    auth = user_json.get("auth") or {}
-    local_auth = auth.get("local") or {}
-    username = local_auth.get("username") or ""
-
-    if not username:
-        profile = user_json.get("profile") or {}
-        username = profile.get("name") or ""
-
-    if not username:
-        username = "habitica_user"
-
-    safe_username = "".join(
-        c if c.isalnum() or c in ("-", "_") else "_"
-        for c in username.strip()
-    ) or "habitica_user"
-
-    # 3) Render avatar via Node into temp PNG, copy to Avatar/<username>.png
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    node_script = os.path.join(base_dir, "render_avatar_from_json.js")
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        user_json_path = os.path.join(tmpdir, "user.json")
-        tmp_png_path = os.path.join(tmpdir, "avatar.png")
-
-        with open(user_json_path, "w", encoding="utf-8") as f:
-            json.dump(user_json, f)
-
-        try:
-            proc = subprocess.run(
-                [NODE_BIN, node_script, user_json_path, tmp_png_path],
-                capture_output=True,
-                text=True,
-            )
-        except FileNotFoundError:
-            logging.error("Node.js binary not found. Tried NODE_BIN=%r", NODE_BIN)
-            return None
-
-        if proc.returncode != 0 or not os.path.exists(tmp_png_path):
-            logging.error(
-                "Avatar render failed (code=%s)\nSTDOUT:\n%s\nSTDERR:\n%s",
-                proc.returncode,
-                proc.stdout,
-                proc.stderr,
-            )
-            return None
-
-        avatar_dir = os.path.join(base_dir, "Avatar")
-        os.makedirs(avatar_dir, exist_ok=True)
-
-        final_png_path = os.path.join(avatar_dir, f"{safe_username}.png")
-        with open(tmp_png_path, "rb") as src, open(final_png_path, "wb") as dst:
-            dst.write(src.read())
-
-    user_data["AVATAR_PNG_PATH"] = final_png_path
-    return final_png_path
-
-
-
+    base_dir = Path(__file__).resolve().parent
+    rendered_path = render_avatar_png(
+        user_json,
+        cache_key=habitica_user_id,
+        cache_dir=base_dir / "Avatar",
+        renderer_path=base_dir / "render_avatar_from_json.js",
+        force_refresh=force_refresh,
+    )
+    if rendered_path:
+        user_data["AVATAR_PNG_PATH"] = rendered_path
+    return rendered_path
 
 
 async def get_API_key_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     api_key = update.effective_message.text.strip()
-    context.user_data["API_KEY"] = api_key
+    if not api_key:
+        await _delete_credential_message(update)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="API_KEY cannot be empty. Please try again or /cancel.",
+        )
+        return API_KEY
+    pending_user_id = context.user_data.pop(UD_PENDING_USER_ID, None)
+    user_id = pending_user_id or context.user_data.get("USER_ID")
+    if not user_id:
+        await _delete_credential_message(update)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="The account-linking session expired. Please use /start again.",
+        )
+        return ConversationHandler.END
+
+    previous_pair = (
+        context.user_data.get("USER_ID"),
+        context.user_data.get("API_KEY"),
+    )
+    context.user_data.update({"USER_ID": user_id, "API_KEY": api_key})
+
+    if previous_pair != (user_id, api_key):
+        for key in (
+            "AVATAR_PNG_PATH",
+            "AVATAR_FILE_ID",
+            "AVATAR_DOC_FILE_ID",
+            UD_TZ_OFFSET,
+            UD_TZ_OFFSET_UPDATED_AT,
+        ):
+            context.user_data.pop(key, None)
+        context.user_data[UD_SENT_REMINDERS] = {}
+
+    await _delete_credential_message(update)
 
     # Default notifications: DM the user (private chat id == user id)
     context.user_data.setdefault(UD_NOTIFY_CHAT_ID, update.effective_user.id)
@@ -1477,109 +1447,48 @@ async def ensure_avatar_png(
     *,
     force_refresh: bool = False,
 ) -> str | None:
-    """
-    Make sure we have an up-to-date avatar PNG for this Habitica user.
-
-    - If force_refresh is False and context.user_data["AVATAR_PNG_PATH"] exists
-      and the file is still there, reuse it.
-    - Otherwise, fetch the user from Habitica, render via Node, save as
-      Avatar/<habitica_username>.png, store the path in context.user_data,
-      and return it.
-
-    Returns the absolute path to the PNG, or None on error (and sends a short
-    error message to the user).
-    """
+    """Return a valid cached avatar PNG, rendering it off the event loop."""
     user_id = context.user_data.get("USER_ID")
     api_key = context.user_data.get("API_KEY")
+    message = update.effective_message
 
     if not user_id or not api_key:
-        await update.message.reply_text(
-            "Use /start to set USER_ID and API_KEY first."
-        )
+        if message:
+            await message.reply_text("Use /start to set USER_ID and API_KEY first.")
         return None
 
-    # Reuse existing avatar if we already rendered it and the file still exists,
-    # but only when we are NOT forcing a refresh.
     existing_path = context.user_data.get("AVATAR_PNG_PATH")
-    if not force_refresh and existing_path and os.path.exists(existing_path):
+    if not force_refresh and existing_path and is_valid_png(existing_path):
         return existing_path
+    if existing_path and not is_valid_png(existing_path):
+        context.user_data.pop("AVATAR_PNG_PATH", None)
 
-    # 1) Fetch user JSON from Habitica
-    user_data = get_status(user_id, api_key)
-    if not user_data:
-        await update.message.reply_text(
-            "❌ Could not fetch your Habitica profile. Please try again later."
-        )
+    user_data = await asyncio.to_thread(get_status, user_id, api_key)
+    if not isinstance(user_data, dict):
+        if message:
+            await message.reply_text(
+                "❌ Could not fetch your Habitica profile. Please try again later."
+            )
         return None
 
-    # --- Determine a safe Habitica username for the filename ---
-    username = ""
-
-    auth = user_data.get("auth") or {}
-    local_auth = auth.get("local") or {}
-    username = local_auth.get("username") or ""
-
-    if not username:
-        profile = user_data.get("profile") or {}
-        username = profile.get("name") or ""
-
-    if not username:
-        username = "habitica_user"
-
-    safe_username = "".join(
-        c if c.isalnum() or c in ("-", "_") else "_"
-        for c in username.strip()
-    ) or "habitica_user"
-
-    # 2) Render avatar via Node into a temp PNG and copy it to Avatar/<username>.png
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    node_script = os.path.join(base_dir, "render_avatar_from_json.js")
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        user_json_path = os.path.join(tmpdir, "user.json")
-        tmp_png_path = os.path.join(tmpdir, "avatar.png")
-
-        with open(user_json_path, "w", encoding="utf-8") as f:
-            json.dump(user_data, f)
-
-        try:
-            proc = subprocess.run(
-                [NODE_BIN, node_script, user_json_path, tmp_png_path],
-                capture_output=True,
-                text=True,
+    base_dir = Path(__file__).resolve().parent
+    rendered_path = await asyncio.to_thread(
+        render_avatar_png,
+        user_data,
+        cache_key=user_id,
+        cache_dir=base_dir / "Avatar",
+        renderer_path=base_dir / "render_avatar_from_json.js",
+        force_refresh=force_refresh,
+    )
+    if not rendered_path:
+        if message:
+            await message.reply_text(
+                "❌ Failed to generate avatar image. Please try again later."
             )
-        except FileNotFoundError:
-            logging.error("Node.js binary not found. Tried NODE_BIN=%r", NODE_BIN)
-            await update.message.reply_text(
-                "❌ Node.js is not available on this server, so I can't render the avatar image."
-            )
-            return None
+        return None
 
-
-        if proc.returncode != 0 or not os.path.exists(tmp_png_path):
-            logging.error(
-                "Avatar render failed (code=%s)\nSTDOUT:\n%s\nSTDERR:\n%s",
-                proc.returncode,
-                proc.stdout,
-                proc.stderr,
-            )
-            await update.message.reply_text(
-                "❌ Failed to generate avatar image. Check server logs for details."
-            )
-            return None
-
-        # 3) Ensure Avatar directory exists and copy the PNG there
-        avatar_dir = os.path.join(base_dir, "Avatar")
-        os.makedirs(avatar_dir, exist_ok=True)
-
-        final_png_path = os.path.join(avatar_dir, f"{safe_username}.png")
-
-        with open(tmp_png_path, "rb") as src, open(final_png_path, "wb") as dst:
-            dst.write(src.read())
-
-    # Store for reuse
-    context.user_data["AVATAR_PNG_PATH"] = final_png_path
-    return final_png_path
+    context.user_data["AVATAR_PNG_PATH"] = rendered_path
+    return rendered_path
 
 
 async def send_avatar_photo(
@@ -1587,7 +1496,7 @@ async def send_avatar_photo(
     context: ContextTypes.DEFAULT_TYPE,
     *,
     caption: str | None = None,
-) -> None:
+) -> bool:
     """
     Ensure the avatar PNG exists for this user and send it to the current chat.
 
@@ -1599,9 +1508,14 @@ async def send_avatar_photo(
     png_path = await ensure_avatar_png(update, context, force_refresh=True)
     if not png_path:
         # ensure_avatar_png already sent an error message
-        return
+        return False
 
-    chat_id = update.effective_chat.id
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat is None and user is None:
+        logger.warning("Avatar delivery skipped because no target chat is available")
+        return False
+    chat_id = chat.id if chat is not None else user.id
 
     try:
         # 1) Send as photo (normal /avatar behaviour)
@@ -1632,20 +1546,26 @@ async def send_avatar_photo(
             if doc_msg.document:
                 context.user_data["AVATAR_DOC_FILE_ID"] = doc_msg.document.file_id
 
-        except Exception as e:
-            logging.warning("Failed to send avatar as document: %s", e)
+        except Exception as exc:
+            logger.warning(
+                "Failed to send avatar as a document (%s)",
+                type(exc).__name__,
+            )
 
+        return True
     except FileNotFoundError:
-        await update.message.reply_text(
-            "❌ I generated your avatar but couldn't find the saved file. Please try again."
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="❌ I generated your avatar but couldn't find the saved file. Please try again.",
         )
+        return False
 
 
 
 
-async def avatar_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def avatar_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Generate, save, and send the user's Habitica avatar as a PNG image."""
-    await send_avatar_photo(
+    return await send_avatar_photo(
         update,
         context,
         caption="Here’s your Habitica avatar ✨",
@@ -1688,9 +1608,10 @@ async def send_panel_with_saved_avatar(
                 context.user_data["AVATAR_FILE_ID"] = msg.photo[-1].file_id
 
             return
-        except Exception as e:
-            logging.warning(
-                "Failed to send avatar photo, falling back to text-only panel: %s", e
+        except Exception as exc:
+            logger.warning(
+                "Failed to send avatar photo; using a text panel (%s)",
+                type(exc).__name__,
             )
 
     # Fallback: no cached avatar => just send the text panel as before
@@ -1707,19 +1628,9 @@ async def send_panel_with_saved_avatar(
 
 
 
-# Assume get_status is defined elsewhere
-# def get_status(user_id, api_key): ...
-
 async def get_status_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /status command."""
     chat_id = update.effective_chat.id
-
-    # Force /status to forget any cached pin info for this chat
-    pinned_key = f"pinned_status_message_id_{chat_id}"
-    text_key = f"pinned_status_text_{chat_id}"
-    context.user_data.pop(pinned_key, None)
-    context.user_data.pop(text_key, None)
-    logging.info("STATUS DEBUG: cleared pinned status cache for chat %s", chat_id)
 
     # Send the temporary message and capture its message object
     temp_message = await update.message.reply_text("Updating status...")
@@ -1787,7 +1698,7 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
             )
         ]
-        await query.answer(results, cache_time=0)
+        await query.answer(results, cache_time=0, is_personal=True)
         return
 
     query_type = query.query.lower().strip()
@@ -1851,14 +1762,27 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if not normalized_type:
         # User typed something that's not a known type
-        await query.answer([], cache_time=10)
+        await query.answer([], cache_time=10, is_personal=True)
         return
 
     if query_type not in valid_types:
-        await query.answer([], cache_time=10)
+        await query.answer([], cache_time=10, is_personal=True)
         return
 
     tasks = get_tasks(user_id, api_key, task_type=normalized_type)
+
+    if tasks is None:
+        results = [
+            InlineQueryResultArticle(
+                id="habitica_unavailable",
+                title="Habitica is temporarily unavailable",
+                input_message_content=InputTextMessageContent(
+                    message_text="I couldn't reach Habitica. Please try again shortly."
+                ),
+            )
+        ]
+        await query.answer(results, cache_time=0, is_personal=True)
+        return
 
     if not tasks:
         results = [
@@ -1870,7 +1794,7 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
             )
         ]
-        await query.answer(results, cache_time=0)
+        await query.answer(results, cache_time=0, is_personal=True)
         return
 
     results: list = []
@@ -1971,7 +1895,7 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
     elif normalized_type == "dailys":
-        dailys = tasks  # you already set tasks = get_tasks(...) above
+        dailys = tasks
 
         layout_mode = context.user_data.get("d_menu_layout", "full")
 
@@ -2034,7 +1958,7 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
     elif normalized_type == "todos":
-        todos = tasks  # you already set tasks = get_tasks(...) above
+        todos = tasks
         layout_mode = context.user_data.get("t_menu_layout", "full")
 
         # Status for the panel
@@ -2276,7 +2200,7 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     avatar_doc_id = context.user_data.get("AVATAR_DOC_FILE_ID")
 
     for task in tasks[:10]:
-        task_text = html.escape(task.get("text", "(no title)"))
+        task_text = _escape_html(task.get("text", "(no title)"))
         task_id = task.get("id")
         if not task_id:
             continue
@@ -2370,7 +2294,7 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
             )
 
-    await query.answer(results, cache_time=10)
+    await query.answer(results, cache_time=10, is_personal=True)
 
 
 
@@ -2434,10 +2358,20 @@ async def task_list_command_handler(update: Update, context: ContextTypes.DEFAUL
         types_to_fetch = ["habits", "dailys", "todos", "rewards", "completedTodos"]
         for t_type in types_to_fetch:
             tasks = get_tasks(user_id, api_key, task_type=t_type)
+            if tasks is None:
+                await update.message.reply_text(
+                    "⚠️ Habitica returned an incomplete task list. Please try again."
+                )
+                return
             if tasks:
                 tasks_to_process.extend(tasks)
     else:
         tasks = get_tasks(user_id, api_key, task_type=task_type)
+        if tasks is None:
+            await update.message.reply_text(
+                "⚠️ Could not reach Habitica. Please try again."
+            )
+            return
         if tasks:
             tasks_to_process = tasks
 
@@ -2462,7 +2396,9 @@ def format_standard_tasks(tasks: list) -> str:
         'habit': [], 'daily': [], 'todo': [], 'reward': []
     }
     for task in tasks:
-        task_groups.get(task.get('type'), []).append(task)
+        group = task_groups.get(task.get('type'))
+        if group is not None:
+            group.append(task)
 
     # Build the formatted message
     sections = []
@@ -2471,7 +2407,7 @@ def format_standard_tasks(tasks: list) -> str:
     if task_groups['habit']:
         sections.append("<b>🌀 HABITS</b>")
         for task in task_groups['habit']:
-            task_text = html.escape(task.get('text', '(no title)'))
+            task_text = _escape_html(task.get('text', '(no title)'))
             counter_up = task.get('counterUp', 0)
             counter_down = task.get('counterDown', 0)
             up = task.get('up', False)
@@ -2479,8 +2415,10 @@ def format_standard_tasks(tasks: list) -> str:
 
             # Create counter display
             counters = []
-            if up: counters.append(f"➕ {counter_up}")
-            if down: counters.append(f"➖ {counter_down}")
+            if up:
+                counters.append(f"➕ {counter_up}")
+            if down:
+                counters.append(f"➖ {counter_down}")
             counter_display = " | ".join(counters) if counters else ""
 
             # Format the habit line
@@ -2494,7 +2432,7 @@ def format_standard_tasks(tasks: list) -> str:
     if task_groups['daily']:
         sections.append("<b>📅 DAILIES</b>")
         for task in task_groups['daily']:
-            task_text = html.escape(task.get('text', '(no title)'))
+            task_text = _escape_html(task.get('text', '(no title)'))
             is_completed = task.get('completed', False)
             streak = task.get('streak', 0)
 
@@ -2515,7 +2453,7 @@ def format_standard_tasks(tasks: list) -> str:
     if task_groups['todo']:
         sections.append("<b>📝 TODOS</b>")
         for task in task_groups['todo']:
-            task_text = html.escape(task.get('text', '(no title)'))
+            task_text = _escape_html(task.get('text', '(no title)'))
             is_completed = task.get('completed', False)
 
             # Format based on completion status
@@ -2531,7 +2469,7 @@ def format_standard_tasks(tasks: list) -> str:
     if task_groups['reward']:
         sections.append("<b>💰 REWARDS</b>")
         for task in task_groups['reward']:
-            task_text = html.escape(task.get('text', '(no title)'))
+            task_text = _escape_html(task.get('text', '(no title)'))
             value = task.get('value', 0)
 
             # Format with value
@@ -2561,7 +2499,7 @@ async def format_and_send_interactive_tasks(update: Update, context: ContextType
             continue
 
         for task in task_groups[task_type]:
-            task_text = html.escape(task.get('text', '(no title)'))
+            task_text = _escape_html(task.get('text', '(no title)'))
 
             if task_type == "daily":
                 task_text = f"📅 <b><i>{task_text}</i></b>"
@@ -2677,7 +2615,7 @@ async def format_and_send_habits(update: Update, context: ContextTypes.DEFAULT_T
 
     # 2) Send a message for each habit with its keyboard
     for task in habits:
-        task_text = html.escape(task.get('text', '(no title)'))
+        task_text = _escape_html(task.get('text', '(no title)'))
         task_text = f"🌀 <b><i>{task_text}</i></b>"
 
         task_id = task.get('id')
@@ -2775,6 +2713,8 @@ def get_old_and_new_stats_for_scored_task(
 
     # 2) Score task
     score_data = score_task(user_id, api_key, task_id, direction)
+    if score_data is None:
+        return old_stats, old_stats, None
 
     # 3) Try to get new stats from score response first
     new_stats = extract_stats_from_score_response(score_data or {}) or {}
@@ -2785,87 +2725,6 @@ def get_old_and_new_stats_for_scored_task(
         new_stats = new_status.get("stats", {}) or {}
 
     return old_stats, new_stats, score_data
-
-
-
-def score_task(user_id: str, api_key: str, task_id: str, direction: str) -> Optional[dict]:
-    """Scores a task in Habitica and returns the updated task data."""
-    if direction not in ['up', 'down']:
-        logging.error(f"Invalid direction '{direction}' for scoring task {task_id}.")
-        return None
-
-    headers = {
-        "x-api-user": user_id,
-        "x-api-key": api_key,
-        "x-client": "habitica-python-3.0.0"
-    }
-
-    url = f"{HABITICA_API_URL}/tasks/{task_id}/score/{direction}"
-    try:
-        response = requests.post(url, headers=headers)
-        response.raise_for_status()
-        logging.info(f"Successfully scored task {task_id} {direction}.")
-        return response.json().get('data')
-    except requests.exceptions.HTTPError as e:
-        # Check for the specific "session outdated" error
-        if e.response.status_code == 401 or (e.response.status_code == 401 and "session is outdated" in e.response.text.lower()):
-            logging.warning("Session outdated. Attempting to refresh user data.")
-            # Try to refresh by getting user status, which often renews the session
-            try:
-                refresh_url = f"{HABITICA_API_URL}/user"
-                refresh_response = requests.get(refresh_url, headers=headers)
-                refresh_response.raise_for_status()
-                logging.info("Session refreshed successfully. Retrying task scoring.")
-                # Retry the original request
-                retry_response = requests.post(url, headers=headers)
-                retry_response.raise_for_status()
-                logging.info(f"Successfully scored task {task_id} {direction} on retry.")
-                return retry_response.json().get('data')
-            except requests.exceptions.RequestException as refresh_error:
-                logging.error(f"Failed to refresh session: {refresh_error}")
-                return None
-        else:
-            # Handle other HTTP errors
-            error_message = "Unknown error"
-            if e.response is not None:
-                try:
-                    error_details = e.response.json()
-                    error_message = error_details.get('message', 'No message in error response')
-                except ValueError:
-                    error_message = e.response.text
-            logging.error(f"Failed to score task {task_id}. API Error: {error_message}")
-            return None
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Failed to score task {task_id} due to a network error: {e}")
-        return None
-
-
-
-def run_cron_for_user(user_id: str, api_key: str) -> bool:
-    """Call Habitica cron (refresh the day). Returns True on success."""
-    headers = {
-        "x-api-user": user_id,
-        "x-api-key": api_key,
-        "x-client": "habitica-python-3.0.0",
-        "Content-Type": "application/json",
-    }
-    url = f"{HABITICA_API_URL}/cron"
-    try:
-        resp = requests.post(url, headers=headers, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        if isinstance(data, dict):
-            return bool(data.get("success", True))
-        return True
-    except requests.RequestException as e:
-        logging.error(f"Failed to run cron: {e}")
-        return False
-
-
-
-
-# Make sure you have this at the top of your file
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 
 
@@ -2905,22 +2764,13 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return f"{'+' if x > 0 else ''}{x:.1f}"
 
     def _delta_text(old_stats: dict, new_stats: dict) -> str:
-        hp  = float(new_stats.get('hp',  0)) - float(old_stats.get('hp',  0))
-        mp  = float(new_stats.get('mp',  0)) - float(old_stats.get('mp',  0))
-        gp  = float(new_stats.get('gp',  0)) - float(old_stats.get('gp',  0))
-        exp = float(new_stats.get('exp', 0)) - float(old_stats.get('exp', 0))
-        parts_ = []
-        if abs(hp)  >= 0.05: parts_.append(f"♥ {_signed(hp)}")
-        if abs(mp)  >= 0.05: parts_.append(f"💧 {_signed(mp)}")
-        if abs(gp)  >= 0.05: parts_.append(f"💰 {_signed(gp)}")
-        if abs(exp) >= 0.05: parts_.append(f"📈 {_signed(exp)}")
-        return ", ".join(parts_) if parts_ else "no change"
+        return format_stats_delta(old_stats, new_stats)
 
     def _fmt_stats(stats: dict) -> str:
         return (
-            f"HP: {int(stats.get('hp', 0))} ♥\n"
-            f"MP: {int(stats.get('mp', 0))} 💧\n"
-            f"Gold: {int(stats.get('gp', 0))} 💰"
+            f"HP: {int(_safe_number(stats.get('hp')))} ♥\n"
+            f"MP: {int(_safe_number(stats.get('mp')))} 💧\n"
+            f"Gold: {int(_safe_number(stats.get('gp')))} 💰"
         )
 
     def _status_block(stats: dict) -> str:
@@ -2953,12 +2803,6 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         # Keep the text before the Status block and after it, just swap the block itself
         return head.rstrip() + "\n" + new_status_html + tail
-
-    # Default inline launcher (fallback markup)
-    try:
-        default_markup = build_inline_launcher_kb()
-    except Exception:
-        default_markup = query.message.reply_markup if query.message else None
 
     async def edit_here(new_text: str, markup: InlineKeyboardMarkup | None = None):
         """
@@ -3033,10 +2877,6 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 else:
                     raise
 
-    # Whether this callback came from a private chat (useful for pinned status updates)
-    chat = update.effective_chat
-    is_private = bool(chat and chat.type == "private")
-
     # ---------------------------
     # Helper: rebuild panel and (if panel had Status block) update its text too
     # Use this wherever you rebuild a panel's keyboard (dMenu/tMenu/rMenu/hMenu/cron)
@@ -3087,7 +2927,7 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             except Exception:
                 tasks = []
 
-            # Layout mode per panel (same keys you already use elsewhere)
+            # Layout mode per panel.
             if panel_kind == "dailys":
                 layout_mode = context.user_data.get("d_menu_layout", "full")
             elif panel_kind == "todos":
@@ -3149,11 +2989,14 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Cycle Dailies layout
         current = context.user_data.get("d_menu_layout", "full")
         new_mode = cycle_layout_mode(current)
-        context.user_data["d_menu_layout"] = new_mode
 
         # Re‑fetch Dailies + status
-        dailys = get_tasks(user_id, api_key, "dailys") or []
-        status_data = get_status(user_id, api_key) or {}
+        dailys = get_tasks(user_id, api_key, "dailys")
+        status_data = get_status(user_id, api_key)
+        if dailys is None or status_data is None:
+            await query.answer("❌ Couldn't refresh the Dailies layout.", show_alert=True)
+            return
+        context.user_data["d_menu_layout"] = new_mode
         stats = status_data.get("stats", {}) or {}
         status_html = build_status_block(stats)
 
@@ -3174,27 +3017,8 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Keyboard for Dailies panel (uses layout_mode internally)
         keyboard = build_dailys_panel_keyboard(dailys, new_mode)
 
-        # Edit the whole message (text + keyboard)
-        try:
-            await query.edit_message_text(
-                panel_text,
-                parse_mode="HTML",
-                reply_markup=keyboard,
-                disable_web_page_preview=True,
-            )
-        except BadRequest as e:
-            # If it's “message is not modified” just update buttons
-            if "message is not modified" in str(e).lower():
-                try:
-                    await query.edit_message_reply_markup(reply_markup=keyboard)
-                except Exception:
-                    pass
-            else:
-                raise
-
-        home_chat_id = context.user_data.get("HOME_CHAT_ID")
-        if home_chat_id:
-            await update_and_pin_status(context, home_chat_id, stats_override=stats)
+        await edit_here(panel_text, keyboard)
+        await update_and_pin_status(context, home_chat_id, stats_override=stats)
 
         await query.answer("📅 Layout updated.", show_alert=False)
         return
@@ -3203,11 +3027,14 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Rotate layout mode
         current = context.user_data.get("t_menu_layout", "full")
         new_mode = cycle_layout_mode(current)
-        context.user_data["t_menu_layout"] = new_mode
 
         # Fresh tasks + stats
-        todos = get_tasks(user_id, api_key, "todos") or []
-        status_data = get_status(user_id, api_key) or {}
+        todos = get_tasks(user_id, api_key, "todos")
+        status_data = get_status(user_id, api_key)
+        if todos is None or status_data is None:
+            await query.answer("❌ Couldn't refresh the Todos layout.", show_alert=True)
+            return
+        context.user_data["t_menu_layout"] = new_mode
         stats = status_data.get("stats", {}) or {}
         status_html = build_status_block(stats)
 
@@ -3246,27 +3073,7 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         append_standard_footer(rows, "todos", new_mode)
         markup = InlineKeyboardMarkup(rows)
 
-        # Update *text + keyboard* together, just like Dailies
-        try:
-            await query.edit_message_text(
-                panel_text,
-                parse_mode="HTML",
-                reply_markup=markup,
-                disable_web_page_preview=True,
-            )
-        except BadRequest as e:
-            # Typical case: "message is not modified" – just update keyboard
-            if "message is not modified" in str(e).lower():
-                try:
-                    await query.edit_message_reply_markup(reply_markup=markup)
-                except Exception:
-                    pass
-            else:
-                # Fallback: keyboard-only update
-                try:
-                    await query.edit_message_reply_markup(reply_markup=markup)
-                except Exception:
-                    pass
+        await edit_here(panel_text, markup)
 
         await update_and_pin_status(context, home_chat_id, stats_override=stats)
         await query.answer(f"Layout: {new_mode.title()}", show_alert=False)
@@ -3277,10 +3084,13 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if parts and parts[0] == "cMenuLayout":
         current = context.user_data.get("c_menu_layout", "full")
         new_mode = cycle_layout_mode(current)
-        context.user_data["c_menu_layout"] = new_mode
 
-        completed = get_tasks(user_id, api_key, "completedTodos") or []
-        status_data = get_status(user_id, api_key) or {}
+        completed = get_tasks(user_id, api_key, "completedTodos")
+        status_data = get_status(user_id, api_key)
+        if completed is None or status_data is None:
+            await query.answer("❌ Couldn't refresh the completed-Todos layout.", show_alert=True)
+            return
+        context.user_data["c_menu_layout"] = new_mode
         stats = status_data.get("stats", {}) or {}
         status_html = build_status_block(stats)
 
@@ -3301,7 +3111,7 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         for t in completed:
             full_text = t.get("text", "(no title)")
             short = full_text if len(full_text) <= MAX_LABEL_LEN else full_text[:MAX_LABEL_LEN - 1] + "…"
-            # these are completed by definition; you already use ↩️ to un-complete
+            # These are completed by definition; ↩️ restores them.
             icon = "↩️"
             action_for_t = "down"
             tid = t.get("id")
@@ -3315,24 +3125,7 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         append_standard_footer(rows, "completedTodos", new_mode, include_potion=False)
         markup = InlineKeyboardMarkup(rows)
 
-        try:
-            await query.edit_message_text(
-                panel_text,
-                parse_mode="HTML",
-                reply_markup=markup,
-                disable_web_page_preview=True,
-            )
-        except BadRequest as e:
-            if "message is not modified" in str(e).lower():
-                try:
-                    await query.edit_message_reply_markup(reply_markup=markup)
-                except Exception:
-                    pass
-            else:
-                try:
-                    await query.edit_message_reply_markup(reply_markup=markup)
-                except Exception:
-                    pass
+        await edit_here(panel_text, markup)
 
         await update_and_pin_status(context, home_chat_id, stats_override=stats)
         await query.answer(f"Layout: {new_mode.title()}", show_alert=False)
@@ -3342,9 +3135,14 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if parts and parts[0] == "rMenuLayout":
         current = context.user_data.get("r_menu_layout", "full")
         new_mode = cycle_layout_mode(current)
-        context.user_data["r_menu_layout"] = new_mode
 
-        rewards = get_tasks(user_id, api_key, "rewards") or []
+        rewards = get_tasks(user_id, api_key, "rewards")
+        status_data = get_status(user_id, api_key)
+        if rewards is None or status_data is None:
+            await query.answer("❌ Couldn't refresh the Rewards layout.", show_alert=True)
+            return
+        context.user_data["r_menu_layout"] = new_mode
+        stats = status_data.get("stats", {}) or {}
         buttons_with_len = []
         MAX_LABEL_LEN = 24
         for t in rewards:
@@ -3359,13 +3157,20 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             buttons_with_len.append((btn, len(label)))
 
         rows = layout_buttons_for_mode(buttons_with_len, new_mode)
-        # ✅ keep the common footer (refresh / buy potion / refresh day + layout toggle)
         append_standard_footer(rows, "rewards", new_mode)
-
-        try:
-            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
-        except Exception:
-            pass
+        markup = InlineKeyboardMarkup(rows)
+        cfg = PANEL_BEHAVIOUR["rewards"]
+        panel_text = build_tasks_panel_text(
+            kind="rewards",
+            tasks=rewards,
+            status_text=build_status_block(stats),
+            show_status=cfg["show_status"],
+            show_list=cfg["show_list"],
+            list_first=cfg["list_first"],
+            layout_mode=new_mode,
+        )
+        await edit_here(panel_text, markup)
+        await update_and_pin_status(context, home_chat_id, stats_override=stats)
 
         await query.answer(f"Layout: {new_mode.title()}", show_alert=False)
         return
@@ -3414,26 +3219,23 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         state = parts[1]     # "0" = unchecked, "1" = checked
         task_id = parts[2]
+        if state not in {"0", "1"} or not task_id:
+            await query.answer("⚠️ Invalid Daily button.", show_alert=True)
+            return
 
         currently_checked = (state == "1")
         new_checked = not currently_checked
         direction = "up" if new_checked else "down"
 
-        # Score the daily & compute stat delta
-        try:
-            old_stats, new_stats, _score_data = get_old_and_new_stats_for_scored_task(
-                user_id=user_id,
-                api_key=api_key,
-                task_id=task_id,
-                direction=direction,
-            )
-        except Exception:
-            # Fallback manual implementation
-            old_status = get_status(user_id, api_key) or {}
-            old_stats = old_status.get("stats", {}) if old_status else {}
-            score_task(user_id, api_key, task_id, direction=direction)
-            new_status = get_status(user_id, api_key) or {}
-            new_stats = new_status.get("stats", {}) or {}
+        old_stats, new_stats, score_data = get_old_and_new_stats_for_scored_task(
+            user_id=user_id,
+            api_key=api_key,
+            task_id=task_id,
+            direction=direction,
+        )
+        if score_data is None:
+            await query.answer("❌ Habitica did not update the Daily.", show_alert=True)
+            return
         delta = _delta_text(old_stats, new_stats)
 
         # Update local refresh-day state
@@ -3497,7 +3299,7 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return
 
             # Actually run Habitica cron
-            ok = run_cron_for_user(user_id, api_key)
+            ok = run_cron(user_id, api_key)
 
             # Always re-fetch status afterwards for accurate stats
             new_status = get_status(user_id, api_key) or {}
@@ -3568,9 +3370,6 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.answer("❌ Refresh cancelled.", show_alert=False)
             return
 
-    # quick cmd actions (cmd:status / cmd:buy_potion)
-    # quick cmd actions (cmd:status / cmd:buy_potion / cmd:refresh_day)
-    # quick cmd actions (cmd:status / cmd:buy_potion / cmd:refresh_day)
     # quick cmd actions (cmd:status / cmd:buy_potion / cmd:refresh_day)
     if parts and parts[0] == "cmd":
         # home_chat_id = query.from_user.id (defined earlier in the function)
@@ -3586,10 +3385,13 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         if len(parts) > 1 and parts[1] == "avatar":
-            # Re-render and send the user's avatar (photo + document) in this chat
-            await avatar_command_handler(update, context)
+            delivered = await avatar_command_handler(update, context)
+            destination = "sent privately" if update.effective_chat is None else "updated"
             try:
-                await query.answer("Avatar updated.", show_alert=False)
+                await query.answer(
+                    f"Avatar {destination}." if delivered else "Avatar generation failed.",
+                    show_alert=not delivered,
+                )
             except Exception:
                 pass
             return
@@ -3666,7 +3468,6 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                     # no layout toggle row for habits
 
                     markup = InlineKeyboardMarkup(rows)
-                    header = "<b>🌀 Your Habits</b>"
 
                 elif panel_hint == "dailys":
                     dailys = get_tasks(user_id, api_key, "dailys") or []
@@ -3689,7 +3490,6 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                     rows = layout_buttons_for_mode(buttons_with_len, layout_mode)
                     append_standard_footer(rows, "dailys", layout_mode)
                     markup = InlineKeyboardMarkup(rows)
-                    header = "<b>📅 Your Dailies</b>"
 
                 elif panel_hint == "todos":
                     todos = get_tasks(user_id, api_key, "todos") or []
@@ -3712,7 +3512,6 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                     append_standard_footer(rows, "todos", layout_mode)
 
                     markup = InlineKeyboardMarkup(rows)
-                    header = "<b>📝 Your Todos</b>"
 
                 else:  # rewards
                     rewards = get_tasks(user_id, api_key, "rewards") or []
@@ -3733,7 +3532,6 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                     append_standard_footer(rows, "rewards", layout_mode)
 
                     markup = InlineKeyboardMarkup(rows)
-                    header = "<b>💰 Rewards</b>"
 
                 # Inline message: update header+status text + keep same keyboard
                 await _update_panel_text_if_needed(new_stats, markup)
@@ -3756,7 +3554,7 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
 
-    if len(parts) > 1 and parts[1] == "refresh_day":
+    if parts == ["cmd", "refresh_day"]:
         # "Refresh day" button – used from panels (/dailys, /habits, /todos, …)
         # and from the inline shortcut menu.
         if not user_id or not api_key:
@@ -3768,9 +3566,8 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         if debug:
-            logging.info(
-                "Opening refresh-day menu from callback for user %s (inline=%s)",
-                user_id,
+            logger.info(
+                "Opening refresh-day menu from callback (inline=%s)",
                 bool(query.inline_message_id),
             )
 
@@ -3797,7 +3594,7 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "<b>These Dailies were due yesterday and are still unchecked:</b>"
             )
             for meta in cron_meta.values():
-                text = html.escape(meta.get("text", "(no title)"))
+                text = _escape_html(meta.get("text", "(no title)"))
                 lines.append(f"• {text}")
             lines.append("")
             lines.append(
@@ -3816,10 +3613,10 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             # Works for both text and photo+caption messages
             await edit_here("\n".join(lines), keyboard)
             await query.answer()
-        except Exception as e:
-            logging.exception(
-                "Failed to edit message to refresh-day panel: %s",
-                e,
+        except Exception as exc:
+            logger.error(
+                "Failed to edit the refresh-day panel (%s)",
+                type(exc).__name__,
             )
         return
 
@@ -4028,7 +3825,9 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         old_stats = old_status.get("stats", {}) if old_status else {}
 
         # Score the Daily
-        score_task(user_id, api_key, task_id, direction=action)
+        if score_task(user_id, api_key, task_id, direction=action) is None:
+            await query.answer("❌ Failed to update Daily.", show_alert=True)
+            return
         updated_task = get_task_by_id(user_id, api_key, task_id)
         if not updated_task:
             await query.answer("❌ Failed to update Daily.", show_alert=True)
@@ -4078,7 +3877,9 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         old_status = get_status(user_id, api_key)
         old_stats = old_status.get("stats", {}) if old_status else {}
 
-        score_task(user_id, api_key, task_id, direction=action)
+        if score_task(user_id, api_key, task_id, direction=action) is None:
+            await query.answer("❌ Failed to update Todo.", show_alert=True)
+            return
         updated_task = get_task_by_id(user_id, api_key, task_id)
         if not updated_task:
             await query.answer("❌ Failed to update Todo.", show_alert=True)
@@ -4144,7 +3945,9 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         old_stats = old_status.get("stats", {}) if old_status else {}
 
         # Score the todo (down = un-complete)
-        score_task(user_id, api_key, task_id, direction=action)
+        if score_task(user_id, api_key, task_id, direction=action) is None:
+            await query.answer("❌ Failed to update completed todo.", show_alert=True)
+            return
         updated_task = get_task_by_id(user_id, api_key, task_id)
         if not updated_task:
             await query.answer("❌ Failed to update completed todo.", show_alert=True)
@@ -4253,7 +4056,6 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # Habits panel (hMenu)
-    # Habits panel (hMenu)
     if len(parts) == 3 and parts[0] == "hMenu":
         _, direction, task_id = parts
         if direction not in ("up", "down"):
@@ -4263,7 +4065,9 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         old = get_status(user_id, api_key)
         old_stats = old.get("stats", {}) if old else {}
 
-        score_task(user_id, api_key, task_id, direction=direction)
+        if score_task(user_id, api_key, task_id, direction=direction) is None:
+            await query.answer("❌ Failed to update Habit.", show_alert=True)
+            return
 
         new = get_status(user_id, api_key) or {}
         new_stats = new.get("stats", {}) or {}
@@ -4352,13 +4156,18 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     # -------------------------------------------------------------------------
     if len(parts) == 6 and parts[0] == "habits":
         _, action, task_id, _cur, up_str, down_str = parts
+        if action not in {"up", "down"}:
+            await query.answer("⚠️ Unknown habit action.", show_alert=True)
+            return
         original_up = (up_str == "True")
         original_down = (down_str == "True")
 
         old = get_status(user_id, api_key)
         old_stats = old.get("stats", {}) if old else {}
 
-        score_task(user_id, api_key, task_id, direction=action)
+        if score_task(user_id, api_key, task_id, direction=action) is None:
+            await query.answer("❌ Failed to update habit.", show_alert=True)
+            return
         updated_task = get_task_by_id(user_id, api_key, task_id)
         if not updated_task:
             await query.answer("❌ Failed to update habit.", show_alert=True)
@@ -4383,7 +4192,7 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             ))
         markup = InlineKeyboardMarkup([kb_row]) if kb_row else None
 
-        task_text = html.escape(updated_task.get('text', '(no title)'))
+        task_text = _escape_html(updated_task.get('text', '(no title)'))
         body = (
                 f"<blockquote>🌀<b><i>{task_text}</i></b></blockquote>\n"
                 + build_status_block(new_stats)
@@ -4408,10 +4217,15 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         ttype, action, task_id = parts
 
         if ttype in {"dailys", "todos", "completedTodos"}:
+            if action not in {"up", "down"}:
+                await query.answer("⚠️ Unknown task action.", show_alert=True)
+                return
             old = get_status(user_id, api_key)
             old_stats = old.get("stats", {}) if old else {}
 
-            score_task(user_id, api_key, task_id, direction=action)
+            if score_task(user_id, api_key, task_id, direction=action) is None:
+                await query.answer("❌ Failed to update task.", show_alert=True)
+                return
             updated_task = get_task_by_id(user_id, api_key, task_id)
             if not updated_task:
                 await query.answer("❌ Failed to update task.", show_alert=True)
@@ -4427,7 +4241,7 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton(btn, callback_data=f"{ttype}:{new_action}:{task_id}")]])
 
             icon = "📅 " if ttype == "dailys" else ("📝 " if ttype == "todos" else "✅ ")
-            task_text = html.escape(updated_task.get("text", "(no title)"))
+            task_text = _escape_html(updated_task.get("text", "(no title)"))
 
             show_status = bool(context.user_data.get(UD_REMINDER_SHOW_STATUS, False))
 
@@ -4447,9 +4261,6 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"{'completed' if is_completed else 'uncompleted'} ({delta})",
                 show_alert=False,
             )
-            return
-
-            await query.answer(f"{icon} {ttype.replace('s','').title()} {'completed' if is_completed else 'uncompleted'} ({delta})", show_alert=False)
             return
 
         if ttype == "rewards" and action == "buy":
@@ -4480,6 +4291,8 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def cancel_command_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
+    context.user_data.pop(UD_PENDING_USER_ID, None)
+    context.user_data.pop("new_todo_title", None)
     text = (
         "✅ The current action has been canceled.\n\n"
         "If you’d like to see the list of available commands, type /help."
@@ -4506,8 +4319,7 @@ async def update_and_pin_status(
     Uses context.user_data to remember the pinned status message id,
     keyed by chat_id (so it works across restarts with persistence).
 
-    NEW BEHAVIOR:
-    - If the computed status_text is identical to the last one we pinned
+    If the computed status_text is identical to the last one we pinned
       for this chat, and a pinned message exists, we skip editing/pinning
       entirely and just clean up temporary messages.
     """
@@ -4517,6 +4329,12 @@ async def update_and_pin_status(
     api_key = context.user_data.get("API_KEY")
     if not (user_id and api_key):
         logging.warning("Cannot update status: USER_ID or API_KEY not found.")
+        await _cleanup_messages(
+            context,
+            chat_id,
+            user_command_message_id,
+            bot_status_message_id,
+        )
         return
 
     # --- Get stats (either from override or from Habitica /user) ---
@@ -4527,6 +4345,12 @@ async def update_and_pin_status(
         status_data = get_status(user_id, api_key)
         if not status_data:
             logging.warning("Cannot update status: Failed to fetch data from Habitica API.")
+            await _cleanup_messages(
+                context,
+                chat_id,
+                user_command_message_id,
+                bot_status_message_id,
+            )
             return
         stats = status_data.get("stats", {}) or {}
 
@@ -4577,9 +4401,9 @@ async def update_and_pin_status(
             context.user_data[text_key] = status_text
             edit_was_successful = True
 
-        except BadRequest as e:
+        except BadRequest as exc:
             # "message is not modified" is harmless, treat as success
-            if "message is not modified" in str(e).lower():
+            if "message is not modified" in str(exc).lower():
                 logging.info(
                     "Status unchanged (BadRequest 'message is not modified'). "
                     "No edit needed for pinned message %s in chat %s.",
@@ -4590,16 +4414,20 @@ async def update_and_pin_status(
             else:
                 logging.warning(
                     "Could not edit pin %s in chat %s. "
-                    "Will create a new one. Error: %s",
-                    pinned_id, chat_id, e
+                    "Will create a new one (%s).",
+                    pinned_id,
+                    chat_id,
+                    type(exc).__name__,
                 )
                 context.user_data.pop(pinned_key, None)
 
-        except TelegramError as e:
+        except TelegramError as exc:
             logging.error(
                 "An unexpected error occurred while editing pinned message %s "
-                "in chat %s: %s",
-                pinned_id, chat_id, e
+                "in chat %s (%s)",
+                pinned_id,
+                chat_id,
+                type(exc).__name__,
             )
             context.user_data.pop(pinned_key, None)
 
@@ -4626,8 +4454,6 @@ async def update_and_pin_status(
         chat_id,
     )
     try:
-        # In private chats this is fine; in groups it may fail if bot has no rights.
-        await context.bot.unpin_all_chat_messages(chat_id=chat_id)
         await context.bot.pin_chat_message(
             chat_id=chat_id,
             message_id=new_message.message_id,
@@ -4640,10 +4466,12 @@ async def update_and_pin_status(
             "Successfully created and pinned new status message %s in chat %s.",
             new_message.message_id, chat_id
         )
-    except TelegramError as e:
+    except TelegramError as exc:
         logging.error(
-            "Failed to pin new status message %s in chat %s: %s",
-            new_message.message_id, chat_id, e
+            "Failed to pin new status message %s in chat %s (%s)",
+            new_message.message_id,
+            chat_id,
+            type(exc).__name__,
         )
 
     # Clean up temp messages at the end
@@ -4660,28 +4488,6 @@ async def _cleanup_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int, us
             await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except TelegramError:
             pass # Ignore errors during cleanup (e.g., message already deleted)
-
-
-
-def run_cron(user_id: str, api_key: str) -> bool:
-    """Call Habitica cron (refresh the day). Returns True on success."""
-    headers = {
-        "x-api-user": user_id,
-        "x-api-key": api_key,
-        "x-client": "habitica-python-3.0.0",
-        "Content-Type": "application/json",
-    }
-    url = f"{HABITICA_API_URL}/cron"
-    try:
-        resp = requests.post(url, headers=headers, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        if isinstance(data, dict):
-            return bool(data.get("success", True))
-        return True
-    except requests.RequestException as e:
-        logging.error(f"Failed to run cron: {e}")
-        return False
 
 
 
@@ -4765,7 +4571,7 @@ async def open_refresh_day_menu_for_chat(
             "<b>These Dailies were due yesterday and are still unchecked:</b>"
         )
         for meta in cron_meta.values():
-            text = html.escape(meta.get("text", "(no title)"))
+            text = _escape_html(meta.get("text", "(no title)"))
             lines.append(f"• {text}")
         lines.append("")
         lines.append(
@@ -4784,8 +4590,11 @@ async def open_refresh_day_menu_for_chat(
     # --- Try to send with avatar PNG ------------------------------------------
     try:
         png_path = await ensure_avatar_png(update, context, force_refresh=False)
-    except Exception as e:
-        logging.warning("ensure_avatar_png failed for refresh-day menu: %s", e)
+    except Exception as exc:
+        logger.warning(
+            "Avatar preparation failed for the refresh-day menu (%s)",
+            type(exc).__name__,
+        )
         png_path = context.user_data.get("AVATAR_PNG_PATH")
 
     if png_path and os.path.exists(png_path):
@@ -4804,10 +4613,10 @@ async def open_refresh_day_menu_for_chat(
                 context.user_data["AVATAR_FILE_ID"] = msg.photo[-1].file_id
             context.user_data["AVATAR_PNG_PATH"] = png_path
             return
-        except Exception as e:
-            logging.warning(
-                "Failed to send refresh-day menu with avatar, falling back to text: %s",
-                e,
+        except Exception as exc:
+            logger.warning(
+                "Failed to send the refresh-day avatar; using text (%s)",
+                type(exc).__name__,
             )
 
     # Fallback: text-only refresh-day menu
@@ -4909,7 +4718,10 @@ async def show_dailys_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Use /start to set USER_ID and API_KEY first.")
         return
 
-    dailys = get_tasks(user_id, api_key, "dailys") or []
+    dailys = get_tasks(user_id, api_key, "dailys")
+    if dailys is None:
+        await update.message.reply_text("⚠️ Could not reach Habitica. Please try again.")
+        return
     if not dailys:
         await update.message.reply_text("📅 You have no Dailies.")
         return
@@ -4954,7 +4766,10 @@ async def show_todos_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Use /start to set USER_ID and API_KEY first.")
         return
 
-    todos = get_tasks(user_id, api_key, "todos") or []
+    todos = get_tasks(user_id, api_key, "todos")
+    if todos is None:
+        await update.message.reply_text("⚠️ Could not reach Habitica. Please try again.")
+        return
     if not todos:
         await update.message.reply_text("📝 You have no Todos.")
         return
@@ -5064,7 +4879,7 @@ async def add_todo_title_received(update: Update, context: ContextTypes.DEFAULT_
         await topic_send(
             update,
             context.bot.send_message,
-            context.bot.send_message,
+            chat_id=update.effective_chat.id,
             text="Please send a non‑empty title, or /cancel.",
         )
         return ADD_TODO_TITLE
@@ -5086,7 +4901,7 @@ async def add_todo_title_received(update: Update, context: ContextTypes.DEFAULT_
         update,
         context.bot.send_message,
         chat_id=update.effective_chat.id,
-        text=f"Title:\n<b>{html.escape(title)}</b>\n\nChoose difficulty:",
+        text=f"Title:\n<b>{_escape_html(title)}</b>\n\nChoose difficulty:",
         parse_mode="HTML",
         reply_markup=keyboard,
         disable_web_page_preview=True,
@@ -5140,7 +4955,7 @@ async def add_todo_difficulty_chosen(update: Update, context: ContextTypes.DEFAU
 
     text = (
         "✅ New To‑Do created:\n"
-        f"<b>{html.escape(title)}</b>\n"
+        f"<b>{_escape_html(title)}</b>\n"
         f"<i>Difficulty:</i> {difficulty_label}"
     )
 
@@ -5158,8 +4973,11 @@ async def add_todo_difficulty_chosen(update: Update, context: ContextTypes.DEFAU
         # Update pinned status in the user's private chat (like other actions)
     try:
         await update_and_pin_status(context, chat_id=query.from_user.id)
-    except Exception as e:
-        logging.warning("Failed to update status after add_todo: %s", e)
+    except Exception as exc:
+        logger.warning(
+            "Failed to update status after creating a Todo (%s)",
+            type(exc).__name__,
+        )
 
     return ConversationHandler.END
 
@@ -5174,7 +4992,10 @@ async def show_completed_todos_menu(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text("Use /start to set USER_ID and API_KEY first.")
         return
 
-    completed = get_tasks(user_id, api_key, "completedTodos") or []
+    completed = get_tasks(user_id, api_key, "completedTodos")
+    if completed is None:
+        await update.message.reply_text("⚠️ Could not reach Habitica. Please try again.")
+        return
     if not completed:
         await update.message.reply_text("✅ You have no completed Todos.")
         return
@@ -5198,7 +5019,7 @@ async def show_completed_todos_menu(update: Update, context: ContextTypes.DEFAUL
         layout_mode=layout_mode,
     )
 
-    # Build keyboard: same layout you already had for completed todos
+    # Build the completed-Todo keyboard.
     buttons_with_len: list[tuple[InlineKeyboardButton, int]] = []
     MAX_LABEL_LEN = 28
     for t in completed:
@@ -5242,7 +5063,10 @@ async def show_rewards_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Use /start to set USER_ID and API_KEY first.")
         return
 
-    rewards = get_tasks(user_id, api_key, "rewards") or []
+    rewards = get_tasks(user_id, api_key, "rewards")
+    if rewards is None:
+        await update.message.reply_text("⚠️ Could not reach Habitica. Please try again.")
+        return
     if not rewards:
         await update.message.reply_text("💰 You have no custom Rewards.")
         return
@@ -5308,7 +5132,10 @@ async def show_habits_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Use /start to set USER_ID and API_KEY first.")
         return
 
-    habits = get_tasks(user_id, api_key, "habits") or []
+    habits = get_tasks(user_id, api_key, "habits")
+    if habits is None:
+        await update.message.reply_text("⚠️ Could not reach Habitica. Please try again.")
+        return
     if not habits:
         await update.message.reply_text("🌀 You have no Habits.")
         return
@@ -5387,217 +5214,266 @@ async def show_habits_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def run_reminder_tick(application: Application) -> dict:
-    """
-    Runs one reminder check for ALL users stored in PicklePersistence (botdata.pkl).
-    Intended to be called from a Flask /tick endpoint.
-    """
-    utc_now = datetime.utcnow()
-    window_seconds = int(os.environ.get("REMINDER_WINDOW_SECONDS", "60"))
+    """Run one isolated, persistent reminder pass for every linked user."""
+    utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+    window_seconds = _bounded_env_int(
+        "REMINDER_WINDOW_SECONDS",
+        default=60,
+        minimum=1,
+        maximum=3600,
+    )
     window = timedelta(seconds=window_seconds)
+    now_epoch = int(time_mod.time())
 
     sent_count = 0
     users_checked = 0
     errors = 0
+    dirty_user_ids: set[int] = set()
 
-    # application.user_data is loaded from PicklePersistence when the app initializes
-    for telegram_user_id, ud in (application.user_data or {}).items():
+    for telegram_user_id, ud in list((application.user_data or {}).items()):
+        if not isinstance(ud, dict) or not ud.get(UD_REMINDERS_ENABLED, True):
+            continue
+
+        habitica_user_id = ud.get("USER_ID")
+        habitica_api_key = ud.get("API_KEY")
+        if not habitica_user_id or not habitica_api_key:
+            continue
+
+        dirty_user_ids.add(telegram_user_id)
+        status_cache: dict | None = None
+        status_loaded = False
+        status_error_counted = False
+
         try:
-            if not ud.get(UD_REMINDERS_ENABLED, True):
-                continue
-
-            habitica_user_id = ud.get("USER_ID")
-            habitica_api_key = ud.get("API_KEY")
-            if not habitica_user_id or not habitica_api_key:
-                continue
-
-            # --- timezoneOffset caching (minutes) ---
-            # Habitica stores timezoneOffset like JS getTimezoneOffset (UTC+10 is -600) :contentReference[oaicite:8]{index=8}
             tz_offset = ud.get(UD_TZ_OFFSET)
-            age = int(time_mod.time()) - int(ud.get(UD_TZ_OFFSET_UPDATED_AT, 0) or 0)
-            if tz_offset is None or age > 24 * 3600:
-                status = get_status(habitica_user_id, habitica_api_key) or {}
-                tz_offset = (status.get("preferences") or {}).get("timezoneOffset", 0)
-                try:
-                    ud[UD_TZ_OFFSET] = int(tz_offset)
-                except Exception:
-                    ud[UD_TZ_OFFSET] = 0
-                ud[UD_TZ_OFFSET_UPDATED_AT] = int(time_mod.time())
+            try:
+                offset_age = now_epoch - int(ud.get(UD_TZ_OFFSET_UPDATED_AT, 0) or 0)
+            except (TypeError, ValueError):
+                offset_age = 24 * 3600 + 1
 
-            tz_offset = int(ud.get(UD_TZ_OFFSET, 0))
+            if tz_offset is None or offset_age > 24 * 3600:
+                status_cache = await asyncio.to_thread(
+                    get_status,
+                    habitica_user_id,
+                    habitica_api_key,
+                )
+                status_loaded = True
+                if status_cache is None:
+                    errors += 1
+                    status_error_counted = True
+                    if tz_offset is None:
+                        continue
+                else:
+                    candidate = (status_cache.get("preferences") or {}).get(
+                        "timezoneOffset"
+                    )
+                    try:
+                        candidate = int(candidate)
+                        if not -14 * 60 <= candidate <= 14 * 60:
+                            raise ValueError
+                    except (TypeError, ValueError):
+                        errors += 1
+                        if tz_offset is None:
+                            continue
+                    else:
+                        tz_offset = candidate
+                        ud[UD_TZ_OFFSET] = candidate
+                        ud[UD_TZ_OFFSET_UPDATED_AT] = now_epoch
+
+            try:
+                tz_offset = int(tz_offset)
+            except (TypeError, ValueError):
+                errors += 1
+                continue
+
             now_local = utc_now - timedelta(minutes=tz_offset)
             today_local = now_local.date()
-
             chat_id, thread_id = _get_notify_target(int(telegram_user_id), ud)
 
-            avatar_doc_id = ud.get("AVATAR_DOC_FILE_ID")
-            avatar_png_path = ud.get("AVATAR_PNG_PATH")
-            status_text_cache: str | None = None
+            dailys = await asyncio.to_thread(
+                get_tasks,
+                habitica_user_id,
+                habitica_api_key,
+                "dailys",
+            )
+            todos = await asyncio.to_thread(
+                get_tasks,
+                habitica_user_id,
+                habitica_api_key,
+                "todos",
+            )
+            if dailys is None:
+                errors += 1
+                dailys = []
+            if todos is None:
+                errors += 1
+                todos = []
 
-            # Fetch tasks
-            dailys = get_tasks(habitica_user_id, habitica_api_key, "dailys") or []
-            todos = get_tasks(habitica_user_id, habitica_api_key, "todos") or []
+            sent_map = ud.get(UD_SENT_REMINDERS)
+            if not isinstance(sent_map, dict):
+                sent_map = {}
+                ud[UD_SENT_REMINDERS] = sent_map
 
-            # --- DAILIES ---
-            for t in dailys:
-                if t.get("completed"):
-                    continue
-                if t.get("isDue") is False:
-                    continue
+            async def status_html() -> str:
+                nonlocal status_cache, status_loaded, status_error_counted, errors
+                if not ud.get(UD_REMINDER_SHOW_STATUS, False):
+                    return ""
+                if not status_loaded:
+                    status_cache = await asyncio.to_thread(
+                        get_status,
+                        habitica_user_id,
+                        habitica_api_key,
+                    )
+                    status_loaded = True
+                if status_cache is None:
+                    if not status_error_counted:
+                        errors += 1
+                        status_error_counted = True
+                    return ""
+                return build_status_block(status_cache.get("stats") or {})
 
-                for rem in (t.get("reminders") or []):
-                    if not isinstance(rem, dict):
-                        continue
-
-                    # Habitica reminders include id/startDate/time :contentReference[oaicite:9]{index=9}
-                    rem_time = _parse_time_of_day(rem.get("time"))
-                    if not rem_time:
-                        continue
-
-                    when = datetime.combine(today_local, rem_time)
-                    if not (when <= now_local < when + window):
-                        continue
-
-                    rem_id = rem.get("id") or rem_time.strftime("%H:%M")
-                    key = f"rem:dailys:{t.get('id')}:{rem_id}:{today_local.isoformat()}:{rem_time.strftime('%H:%M')}"
-
-                    sent_map = ud.setdefault(UD_SENT_REMINDERS, {})
-                    if key in sent_map:
-                        continue
-
-                    show_status = bool(ud.get(UD_REMINDER_SHOW_STATUS, False))
-
-                    status_html = ""
-                    if show_status:
-                        status_data = get_status(habitica_user_id, habitica_api_key) or {}
-                        stats = status_data.get("stats", {}) or {}
-                        status_html = build_status_block(stats)
-
-                    await _send_task_reminder(
+            async def deliver(task_type: str, task: dict, key: str) -> None:
+                nonlocal sent_count, errors
+                if key in sent_map:
+                    return
+                try:
+                    delivered = await _send_task_reminder(
                         application.bot,
                         chat_id=chat_id,
                         thread_id=thread_id,
-                        normalized_type="dailys",
-                        task=t,
+                        normalized_type=task_type,
+                        task=task,
                         user_data=ud,
                         habitica_user_id=habitica_user_id,
                         habitica_api_key=habitica_api_key,
-                        status_html=status_html,
+                        status_html=await status_html(),
                     )
+                except TelegramError as exc:
+                    errors += 1
+                    logger.warning(
+                        "Telegram reminder delivery failed (%s)",
+                        type(exc).__name__,
+                    )
+                    return
+                except Exception as exc:
+                    errors += 1
+                    logger.error(
+                        "Reminder delivery failed (%s)",
+                        type(exc).__name__,
+                    )
+                    return
 
+                if delivered:
                     sent_map[key] = int(time_mod.time())
                     sent_count += 1
 
-            # --- TODOS ---
-            for t in todos:
-                if t.get("completed"):
+            for task in dailys:
+                if task.get("completed") or task.get("isDue") is False:
                     continue
+                for reminder in task.get("reminders") or []:
+                    if not isinstance(reminder, dict):
+                        continue
+                    reminder_time = _parse_time_of_day(
+                        reminder.get("time"),
+                        tz_offset_minutes=tz_offset,
+                    )
+                    if reminder_time is None:
+                        continue
+                    occurrence = datetime.combine(today_local, reminder_time)
+                    if not occurrence <= now_local < occurrence + window:
+                        continue
+                    reminder_id = reminder.get("id") or reminder_time.strftime("%H:%M")
+                    key = (
+                        f"rem:dailys:{task.get('id')}:{reminder_id}:"
+                        f"{today_local.isoformat()}:{reminder_time.strftime('%H:%M')}"
+                    )
+                    await deliver("dailys", task, key)
 
-                reminders = t.get("reminders") or []
+            for task in todos:
+                if task.get("completed"):
+                    continue
+                reminders = task.get("reminders") or []
                 if reminders:
-                    for rem in reminders:
-                        if not isinstance(rem, dict):
+                    for reminder in reminders:
+                        if not isinstance(reminder, dict):
                             continue
-
-                        rem_time = _parse_time_of_day(rem.get("time"))
-                        if not rem_time:
-                            continue
-
-                        when = datetime.combine(today_local, rem_time)
-                        if not (when <= now_local < when + window):
-                            continue
-
-                        rem_id = rem.get("id") or rem_time.strftime("%H:%M")
-                        key = f"rem:todos:{t.get('id')}:{rem_id}:{today_local.isoformat()}:{rem_time.strftime('%H:%M')}"
-
-                        sent_map = ud.setdefault(UD_SENT_REMINDERS, {})
-                        if key in sent_map:
-                            continue
-
-                        show_status = bool(ud.get(UD_REMINDER_SHOW_STATUS, False))
-
-                        status_html = ""
-                        if show_status:
-                            status_data = get_status(habitica_user_id, habitica_api_key) or {}
-                            stats = status_data.get("stats", {}) or {}
-                            status_html = build_status_block(stats)
-
-                        await _send_task_reminder(
-                            application.bot,
-                            chat_id=chat_id,
-                            thread_id=thread_id,
-                            normalized_type="todos",
-                            task=t,
-                            user_data=ud,
-                            habitica_user_id=habitica_user_id,
-                            habitica_api_key=habitica_api_key,
-                            status_html=status_html,
+                        reminder_time = _parse_time_of_day(
+                            reminder.get("time"),
+                            tz_offset_minutes=tz_offset,
                         )
-
-                        sent_map[key] = int(time_mod.time())
-                        sent_count += 1
+                        if reminder_time is None:
+                            continue
+                        start_date = _parse_local_date(
+                            reminder.get("startDate") or task.get("date"),
+                            tz_offset_minutes=tz_offset,
+                        )
+                        if start_date is not None and start_date != today_local:
+                            continue
+                        occurrence = datetime.combine(today_local, reminder_time)
+                        if not occurrence <= now_local < occurrence + window:
+                            continue
+                        reminder_id = reminder.get("id") or reminder_time.strftime("%H:%M")
+                        key_date = start_date or today_local
+                        key = (
+                            f"rem:todos:{task.get('id')}:{reminder_id}:"
+                            f"{key_date.isoformat()}:{reminder_time.strftime('%H:%M')}"
+                        )
+                        await deliver("todos", task, key)
                 else:
-                    # Optional fallback: todo due datetime in `date` (only if no reminders)
-                    due_dt = _parse_iso_dt(t.get("date"))
-                    if due_dt:
-                        # convert due to UTC naive, then to local
-                        if due_dt.tzinfo is not None:
-                            due_utc = due_dt.astimezone(timezone.utc).replace(tzinfo=None)
-                            due_local = due_utc - timedelta(minutes=tz_offset)
-                        else:
-                            due_local = due_dt
-
-                        if due_local <= now_local < due_local + window:
-                            key = f"due:todos:{t.get('id')}:{due_local.strftime('%Y-%m-%dT%H:%M')}"
-                            sent_map = ud.setdefault(UD_SENT_REMINDERS, {})
-                            if key not in sent_map:
-
-                                show_status = bool(ud.get(UD_REMINDER_SHOW_STATUS, False))
-
-                                status_html = ""
-                                if show_status:
-                                    status_data = get_status(habitica_user_id, habitica_api_key) or {}
-                                    stats = status_data.get("stats", {}) or {}
-                                    status_html = build_status_block(stats)
-
-                                await _send_task_reminder(
-                                    application.bot,
-                                    chat_id=chat_id,
-                                    thread_id=thread_id,
-                                    normalized_type="todos",
-                                    task=t,
-                                    user_data=ud,
-                                    habitica_user_id=habitica_user_id,
-                                    habitica_api_key=habitica_api_key,
-                                    status_html=status_html,
-                                )
-
-                                sent_map[key] = int(time_mod.time())
-                                sent_count += 1
+                    due_at = _parse_local_datetime(
+                        task.get("date"),
+                        tz_offset_minutes=tz_offset,
+                    )
+                    if due_at is not None and due_at <= now_local < due_at + window:
+                        key = f"due:todos:{task.get('id')}:{due_at.strftime('%Y-%m-%dT%H:%M')}"
+                        await deliver("todos", task, key)
 
             _sent_key_prune(ud)
-
             users_checked += 1
-
-        except Exception:
+        except Exception as exc:
             errors += 1
-            logging.exception("Reminder tick failed for telegram_user_id=%s", telegram_user_id)
+            logger.error("Reminder tick failed for one user (%s)", type(exc).__name__)
 
-    # Make sure persistence sees our updated user_data maps
+    persistence_updated = True
     try:
+        if dirty_user_ids:
+            application.mark_data_for_update_persistence(user_ids=dirty_user_ids)
         await application.update_persistence()
-    except Exception:
-        pass
+    except Exception as exc:
+        persistence_updated = False
+        errors += 1
+        logger.error("Reminder persistence update failed (%s)", type(exc).__name__)
 
     return {
+        "ok": errors == 0 and persistence_updated,
         "sent": sent_count,
         "users_checked": users_checked,
         "errors": errors,
+        "persistence_updated": persistence_updated,
         "window_seconds": window_seconds,
     }
 
 
-def _parse_time_of_day(value) -> dtime | None:
-    """Accepts 'HH:MM', 'HH:MM:SS', ISO datetime, or minutes since midnight."""
+def _bounded_env_int(
+    name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        logger.warning("Invalid integer configuration for %s; using the default", name)
+        return default
+    if not minimum <= value <= maximum:
+        logger.warning("Out-of-range configuration for %s; using the default", name)
+        return default
+    return value
+
+
+def _parse_time_of_day(value, *, tz_offset_minutes: int = 0) -> dtime | None:
+    """Parse a local time, converting aware ISO timestamps to Habitica local time."""
     if value is None:
         return None
 
@@ -5607,21 +5483,27 @@ def _parse_time_of_day(value) -> dtime | None:
         if "T" in s:
             try:
                 dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                if dt.tzinfo is not None:
+                    utc_naive = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                    dt = utc_naive - timedelta(minutes=tz_offset_minutes)
                 return dt.time().replace(second=0, microsecond=0)
-            except Exception:
+            except (TypeError, ValueError):
                 pass
 
         for fmt in ("%H:%M", "%H:%M:%S"):
             try:
                 return datetime.strptime(s, fmt).time()
-            except Exception:
+            except ValueError:
                 pass
 
         # "1200" -> 12:00
         if s.isdigit() and len(s) == 4:
-            return dtime(hour=int(s[:2]), minute=int(s[2:]))
+            try:
+                return dtime(hour=int(s[:2]), minute=int(s[2:]))
+            except ValueError:
+                return None
 
-    if isinstance(value, (int, float)):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
         mins = int(value)
         if 0 <= mins < 24 * 60:
             return dtime(hour=mins // 60, minute=mins % 60)
@@ -5634,8 +5516,31 @@ def _parse_iso_dt(value: str | None) -> datetime | None:
         return None
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except Exception:
+    except (TypeError, ValueError):
         return None
+
+
+def _parse_local_datetime(
+    value: str | None,
+    *,
+    tz_offset_minutes: int,
+) -> datetime | None:
+    parsed = _parse_iso_dt(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        return parsed
+    utc_naive = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return utc_naive - timedelta(minutes=tz_offset_minutes)
+
+
+def _parse_local_date(
+    value: str | None,
+    *,
+    tz_offset_minutes: int,
+) -> date | None:
+    parsed = _parse_local_datetime(value, tz_offset_minutes=tz_offset_minutes)
+    return parsed.date() if parsed is not None else None
 
 
 def _get_notify_target(telegram_user_id: int, user_data: dict) -> tuple[int, int | None]:
@@ -5665,10 +5570,10 @@ async def _send_task_reminder(
     habitica_user_id: str,
     habitica_api_key: str,
     status_html: str = "",
-):
+) -> bool:
     """
     Reminder message styled like inline single-task cards:
-      - avatar attached as DOCUMENT
+      - avatar attached as a photo when available, with a text fallback
       - caption:
           <blockquote>ICON <b><i>task</i></b></blockquote>
           <blockquote>Status ...</blockquote>   (optional toggle)
@@ -5680,7 +5585,7 @@ async def _send_task_reminder(
         thread_id = None
 
     # --- caption (task blockquote + optional status) ---
-    task_text = html.escape(task.get("text", "(no title)"))
+    task_text = _escape_html(task.get("text", "(no title)"))
 
     icon_map = {
         "habits": "🌀",
@@ -5702,10 +5607,10 @@ async def _send_task_reminder(
         # When OFF: just show unquoted task name (bold)
         caption = f"{icon} <b>{task_text}</b>"
 
-    # --- buttons (same formats you already handle) ---
+    # Buttons use the existing callback formats.
     task_id = task.get("id")
     if not task_id:
-        return
+        return False
 
     reply_markup = None
 
@@ -5761,16 +5666,17 @@ async def _send_task_reminder(
     if avatar_photo_id:
         try:
             await bot.send_photo(photo=avatar_photo_id, **photo_kwargs)
-            return
-        except Exception:
-            # If Telegram rejects old/invalid file_id, drop it and fall back to PNG
+            return True
+        except BadRequest:
+            # A deterministic rejection means no message was accepted.
             user_data.pop("AVATAR_FILE_ID", None)
 
     # 2) Next: existing PNG on disk (maybe created by /avatar or other panels)
     png_path = user_data.get("AVATAR_PNG_PATH")
-    if not (png_path and os.path.exists(png_path)):
-        # 3) Fallback: render avatar via Node (no export_avatar_png)
-        png_path = ensure_avatar_png_no_update(
+    if not (png_path and is_valid_png(png_path)):
+        # 3) Fallback: render the avatar locally with Node
+        png_path = await asyncio.to_thread(
+            ensure_avatar_png_no_update,
             habitica_user_id=habitica_user_id,
             habitica_api_key=habitica_api_key,
             user_data=user_data,
@@ -5778,17 +5684,17 @@ async def _send_task_reminder(
             preloaded_user_json=None,
         )
 
-    if png_path and os.path.exists(png_path):
+    if png_path and is_valid_png(png_path):
         try:
             with open(png_path, "rb") as fp:
                 msg = await bot.send_photo(photo=fp, **photo_kwargs)
             if getattr(msg, "photo", None):
                 # Cache the biggest size photo file_id
                 user_data["AVATAR_FILE_ID"] = msg.photo[-1].file_id
-            return
-        except Exception:
-            # Fall through to text-only fallback below
-            pass
+            return True
+        except (BadRequest, OSError):
+            # Deterministic media/local-file failure: a text fallback is safe.
+            logger.warning("Avatar media was rejected; sending a text reminder")
 
     # 4) Final fallback (if avatar render failed): text-only
     msg_kwargs = dict(
@@ -5800,10 +5706,17 @@ async def _send_task_reminder(
     if thread_id is not None:
         msg_kwargs["message_thread_id"] = thread_id
     await bot.send_message(**msg_kwargs)
+    return True
 
 
 
-def build_application(*, register_commands: bool = False) -> Application:
+def build_application(
+    *,
+    register_commands: bool = False,
+    persistence_on_flush: bool = False,
+    persistence_path: str | os.PathLike[str] | None = None,
+    bot_token: str | None = None,
+) -> Application:
     """
     Create and configure the PTB Application.
 
@@ -5812,6 +5725,20 @@ def build_application(*, register_commands: bool = False) -> Application:
     - For webhook/serverless mode, you usually set it to False and use
       /sync_commands when you want to refresh the menu.
     """
+    token = bot_token or os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+
+    data_path = (
+        Path(persistence_path).expanduser().resolve()
+        if persistence_path is not None
+        else get_bot_data_path()
+    )
+    persistence = PicklePersistence(
+        filepath=data_path,
+        on_flush=persistence_on_flush,
+    )
+
     request = HTTPXRequest(
         connect_timeout=30.0,
         read_timeout=30.0,
@@ -5819,7 +5746,7 @@ def build_application(*, register_commands: bool = False) -> Application:
 
     builder = (
         ApplicationBuilder()
-        .token(BOT_TOKEN)
+        .token(token)
         .request(request)
         .persistence(persistence)
     )
@@ -5832,8 +5759,16 @@ def build_application(*, register_commands: bool = False) -> Application:
     # Conversation (start/relink + account choice + credentials)
     account_conv = ConversationHandler(
         entry_points=[
-            CommandHandler("start", start_command_handler),
-            CommandHandler("relink", relink_command_handler),
+            CommandHandler(
+                "start",
+                start_command_handler,
+                filters=filters.ChatType.PRIVATE,
+            ),
+            CommandHandler(
+                "relink",
+                relink_command_handler,
+                filters=filters.ChatType.PRIVATE,
+            ),
         ],
         states={
             CHOOSING_ACCOUNT: [
@@ -5844,13 +5779,13 @@ def build_application(*, register_commands: bool = False) -> Application:
             ],
             USER_ID: [
                 MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
+                    filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
                     get_user_id_command_handler,
                 )
             ],
             API_KEY: [
                 MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
+                    filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
                     get_API_key_command_handler,
                 )
             ],
@@ -5858,10 +5793,17 @@ def build_application(*, register_commands: bool = False) -> Application:
         fallbacks=[CommandHandler("cancel", cancel_command_handler)],
         allow_reentry=True,
         per_message=False,
-        name="account_link",  # <--- ADD THIS
-        persistent=True,  # <--- AND THIS
+        name="account_link",
+        persistent=True,
     )
     app.add_handler(account_conv)
+    app.add_handler(
+        CommandHandler(
+            ["start", "relink"],
+            account_link_private_only_handler,
+            filters=~filters.ChatType.PRIVATE,
+        )
+    )
 
     # 🔹 Conversation for /add_todo and the "➕ New Todo" button
     add_todo_conv = ConversationHandler(
@@ -5881,7 +5823,7 @@ def build_application(*, register_commands: bool = False) -> Application:
             ADD_TODO_DIFFICULTY: [
                 CallbackQueryHandler(
                     add_todo_difficulty_chosen,
-                    pattern=r"^addTodoDifficulty:",
+                    pattern=r"^addTodoDifficulty:(trivial|easy|medium|hard)$",
                 ),
             ],
         },
@@ -5892,8 +5834,8 @@ def build_application(*, register_commands: bool = False) -> Application:
         ],
         per_message=False,
         allow_reentry=True,
-        name="add_todo",  # <--- ADD THIS
-        persistent=True,  # <--- AND THIS
+        name="add_todo",
+        persistent=True,
     )
     app.add_handler(add_todo_conv)
 
@@ -5909,6 +5851,7 @@ def build_application(*, register_commands: bool = False) -> Application:
     # Menus
     app.add_handler(CommandHandler("menu", menu_command_handler))
     app.add_handler(CommandHandler("menu_rk", menu_rk_command_handler))
+    app.add_handler(CommandHandler("refresh_menu", refresh_menu_command_handler))
 
     # Inline and callback handling
     app.add_handler(InlineQueryHandler(inline_query_handler))
@@ -5959,5 +5902,9 @@ def build_application(*, register_commands: bool = False) -> Application:
 
 if __name__ == "__main__":
     # Local / dev: still use polling
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     application = build_application(register_commands=True)
     application.run_polling(bootstrap_retries=10)

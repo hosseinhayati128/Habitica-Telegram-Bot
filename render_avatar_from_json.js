@@ -4,7 +4,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const puppeteer = require('puppeteer'); // you already have this installed
+const puppeteer = require('puppeteer');
 
 async function main() {
   const [, , userJsonPath, outputPath] = process.argv;
@@ -26,10 +26,22 @@ async function main() {
 
   // Support both shapes: {data: {...}} or {...}
   const user = userData.data ? userData.data : userData;
+  if (
+    !user ||
+    typeof user !== 'object' ||
+    !user.preferences ||
+    !user.items ||
+    !user.stats
+  ) {
+    console.error('Avatar JSON is missing required fields');
+    process.exit(1);
+  }
 
   // 2. Launch headless browser
   const browser = await puppeteer.launch({
-    headless: true,
+    // The shell is smaller than full Chrome and is purpose-built for this
+    // non-interactive screenshot workflow.
+    headless: 'shell',
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
   });
 
@@ -128,7 +140,8 @@ async function main() {
         (img) => img.complete && img.naturalWidth > 0
       );
     }, { timeout: 10000 }).catch(() => {
-      // If it times out, we still fall back to whatever is loaded
+      // Some optional layers may be missing or slow. Keep the original
+      // renderer behavior and capture the layers that did load.
     });
 
     // Tiny extra buffer to let layout settle

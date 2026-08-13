@@ -1,15 +1,37 @@
 {
-  "name": "habitica",
+  "name": "habitica-telegram-bot",
   "version": "1.0.0",
-  "description": "",
-  "main": "render_avatar.js",
+  "private": true,
+  "description": "Node/Puppeteer avatar renderer for the Habitica Telegram bot",
+  "main": "render_avatar_from_json.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build:avatar": "browserify node_modules/habitica-avatar/habitica-avatar.js --standalone habiticaAvatar --outfile habitica-avatar.bundle.js",
+    "check:js": "node --check habitica-avatar.js && node --check habitica-avatar.bundle.js && node --check render_avatar.js && node --check render_avatar_from_json.js",
+    "test": "npm run check:js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "habitica",
+    "telegram-bot",
+    "avatar"
+  ],
+  "author": "hosseinhayati128",
+  "license": "MIT",
   "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hosseinhayati128/Habitica-Telegram-Bot.git"
+  },
+  "allowScripts": {
+    "puppeteer@24.32.0": true
+  },
+  "puppeteer": {
+    "chrome": {
+      "skipDownload": true
+    }
+  },
   "dependencies": {
     "browserify": "^17.0.1",
     "habitica-avatar": "^0.2.0",

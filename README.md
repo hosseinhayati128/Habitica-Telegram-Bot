@@ -1,357 +1,368 @@
-# HHabitica – Habitica Telegram Bot
+# HHabitica — Habitica Telegram Bot
 
-Unofficial Telegram bot for [Habitica](https://habitica.com) that lets you manage your **Habits, Dailys, Todos and Rewards directly from Telegram** — with inline menus, a handy reply keyboard and a pinned status HUD.
+HHabitica is an unofficial Telegram bot for managing Habitica Habits, Dailies,
+Todos, rewards, status, reminders, and avatars. It supports local polling for
+development and a synchronous Flask/WSGI deployment designed for PythonAnywhere.
 
-You can try the running bot here: **[@HHabitica_bot](https://t.me/HHabitica_bot)**
+Try the public instance at [@HHabitica_bot](https://t.me/HHabitica_bot). This is a
+fan project and is not affiliated with or endorsed by Habitica.
 
-> This is a fan project, not affiliated with or endorsed by Habitica.
+This repository currently contains the existing Telegram bot only. A Telegram Mini
+App is intentionally outside this stabilization milestone.
 
----
+## Features and commands
 
-## Features
+- Private account linking with persistent Habitica credentials.
+- Habit, Daily, and Todo scoring; completed Todo restoration.
+- Custom reward and health-potion purchases.
+- Inline panels, reply keyboards, and a pinned private status message.
+- Guided Habitica “Refresh Day”/cron flow.
+- Habitica task reminders delivered to a DM, group, or forum topic.
+- Local avatar rendering through Node.js, Puppeteer, and a tracked browser bundle.
+- Flask webhook and authenticated reminder-tick endpoints for PythonAnywhere.
 
-* ✅ **Link your Habitica account once**
+| Command | Purpose |
+| --- | --- |
+| `/start`, `/relink`, `/cancel` | Link, replace, or cancel linking a Habitica account |
+| `/status` | Refresh stats and the pinned status message |
+| `/habits`, `/dailys`, `/todos` | Open interactive task panels |
+| `/completedtodos`, `/rewards` | Restore completed Todos or purchase custom rewards |
+| `/buy_potion`, `/refresh_day` | Buy a potion or run the guided day refresh |
+| `/add_todo`, `/task_list` | Create a Todo or show a text task list |
+| `/inline`, `/menu`, `/menu_rk` | Open inline and reply-keyboard launchers |
+| `/notify_here`, `/reminder_status` | Configure reminder destination and status display |
+| `/avatar` | Render and send the current Habitica avatar |
+| `/sync_commands`, `/debug` | Refresh Telegram commands or show sanitized diagnostics |
 
-  * `/start` guides you through entering your `USER_ID` and `API_KEY`
-  * `/relink` lets you switch to a different Habitica account
-  * Credentials are stored per‑Telegram‑user using `PicklePersistence` (local file)
+Account linking is accepted only in a private chat. Credential messages are deleted
+on a best-effort basis after capture, but the final credentials remain encrypted in
+transit by Telegram and stored locally in the bot's pickle persistence file.
 
-* 📊 **Pinned status HUD in your DM**
+## Requirements
 
-  * Shows HP, MP, Gold, XP, level, etc.
-  * Automatically updated whenever you:
+- Linux or macOS. Production locking uses `fcntl`, as available on PythonAnywhere.
+  On Windows, use WSL for the current codebase.
+- Python 3.10 or newer.
+- Node.js 18 or newer for avatar rendering; Node.js 20+ is recommended. The rest of
+  the bot works without Node and falls back when no rendered avatar is available.
+- A Telegram bot token from [@BotFather](https://t.me/BotFather).
+- A Habitica User ID and API Token, entered later through `/start` in a private chat.
 
-    * score a task (Habit / Daily / Todo)
-    * buy a reward / health potion
-    * run **Refresh Day / cron**
+Runtime Python dependencies are bounded in `requirements.txt`. Development tools are
+in `requirements-dev.txt`. Node dependencies and exact transitive versions are locked
+in `package-lock.json`.
 
-* 🌀 **Interactive panels for tasks**
-
-  * `/habits` – Habits with ➕ / ➖ buttons and counters
-  * `/dailys` – Dailys with completed/active markers and layout toggle
-  * `/todos` – Todos as a big button panel with layout toggle
-  * `/completedtodos` – Completed todos you can un‑complete with one tap
-  * `/rewards` – Custom rewards, with price in gold and one‑tap “buy”
-
-* 🧪 **Potions & rewards**
-
-  * `/buy_potion` or the **🧪 Buy Potion** button to quickly heal
-  * Rewards panel (`rMenu`) lets you buy any Habitica custom reward
-
-* 📅 **Refresh Day (cron) helper**
-
-  * `/refresh_day` / **🔄 Refresh Day** button:
-
-    * shows yesterday’s unfinished Dailies
-    * lets you mark which ones you actually did
-    * then runs Habitica cron for you
-  * Inline version from the **Inline Menu** too
-
-* ⏰ **Habitica task reminders → Telegram notifications**
-
-  * Sends reminders for Dailys and Todos (based on the reminders you set in Habitica)
-  * Use `/notify_here` to choose where the reminders are sent (DM, group, or topic)
-  * `/reminder_status` toggles showing your status block inside reminders
-
-* 📝 **Add Todos from Telegram**
-
-  * `/add_todo` or **➕ New Todo** button
-  * Conversation flow:
-
-    1. Ask for title
-    2. Ask for difficulty (Trivial / Easy / Medium / Hard)
-    3. Creates the Todo in Habitica and confirms
-
-* 🔎 **Inline task picker (works in any chat)**
-
-  * Type `@HHabitica_bot` in any chat and choose:
-
-    * “All Habits / All Dailys / All Todos / Rewards”
-  * Opens interactive panels **inline**, so you can:
-
-    * see lists
-    * score tasks
-    * see updated stats — without leaving the chat
-
-* 🧱 **Reply keyboard menu**
-
-  * Persistent RK with buttons:
-
-    * 🔎 Inline Menu
-    * 🌀 Habits / 📅 Dailys / 📝 Todos / 💰 Rewards
-    * ➕ New Todo
-    * 📊 Status / 🧪 Buy Potion
-    * 🔄 Refresh Day
-    * ⏰ Reminder Settings
-    * ✅ Completed Todos / 🔁 Menu
-  * `/menu` and `/menu_rk` control how/when it’s shown
-
-* 🧍 **Avatar image export**
-
-  * `/avatar` sends a PNG image of your current Habitica avatar
-  * Uses a small Node.js helper with Puppeteer + the `habitica-avatar` library (optional; see “Installation & setup”)
-
-
-* ⚙️ **Configurable panel layout via `PANEL_BEHAVIOUR`**
-
-  * One central dict defines how each panel looks:
-
-    * whether to show status block
-    * whether to show the plain text task list
-    * whether the list comes before or after the status block
-  * Used consistently for:
-
-    * `/habits`, `/dailys`, `/todos`, `/completedtodos`, `/rewards`
-    * Their inline “All …” versions
-    * The `hMenu`, `dMenu`, `tMenu`, `rMenu`, `cMenu` callbacks and refreshes
-
----
-
-## Panel behaviour configuration
-
-In `habitica_bot.py` you’ll find something like:
-
-```python
-PANEL_BEHAVIOUR: dict[str, dict[str, bool]] = {
-    "habits": {
-        "show_status": True,
-        "show_list": False,
-        "list_first": True,
-    },
-    "dailys": {
-        "show_status": True,
-        "show_list": True,
-        "list_first": True,
-    },
-    "todos": {
-        "show_status": True,
-        "show_list": True,
-        "list_first": False,
-    },
-    "completedTodos": {
-        "show_status": False,
-        "show_list": True,
-        "list_first": True,
-    },
-    "rewards": {
-        "show_status": True,
-        "show_list": False,
-        "list_first": False,
-    },
-}
-```
-
-**What each flag means:**
-
-* `show_status`: include the HP/MP/XP/Gold block at the top/bottom.
-* `show_list`: include a text list of tasks (in addition to buttons).
-* `list_first`:
-
-  * `True` → list first, then status block
-  * `False` → status block first, then list
-
-All the panels (normal commands, inline “All …” queries, and the `hMenu/tMenu/rMenu/dMenu/cMenu` callbacks) rebuild their message text using this same configuration, so your layout stays consistent even after scoring tasks or buying rewards.
-
----
-
-## Commands overview
-
-Common commands you’ll see in the bot:
-
-| Command           | Description                                                     |
-| ----------------- | --------------------------------------------------------------- |
-| `/start`          | Link your Habitica account (or change it if already linked)     |
-| `/relink`         | Force re-entering USER_ID and API_KEY                           |
-| `/status`         | Show current stats and refresh the pinned HUD                   |
-| `/habits`         | Habits panel (buttons + optional task list)                     |
-| `/dailys`         | Dailys panel (with layout toggle)                               |
-| `/todos`          | Todos panel (with layout toggle)                                |
-| `/completedtodos` | Completed todos that you can un‑complete                        |
-| `/rewards`        | Custom rewards panel                                            |
-| `/buy_potion`     | Quick “buy health potion” shortcut                              |
-| `/refresh_day`    | Guided Habitica cron / “Refresh Day” flow                       |
-| `/add_todo`       | Add a new Todo via conversation                                 |
-| `/inline`         | Show inline launcher helper message                             |
-| `/menu`           | Show / rebuild the reply keyboard menu                          |
-| `/notify_here`    | Send task reminders in this chat/topic                           |
-| `/reminder_status`| Status block in reminders (on/off)                               |
-| `/task_list`      | Text-only grouped task list (Habits / Dailys / Todos / Rewards) |
-| `/avatar`         | Generate and send your Habitica avatar as a PNG image           |
-| `/debug`          | Debug info (intended for dev/testing)                           |
-| `/sync_commands`  | Manually re-sync Telegram commands menu                         |
-
----
-
-## Installation & setup
-
-### 1. Clone the repo
+## Installation
 
 ```bash
-git clone https://github.com/<your-username>/<your-repo-name>.git
-cd <your-repo-name>
+git clone https://github.com/hosseinhayati128/Habitica-Telegram-Bot.git
+cd Habitica-Telegram-Bot
+
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-### 2. Create a virtual environment (optional but recommended)
+For tests and linting:
 
 ```bash
-python -m venv venv
-source venv/bin/activate       # on Windows: venv\Scripts\activate
+python -m pip install -r requirements-dev.txt
 ```
 
-### 3. Install dependencies
-
-If you have a `requirements.txt`:
+For optional avatar rendering, install the lockfile exactly:
 
 ```bash
-pip install -r requirements.txt
+npm ci
+npm test
 ```
 
-Otherwise, make sure you install at least:
+Puppeteer's pinned install script downloads its compatible Chrome headless-shell
+build during `npm ci`; make sure the host has enough disk space and allows the
+download. The package script is explicitly allowlisted for current npm releases.
 
-* `python-telegram-bot` (v20+)
-* `requests`
-* `httpx`
-* `flask` (only needed if you use the webhook/WSGI setup)
+## Configuration
 
-### 4. Create a Telegram bot
+The application reads the following environment variables. It does not automatically
+load a `.env` file.
 
-1. Talk to [@BotFather](https://t.me/BotFather) on Telegram.
-2. Run `/newbot` and follow the prompts.
-3. Copy the bot token you get at the end.
+| Variable | Required | Default and behavior |
+| --- | --- | --- |
+| `TELEGRAM_BOT_TOKEN` | Yes | BotFather token used by polling and WSGI. |
+| `BOT_DATA_PATH` | Recommended in production | `botdata.pkl` in the process working directory. Use an absolute path on WSGI hosts. |
+| `TELEGRAM_WEBHOOK_SECRET` | Optional for compatibility; strongly recommended | When set, `/telegram-webhook` requires Telegram's matching `X-Telegram-Bot-Api-Secret-Token` header. If unset, legacy webhook requests remain accepted. |
+| `TICK_TOKEN` | Required to use `/tick` | Shared secret for the reminder endpoint. An unset value denies every tick request. |
+| `ALLOW_LEGACY_TICK_QUERY_TOKEN` | Migration only | Defaults to `true`, allowing legacy `/tick?token=...`. Set to `false` after moving the scheduler to a header. |
+| `RUNTIME_LOCK_TIMEOUT_SECONDS` | No | `2.0`. Nonnegative seconds to wait for the cross-process persistence lock, capped at 30. Invalid values use the default. |
+| `REMINDER_WINDOW_SECONDS` | No | `60`, constrained to 1–3600 seconds. Controls the reminder matching window. |
+| `AVATAR_RENDER_TIMEOUT_SECONDS` | No | `45`; positive values are capped at 120 seconds. |
+| `NODE_BIN` | No | Explicit Node executable name/path. Otherwise `node`, `nodejs`, and common NVM paths are searched. |
 
-### 5. Get your Habitica API credentials
+Never commit real values. `.gitignore` excludes common secret files, pickle data,
+runtime locks, caches, and avatar output.
 
-In Habitica:
+## Local development with polling
 
-1. Open **User → Settings → API**.
-2. Copy your `User ID` and `API Token`.
-3. You’ll enter these inside Telegram via `/start` (the bot does *not* hard-code them).
-
-### 6. Set `TELEGRAM_BOT_TOKEN` environment variable
-
-The main bot code reads your token from the environment:
-
-```python
-BOT_TOKEN: Final = os.environ.get("TELEGRAM_BOT_TOKEN")
-
-if not BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
-```
-
-So, before running the bot, set:
-
-**Linux / macOS:**
+Set at least the Telegram token and preferably an absolute development data path:
 
 ```bash
-export TELEGRAM_BOT_TOKEN="your-telegram-bot-token-here"
-```
-
-**Windows (PowerShell):**
-
-```powershell
-$env:TELEGRAM_BOT_TOKEN="your-telegram-bot-token-here"
-```
-
-*(On hosts like PythonAnywhere you can set this in your WSGI file or environment config instead of committing it to the repo.)*
-
-### 7. (Optional) Enable `/avatar` (Node.js avatar renderer)
-
-If you want the `/avatar` command to send a PNG of your Habitica avatar, you also need Node.js and the small helper project in this repo (`render_avatar_from_json.js`, `package.json`, etc.). 
-
-1. Install **Node.js 18+** on the server (required by Puppeteer). 
-2. From the project root, install the Node dependencies defined in `package.json`:
-
-   ```bash
-   npm install
-   ```
-3. Build (or rebuild) the browser bundle that the renderer uses:
-
-   ```bash
-   npx browserify node_modules/habitica-avatar/index.js -s habiticaAvatar -o habitica-avatar.bundle.js
-   ```
-
-   You do not need to recreate `habitica-avatar.bundle.js` on every deploy.
-You can commit the generated file to the repo and deploy it like any other asset.
-Only rebuild it if you update the `habitica-avatar` dependency or change the avatar renderer code.
-
-
-
-
----
-
-## Running the bot
-
-### Option A – Local development (polling)
-
-The main file (e.g. `habitica_bot.py`) defines a `build_application()` helper and uses polling when run directly:
-
-```bash
+export TELEGRAM_BOT_TOKEN='replace-with-your-token'
+export BOT_DATA_PATH="$PWD/.runtime/dev-botdata.pkl"
+mkdir -p .runtime
+chmod 700 .runtime
 python habitica_bot.py
 ```
 
-This:
+If this bot was previously configured for webhook delivery, delete the webhook before
+starting polling; Telegram does not permit webhook delivery and `getUpdates` polling
+for the same bot at the same time:
 
-* builds a `python-telegram-bot` `Application`
-* syncs commands (if configured)
-* starts `run_polling()`
+```bash
+curl --fail --silent --show-error \
+  --request POST \
+  "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteWebhook" \
+  --data-urlencode 'drop_pending_updates=false'
+```
 
-Now just open your bot in Telegram and run `/start`.
+Running `habitica_bot.py` builds the application, synchronizes commands, and calls
+`run_polling()`. The external `/tick` endpoint is not started by polling, so scheduled
+reminders require the WSGI deployment or another deliberate tick integration.
 
-### Option B – Webhook / WSGI hosting (e.g. PythonAnywhere, other hosts)
+Do not run polling and WSGI simultaneously against the same `BOT_DATA_PATH`.
 
-The repo also contains:
+## PythonAnywhere Flask/WSGI deployment
 
-* `webhook_app.py` – a small Flask app that:
+The WSGI entry point is `webhook_app.flask_app`. It exposes:
 
-  * exposes `/telegram-webhook`
-  * exposes `/tick` (used for reminder checks)
-  * builds an `Application` via `build_application(register_commands=False)`
-  * processes **one** Telegram update per HTTP request (no long-running tasks)
-* `wsgi.py` (or similar) – example WSGI entry file that imports the Flask app and sets `TELEGRAM_BOT_TOKEN` in the environment.
+- `POST /telegram-webhook` for Telegram JSON updates (maximum body: 1 MiB).
+- `GET /tick` for authenticated reminder checks.
 
-Typical high‑level steps:
+Both routes serialize their complete persistence transaction with a Linux advisory
+lock next to the pickle file. Lock contention returns HTTP 503 rather than allowing
+two workers to overwrite each other's state.
 
-1. Configure your host (PythonAnywhere, VPS, etc.) to serve `webhook_app.flask_app`.
-2. Make sure the environment variable `TELEGRAM_BOT_TOKEN` is set on the server.
-3. Tell Telegram to use your webhook URL, e.g.:
+### 1. Install and prepare private state
 
-   ```bash
-   https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=https://your-domain/telegram-webhook
-   ```
+In a PythonAnywhere Bash console, create a virtual environment supported by the web
+app and install the runtime dependencies:
 
-If you want task reminders, set up an external cron ping (e.g. with [cron-job.org](https://cron-job.org)) to call `https://your-domain/tick` every minute.
+```bash
+cd /home/<username>/Habitica-Telegram-Bot
+python3.10 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 
-This approach works well on platforms that don’t allow long‑running background processes.
+mkdir -p /home/<username>/.local/share/habitica-telegram-bot
+chmod 700 /home/<username>/.local/share/habitica-telegram-bot
+```
 
----
+Use the Python version actually enabled for the PythonAnywhere web app if it is newer
+than 3.10. Configure the web app to use this virtual environment.
 
-## Data & privacy
+### 2. Configure the private WSGI file
 
-* The bot uses `PicklePersistence` to store:
+Set secrets in PythonAnywhere's private WSGI configuration or another host-provided
+environment mechanism, never in this repository. A minimal WSGI file is:
 
-  * your Habitica `USER_ID` and `API_KEY`
-  * some per-user/per-chat settings (layouts, pinned message IDs, etc.)
-* All of this is stored **in a local file on the machine running the bot** (e.g. `botdata.pkl`).
-* No external database is used; you control the data by controlling the server.
+```python
+import os
+import sys
 
-If you’re deploying a public instance, make sure you’re comfortable storing API keys on that machine and that it’s not shared with untrusted users.
+PROJECT_ROOT = "/home/<username>/Habitica-Telegram-Bot"
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
----
+os.environ["TELEGRAM_BOT_TOKEN"] = "replace-on-host"
+os.environ["BOT_DATA_PATH"] = (
+    "/home/<username>/.local/share/habitica-telegram-bot/botdata.pkl"
+)
+os.environ["TELEGRAM_WEBHOOK_SECRET"] = "replace-on-host"
+os.environ["TICK_TOKEN"] = "replace-on-host"
+os.environ["ALLOW_LEGACY_TICK_QUERY_TOKEN"] = "false"
 
-## Trying the hosted bot
+from webhook_app import flask_app as application
+```
 
-If you just want to see how it behaves before self‑hosting, you can connect your Habitica account to the public instance:
+Generate independent high-entropy webhook and tick values. Do not reuse the bot token
+or a Habitica key. Reload the web app after changing its environment.
 
-👉 **[@HHabitica_bot](https://t.me/HHabitica_bot)**
+### 3. Register the Telegram webhook manually
 
-*(Please keep in mind it’s a personal hobby bot; uptime is not guaranteed.)*
+Setting `TELEGRAM_WEBHOOK_SECRET` in the application is only half of the setup.
+Telegram must also be told to send the same secret. With the values exported in a
+private shell session:
 
----
+```bash
+export WEBHOOK_URL='https://<username>.pythonanywhere.com/telegram-webhook'
 
-## Contributing
+curl --fail --silent --show-error \
+  --request POST \
+  "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
+  --data-urlencode "url=${WEBHOOK_URL}" \
+  --data-urlencode "secret_token=${TELEGRAM_WEBHOOK_SECRET}"
+```
 
-Feel free to:
+For an existing deployment, a low-interruption migration is:
 
-* Fork the repo and adapt it to your own workflow
-* Open issues / PRs for bugs, improvements, or new features
-* Tweak `PANEL_BEHAVIOUR`, reply keyboards, or inline flows to better match your Habitica setup
+1. Generate a webhook secret.
+2. Call `setWebhook` with `secret_token` while compatibility mode is still active.
+3. Set the identical `TELEGRAM_WEBHOOK_SECRET` on PythonAnywhere and reload.
+4. Confirm webhook delivery, then keep the secret in both configurations.
+
+If the application variable is configured but Telegram's webhook is not updated with
+the same value, every webhook request receives HTTP 403.
+
+## Reminder tick authentication and migration
+
+New scheduler jobs should send the token in a header, preferably:
+
+```bash
+curl --fail --silent --show-error \
+  --header "Authorization: Bearer ${TICK_TOKEN}" \
+  'https://<username>.pythonanywhere.com/tick'
+```
+
+`X-Tick-Token: <token>` is also accepted. Schedule the endpoint approximately once per
+minute. Avoid overlapping runs; a busy runtime lock returns HTTP 503 with a short
+`Retry-After` hint.
+
+Older jobs using `/tick?token=...` continue to work while
+`ALLOW_LEGACY_TICK_QUERY_TOKEN` is true. Query strings commonly enter access logs, so
+migrate deliberately:
+
+1. Change the scheduler to `Authorization: Bearer` or `X-Tick-Token` and verify HTTP
+   200 using the existing token.
+2. Set `ALLOW_LEGACY_TICK_QUERY_TOKEN=false` and reload the web app.
+3. Rotate `TICK_TOKEN` because the previous value may exist in URL logs, then update
+   the scheduler's secret header.
+
+If `TICK_TOKEN` is missing or mismatched, `/tick` always returns HTTP 403. Tick responses
+contain only aggregate counts, not user IDs, task content, or credentials.
+
+## Persistence, backup, and concurrency
+
+`PicklePersistence` stores account credentials, conversation state, layouts, reminder
+deduplication state, and pinned-message IDs. Treat the file as a secret:
+
+- Set `BOT_DATA_PATH` to an absolute path outside the repository and web-served paths.
+- Make its directory mode `0700` and the pickle/backups mode `0600`.
+- Never open a pickle from an untrusted source; pickle loading can execute code.
+- Never commit the pickle, lock file, backups, or copied production state.
+
+The WSGI routes use `<BOT_DATA_PATH>.lock` to serialize webhook and tick transactions
+across worker processes on the same Linux host. This does not make pickle a distributed
+database and does not coordinate another machine or an independently started polling
+process.
+
+For a consistent backup, stop or quiesce webhook/tick processing first, copy the file
+to a private non-web directory, restrict it to `0600`, then resume processing. Do not
+copy while a worker may be writing. Test restoration only with a trusted copy and a
+separate `BOT_DATA_PATH`.
+
+## Avatar renderer and tracked bundle
+
+Production avatar rendering works as follows:
+
+1. Python fetches the authenticated Habitica profile.
+2. Only the avatar fields needed by the renderer are written to a private temporary
+   JSON file; Habitica credentials are not passed to Node.
+3. `render_avatar_from_json.js` uses Puppeteer and
+   `habitica-avatar.bundle.js` to produce a PNG.
+4. Python validates and atomically caches the PNG under the ignored `Avatar/` folder.
+
+`habitica-avatar.bundle.js` is generated but intentionally tracked because production
+needs it at runtime and should not have to rebuild assets during deployment. Do not
+edit the bundle manually. Rebuild it only after changing the `habitica-avatar`
+dependency or the bundling source:
+
+```bash
+npm ci
+npm run build:avatar
+npm test
+git diff -- habitica-avatar.bundle.js package.json package-lock.json
+```
+
+Review and commit the generated diff together with its source/dependency change.
+`render_avatar.js` is a legacy developer utility; normal bot execution uses
+`render_avatar_from_json.js` and does not put Habitica credentials on a Node command
+line.
+
+## Tests and lint
+
+The Python tests mock Telegram, Habitica, subprocess, and WSGI boundaries; they must
+not contact real services.
+
+```bash
+source .venv/bin/activate
+python -m pip install -r requirements-dev.txt
+python -m pytest
+python -m ruff check .
+
+npm ci
+npm test
+```
+
+Use `npm run build:avatar` only when intentionally regenerating the tracked bundle.
+Before committing, review `git status` and ensure no pickle, token, `.env`, avatar
+payload, or runtime output is staged.
+
+## Troubleshooting
+
+- **Polling reports a Telegram conflict:** remove the registered webhook and ensure no
+  second polling process is running for the same bot token.
+- **Webhook returns 403:** compare `TELEGRAM_WEBHOOK_SECRET` with the `secret_token`
+  passed to `setWebhook`. Do not print either value in logs.
+- **Webhook returns 415 or 400:** Telegram must POST a JSON object containing an integer
+  `update_id`. Proxies must preserve the JSON content type and body.
+- **Webhook returns 413:** a proxy or caller sent more than the 1 MiB request limit.
+- **Webhook or tick returns 503:** another worker owns the persistence lock or the
+  transaction failed. Prevent overlapping jobs; increase `RUNTIME_LOCK_TIMEOUT_SECONDS`
+  only after checking for stuck/duplicate workers.
+- **Tick returns 403:** set `TICK_TOKEN` and send it in an accepted header. If legacy
+  query authentication was disabled, `?token=` is intentionally ignored.
+- **State resets after reload:** set an absolute `BOT_DATA_PATH`, ensure its parent is
+  writable by the web app, and confirm polling/WSGI are not using different files.
+- **Avatar says Node is unavailable:** run `npm ci`, set `NODE_BIN` to an executable
+  Node path if auto-detection fails, and verify Puppeteer's Chromium can start.
+- **Avatar times out or returns no PNG:** check host resource limits and optionally
+  adjust `AVATAR_RENDER_TIMEOUT_SECONDS` up to 120 seconds. Renderer logs are sanitized;
+  reproduce locally for detailed diagnosis rather than logging profile JSON.
+- **PythonAnywhere import fails:** verify the source directory, virtualenv, selected
+  Python version, and WSGI `sys.path`, then reload the web app.
+- **Habitica actions fail:** verify credentials through `/relink` in a private chat.
+  Never paste credentials into an issue, log, screenshot, or group chat.
+
+## Security and privacy
+
+- Telegram and Habitica secrets come from environment variables or private persisted
+  user data; no secrets belong in source control.
+- Habitica API calls use bounded timeouts, validated response envelopes, and no blind
+  retry of non-idempotent mutations.
+- Webhook and tick secrets use timing-safe comparisons.
+- Raw Telegram updates and raw Habitica response bodies are not normal log content.
+- The bot intentionally remains a local-pickle deployment for this milestone. Protect
+  the host account, backups, WSGI file, and state directory accordingly.
+
+## Known limitations
+
+- `habitica_bot.py` remains a large, tightly coupled handler module. The avatar and
+  webhook/runtime-lock boundaries were extracted because they are cohesive; a broad
+  handler rewrite was intentionally deferred.
+- The Habitica client is synchronous. Requests now have strict connect/read timeouts,
+  and reminder/avatar work is offloaded from the event loop, but some legacy polling
+  handlers can still pause other updates while waiting for Habitica. An async adapter
+  should be a separately tested follow-up rather than a mechanical rewrite.
+- Webhook update IDs are persisted to suppress normal Telegram redelivery. A hard
+  process crash after an external Habitica mutation but before the journal is flushed
+  can still leave an ambiguous replay; solving that fully needs a durable transactional
+  design beyond a local pickle.
+- The runtime lock coordinates only processes on one Linux host that use these WSGI
+  routes and the same `BOT_DATA_PATH`; it does not coordinate polling or another host.
+- `PicklePersistence` remains a non-database file format; the lock prevents concurrent
+  writers but cannot make a write crash-proof. Keep private, quiesced backups as
+  described above.
+
+## License
+
+MIT. See `LICENSE`.

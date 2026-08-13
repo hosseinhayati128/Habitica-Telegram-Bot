@@ -1,0 +1,4 @@
+# Runtime dependencies. Keep these ranges aligned with pyproject.toml.
+Flask>=3.1,<4
+python-telegram-bot>=22,<23
+requests>=2.32,<3
