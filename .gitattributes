@@ -1,0 +1,3 @@
+# Preserve the legacy bot module's tracked CRLF convention without treating
+# carriage returns as trailing whitespace in diffs.
+habitica_bot.py -text whitespace=cr-at-eol
