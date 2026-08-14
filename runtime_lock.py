@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import hashlib
 import math
 import os
 import time
@@ -19,6 +20,7 @@ from pathlib import Path
 DEFAULT_LOCK_TIMEOUT_SECONDS = 2.0
 MAX_LOCK_TIMEOUT_SECONDS = 30.0
 LOCK_POLL_INTERVAL_SECONDS = 0.05
+GAMEPLAY_LOCK_SHARDS = 32
 
 
 class RuntimeLockUnavailable(TimeoutError):
@@ -44,6 +46,26 @@ def get_runtime_lock_path() -> Path:
     """Return the lock-file path paired with the configured pickle file."""
 
     return Path(f"{get_bot_data_path()}.lock")
+
+
+def get_gameplay_lock_path(habitica_user_id: str) -> Path:
+    """Return the bounded lock shard shared by gameplay entry points.
+
+    Both the Telegram callback flow and the Mini App use this path so a day
+    refresh cannot interleave with another local score or Potion mutation.
+    Habitica's own clients are outside this advisory-lock boundary, so callers
+    must still re-check remote day state immediately before mutations.
+    """
+
+    digest = hashlib.sha256(habitica_user_id.encode("utf-8")).digest()
+    shard = int.from_bytes(digest[:2], "big") % GAMEPLAY_LOCK_SHARDS
+    lock_root = (get_bot_data_path().parent / ".miniapp-gameplay-locks").resolve()
+    lock_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(lock_root, 0o700)
+    except OSError:
+        pass
+    return lock_root / f"gameplay-{shard:02d}.lock"
 
 
 def _configured_timeout() -> float:

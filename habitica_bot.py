@@ -47,16 +47,21 @@ from telegram.request import HTTPXRequest
 
 from avatar_renderer import is_valid_png, render_avatar_png
 from Habitica_API import (
-    buy_potion,
-    buy_reward,
+    buy_potion as _habitica_buy_potion,
+    buy_reward as _habitica_buy_reward,
     create_todo_task,
     get_status,
     get_task_by_id,
     get_tasks,
-    run_cron,
-    score_task,
+    score_task as _habitica_score_task,
 )
-from runtime_lock import get_bot_data_path
+from habitica_gameplay import fetch_day_status, refresh_day as refresh_habitica_day
+from runtime_lock import (
+    RuntimeLockUnavailable,
+    acquire_runtime_lock,
+    get_bot_data_path,
+    get_gameplay_lock_path,
+)
 
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -65,6 +70,55 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 debug = False
 CHOOSING_ACCOUNT = "CHOOSING_ACCOUNT"   # use a string to avoid collisions
 UD_PENDING_USER_ID = "_pending_habitica_user_id"
+
+
+def _run_gameplay_mutation(user_id: str, operation: Callable[[], Any], fallback: Any):
+    """Serialize Telegram mutations with Mini App score/cron/potion work."""
+    try:
+        with acquire_runtime_lock(
+            lock_path=get_gameplay_lock_path(user_id),
+            timeout=0,
+        ):
+            return operation()
+    except RuntimeLockUnavailable:
+        logger.info("Habitica gameplay mutation skipped because the account is busy")
+        return fallback
+
+
+def score_task(
+    user_id: str,
+    api_key: str,
+    task_id: str,
+    direction: str,
+) -> Optional[dict]:
+    """Score through the account gameplay lock shared with the Mini App."""
+    return _run_gameplay_mutation(
+        user_id,
+        lambda: _habitica_score_task(user_id, api_key, task_id, direction),
+        None,
+    )
+
+
+def buy_potion(user_id: str, api_key: str) -> bool:
+    """Buy one Potion through the shared account gameplay lock."""
+    return bool(
+        _run_gameplay_mutation(
+            user_id,
+            lambda: _habitica_buy_potion(user_id, api_key),
+            False,
+        )
+    )
+
+
+def buy_reward(user_id: str, api_key: str, task_id: str) -> bool:
+    """Buy one custom reward through the shared account gameplay lock."""
+    return bool(
+        _run_gameplay_mutation(
+            user_id,
+            lambda: _habitica_buy_reward(user_id, api_key, task_id),
+            False,
+        )
+    )
 
 
 def _escape_html(value: object, default: str = "(no title)") -> str:
@@ -3223,26 +3277,21 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.answer("⚠️ Invalid Daily button.", show_alert=True)
             return
 
-        currently_checked = (state == "1")
-        new_checked = not currently_checked
-        direction = "up" if new_checked else "down"
-
-        old_stats, new_stats, score_data = get_old_and_new_stats_for_scored_task(
-            user_id=user_id,
-            api_key=api_key,
-            task_id=task_id,
-            direction=direction,
-        )
-        if score_data is None:
-            await query.answer("❌ Habitica did not update the Daily.", show_alert=True)
-            return
-        delta = _delta_text(old_stats, new_stats)
-
-        # Update local refresh-day state
         cron_meta = context.user_data.get("cron_meta") or {}
-        if task_id in cron_meta:
-            cron_meta[task_id]["checked"] = new_checked
-            context.user_data["cron_meta"] = cron_meta
+        if task_id not in cron_meta:
+            await query.answer("⚠️ This Daily is no longer available.", show_alert=True)
+            return
+
+        currently_checked = state == "1"
+        new_checked = not currently_checked
+
+        # Selection is local until the user confirms Refresh day.  Submitting
+        # the complete set through the shared service lets it re-check
+        # ``needsCron`` and eligibility immediately before each remote score.
+        # It also makes Cancel a true cancellation instead of leaving scores
+        # that were already applied by individual checkbox taps.
+        cron_meta[task_id]["checked"] = new_checked
+        context.user_data["cron_meta"] = cron_meta
 
         # Rebuild the keyboard, but keep the same ✖/✔ style
         layout_mode = context.user_data.get("cron_layout_mode", "full")
@@ -3253,11 +3302,8 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             except Exception:
                 pass
 
-        # Always update pinned HUD in the user's private chat
-        await update_and_pin_status(context, home_chat_id, stats_override=new_stats)
-
         await query.answer(
-            f"📅 Daily {'marked done' if new_checked else 'un-done'} ({delta})",
+            f"📅 Daily {'selected' if new_checked else 'unselected'} for yesterday",
             show_alert=False,
         )
         return
@@ -3273,69 +3319,160 @@ async def task_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         is_inline_refresh = from_inline_refresh or (query.inline_message_id is not None)
 
         if action == "run":
-            # Get old status for delta and to check needsCron
-            old_status = get_status(user_id, api_key)
-            if not old_status:
-                await query.answer("❌ Couldn't reach Habitica.", show_alert=True)
+            cron_meta = context.user_data.get("cron_meta") or {}
+            selected_ids = tuple(
+                task_id
+                for task_id, meta in cron_meta.items()
+                if bool(meta.get("checked"))
+            )
+
+            # Use the same bounded account lock and guarded submission service
+            # as the Mini App.  The webhook already owns the persistence lock;
+            # Mini App credential reads release it before taking this lock, so
+            # this ordering cannot deadlock the two entry points.
+            try:
+                with acquire_runtime_lock(
+                    lock_path=get_gameplay_lock_path(user_id),
+                    timeout=0,
+                ):
+                    refresh_result = refresh_habitica_day(
+                        user_id,
+                        api_key,
+                        selected_ids,
+                    )
+            except RuntimeLockUnavailable:
+                await query.answer(
+                    "⏳ Another gameplay action is in progress. Please wait.",
+                    show_alert=True,
+                )
                 return
-
-            old_stats = old_status.get("stats", {}) or {}
-            needs_cron = bool(old_status.get("needsCron", False))
-
-            # No cron needed → just show current stats again
-            if not needs_cron:
-                feedback = "✅ Day is already refreshed (cron already ran)."
-
-                if is_inline_refresh:
-                    # Inline panel: show Status + shortcuts again
-                    text = build_status_block(old_stats)
-                    await edit_here(text)  # uses Inline shortcuts keyboard as default
-                    context.user_data["cron_from_inline"] = False
-                else:
-                    text = f"<b>🔄 Day already refreshed</b>\n\n{build_status_block(old_stats)}"
-                    await edit_here(text, build_inline_launcher_kb())
-
-                await query.answer(feedback, show_alert=False)
-                return
-
-            # Actually run Habitica cron
-            ok = run_cron(user_id, api_key)
-
-            # Always re-fetch status afterwards for accurate stats
-            new_status = get_status(user_id, api_key) or {}
-            new_stats = new_status.get("stats", {}) or {}
-            delta = _delta_text(old_stats, new_stats)
+            ok = bool(
+                refresh_result.ok
+                and refresh_result.data is not None
+                and not refresh_result.data.refresh_required
+            )
 
             if ok:
-                feedback = f"🔄 Day refreshed ({delta})"
+                snapshot = getattr(refresh_result.data, "profile", None)
+                snapshot_payload = (
+                    snapshot.to_payload()
+                    if snapshot is not None and hasattr(snapshot, "to_payload")
+                    else {}
+                )
+                normalized_stats = snapshot_payload.get("stats", {})
+                normalized_profile = snapshot_payload.get("profile", {})
+                new_stats = {
+                    "hp": normalized_stats.get("hp"),
+                    "mp": normalized_stats.get("mp"),
+                    "gp": normalized_stats.get("gold"),
+                    "lvl": normalized_profile.get("level"),
+                    "exp": normalized_stats.get("exp"),
+                    "toNextLevel": normalized_stats.get("maxExp"),
+                }
+                if not all(
+                    isinstance(new_stats.get(field), (int, float))
+                    for field in ("hp", "mp", "gp", "lvl", "exp", "toNextLevel")
+                ):
+                    # A confirmed cron may legitimately lose only its final
+                    # profile read. One safe GET restores the Telegram HUD;
+                    # the mutating cron itself is never repeated.
+                    current = get_status(user_id, api_key) or {}
+                    new_stats = current.get("stats", {}) or {}
+                already_refreshed = (
+                    getattr(refresh_result.data, "status", "")
+                    == "already_refreshed"
+                )
+                feedback = (
+                    "✅ Day was already refreshed."
+                    if already_refreshed
+                    else "🔄 Day refreshed."
+                )
+                status_block = build_status_block(new_stats)
 
                 if is_inline_refresh:
                     # Inline panel: turn back into "Status + shortcuts"
-                    text = build_status_block(new_stats)
+                    text = status_block or "<b>🔄 Day refreshed.</b>"
                     await edit_here(text, build_inline_launcher_kb())
 
                 else:
-                    text = f"<b>🔄 Day refreshed!</b>\n\n{build_status_block(new_stats)}"
+                    text = "<b>🔄 Day refreshed!</b>"
+                    if status_block:
+                        text += f"\n\n{status_block}"
                     await edit_here(text)
 
                 # Update pinned HUD in the user's private chat
-                await update_and_pin_status(
-                    context, home_chat_id, stats_override=new_stats
-                )
+                if new_stats:
+                    await update_and_pin_status(
+                        context, home_chat_id, stats_override=new_stats
+                    )
             else:
                 feedback = "❌ Failed to refresh day."
 
+                partial = refresh_result.data
+                unresolved = tuple(
+                    getattr(partial, "unresolved_daily_ids", ()) or ()
+                )
+                outcome_unknown = bool(
+                    refresh_result.error
+                    and refresh_result.error.outcome_unknown
+                )
+                batch_incomplete = bool(
+                    refresh_result.error
+                    and getattr(refresh_result.error, "code", None)
+                    == "batch_incomplete"
+                )
+
+                if unresolved and not outcome_unknown:
+                    fresh_meta = fetch_cron_meta(user_id, api_key)
+                    unresolved_set = set(unresolved)
+                    if fresh_meta is None:
+                        # A failed reconciliation read must never leave an
+                        # already-resolved selected ID checked for blind retry.
+                        fresh_meta = {
+                            pending_id: dict(meta)
+                            for pending_id, meta in cron_meta.items()
+                            if pending_id not in selected_ids
+                            or pending_id in unresolved_set
+                        }
+                    for pending_id, meta in fresh_meta.items():
+                        meta["checked"] = pending_id in unresolved_set
+                    context.user_data["cron_meta"] = fresh_meta
+                    markup = build_refresh_day_keyboard(
+                        fresh_meta,
+                        context.user_data.get("cron_layout_mode", "full"),
+                    )
+                    try:
+                        await query.edit_message_reply_markup(reply_markup=markup)
+                    except Exception:
+                        pass
+                    message = (
+                        "✅ This batch was recorded. Wait about a minute, then "
+                        "submit the remaining Dailies."
+                        if batch_incomplete
+                        else "⚠️ Some Dailies remain unresolved. Review and submit again."
+                    )
+                    await query.answer(message, show_alert=True)
+                    return
+
+                if outcome_unknown:
+                    feedback = (
+                        "⚠️ Habitica's result is uncertain. Wait, then reopen "
+                        "Refresh Day to check again."
+                    )
+
                 if is_inline_refresh:
-                    # Inline panel: also go back to "Status + shortcuts", but with old stats
-                    text = build_status_block(old_stats)
-                    await edit_here(text, build_inline_launcher_kb())
+                    await edit_here(
+                        "<b>❌ Failed to refresh day.</b>",
+                        build_inline_launcher_kb(),
+                    )
 
 
                 else:
-                    text = f"<b>❌ Failed to refresh day.</b>\n\n{build_status_block(old_stats)}"
-                    await edit_here(text)
+                    await edit_here("<b>❌ Failed to refresh day.</b>")
 
-            # Drop any cached refresh-day state so the next run starts fresh.
+            # Drop cached state after success or an unreconciled terminal
+            # failure.  Definite partial failures returned above keep only the
+            # freshly eligible panel so a retry cannot score resolved tasks.
             context.user_data.pop("cron_meta", None)
             context.user_data["cron_from_inline"] = False
             await query.answer(feedback, show_alert=not ok)
@@ -4496,36 +4633,17 @@ def fetch_cron_meta(user_id: str, api_key: str) -> dict[str, dict[str, object]] 
     Build the 'cron_meta' dict used by the refresh-day UI.
 
     Keys are task ids, values are {"text": title, "checked": bool}.
-    Only includes Dailies that Habitica considers candidates for
-    "Record Yesterday's Activity": they were due yesterday and are still
-    incomplete (yesterDaily == True and completed == False).
+    Uses the shared authoritative day service so Telegram and the Mini App
+    agree on ``needsCron`` and on which incomplete personal Dailies were
+    actually scheduled for Habitica's previous user day.
     """
-    dailies = get_tasks(user_id, api_key, "dailys")
-    if dailies is None:
-        # Propagate network / API errors to the caller so it can show
-        # a proper error message instead of an empty list.
+    day_result = fetch_day_status(user_id, api_key)
+    if not day_result.ok or day_result.data is None:
         return None
-
-    cron_meta: dict[str, dict[str, object]] = {}
-
-    for task in dailies:
-        # Habitica marks Record-Yesterday-Activity candidates with yesterDaily=True.
-        if not task.get("yesterDaily", False):
-            continue
-        # Already checked off yesterday – nothing to recover.
-        if task.get("completed", False):
-            continue
-
-        tid = task.get("id")
-        if not tid:
-            continue
-
-        cron_meta[tid] = {
-            "text": task.get("text", "(no title)"),
-            "checked": False,
-        }
-
-    return cron_meta
+    return {
+        daily.id: {"text": daily.text, "checked": False}
+        for daily in day_result.data.dailies
+    }
 
 
 
@@ -4552,12 +4670,17 @@ async def open_refresh_day_menu_for_chat(
         )
         return
 
-    # Fetch Dailies and build the same panel as the inline cron UI
-    # Fetch Dailies and build the same panel as the inline cron UI.
-    # We rely on Habitica's own `yesterDaily` flag instead of guessing
-    # from `isDue`, so the list matches the official Record Yesterday's
-    # Activity screen.
-    cron_meta = fetch_cron_meta(user_id, api_key) or {}
+    # Fetch authoritative Habitica day state and the same review candidates
+    # used by the Mini App, then build the existing Telegram panel.
+    cron_meta = fetch_cron_meta(user_id, api_key)
+    if cron_meta is None:
+        await topic_send(
+            update,
+            context.bot.send_message,
+            chat_id=chat_id,
+            text="⚠️ Could not check Habitica's day status. Please try again.",
+        )
+        return
 
     context.user_data["cron_meta"] = cron_meta
     layout_mode = context.user_data.get("cron_layout_mode", "full")

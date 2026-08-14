@@ -2,7 +2,9 @@ import asyncio
 import logging
 import pickle
 import time
+from contextlib import contextmanager
 from datetime import datetime, time as day_time, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -13,6 +15,8 @@ import habitica_bot as bot
 
 
 FAKE_BOT_TOKEN = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
+LOCKED_SCORE_TASK = bot.score_task
+LOCKED_BUY_POTION = bot.buy_potion
 
 
 def run(coroutine):
@@ -33,7 +37,8 @@ def block_unmocked_backends(monkeypatch):
         "get_status",
         "get_task_by_id",
         "get_tasks",
-        "run_cron",
+        "fetch_day_status",
+        "refresh_habitica_day",
         "score_task",
     ):
         monkeypatch.setattr(bot, name, unexpected_backend_call)
@@ -381,7 +386,7 @@ def _callback_update(data):
     return update, query
 
 
-def test_failed_daily_score_does_not_toggle_refresh_state(monkeypatch):
+def test_daily_callback_only_toggles_local_refresh_selection(monkeypatch):
     update, query = _callback_update("yester:0:daily-id")
     cron_meta = {"daily-id": {"checked": False, "text": "Morning routine"}}
     context = SimpleNamespace(
@@ -392,23 +397,18 @@ def test_failed_daily_score_does_not_toggle_refresh_state(monkeypatch):
         },
         bot=SimpleNamespace(),
     )
-    scorer = Mock(return_value=({"hp": 50}, {"hp": 50}, None))
+    scorer = Mock(side_effect=AssertionError("selection must not score before submit"))
     monkeypatch.setattr(bot, "get_old_and_new_stats_for_scored_task", scorer)
 
     run(bot.task_button_handler(update, context))
 
-    assert context.user_data["cron_meta"]["daily-id"]["checked"] is False
-    scorer.assert_called_once_with(
-        user_id="habitica-user",
-        api_key="habitica-key",
-        task_id="daily-id",
-        direction="up",
-    )
+    assert context.user_data["cron_meta"]["daily-id"]["checked"] is True
+    scorer.assert_not_called()
     query.answer.assert_awaited_once_with(
-        "❌ Habitica did not update the Daily.",
-        show_alert=True,
+        "📅 Daily selected for yesterday",
+        show_alert=False,
     )
-    query.edit_message_reply_markup.assert_not_awaited()
+    query.edit_message_reply_markup.assert_awaited_once()
 
 
 @pytest.mark.parametrize("callback_data", ["yester", "yester:2:daily-id", "yester:0:"])
@@ -429,6 +429,281 @@ def test_malformed_daily_callbacks_are_rejected_before_scoring(
     scorer.assert_not_called()
     assert query.answer.await_count == 1
     assert query.answer.await_args.kwargs["show_alert"] is True
+
+
+def test_yesterday_callback_rejects_task_outside_fresh_panel(monkeypatch):
+    update, query = _callback_update("yester:0:untrusted-daily-id")
+    context = SimpleNamespace(
+        user_data={
+            "USER_ID": "habitica-user",
+            "API_KEY": "habitica-key",
+            "cron_meta": {
+                "eligible-daily-id": {
+                    "checked": False,
+                    "text": "Morning routine",
+                }
+            },
+        },
+        bot=SimpleNamespace(),
+    )
+    scorer = Mock(side_effect=AssertionError("untrusted callback reached scoring"))
+    monkeypatch.setattr(bot, "get_old_and_new_stats_for_scored_task", scorer)
+
+    run(bot.task_button_handler(update, context))
+
+    scorer.assert_not_called()
+    query.answer.assert_awaited_once_with(
+        "⚠️ This Daily is no longer available.",
+        show_alert=True,
+    )
+
+
+def test_fetch_cron_meta_reuses_shared_authoritative_day_service(monkeypatch):
+    day_status = SimpleNamespace(
+        ok=True,
+        data=SimpleNamespace(
+            dailies=(
+                SimpleNamespace(id="daily-one", text="Read"),
+                SimpleNamespace(id="daily-two", text="Exercise"),
+            )
+        ),
+    )
+    fetcher = Mock(return_value=day_status)
+    monkeypatch.setattr(bot, "fetch_day_status", fetcher)
+
+    assert bot.fetch_cron_meta("habitica-user", "habitica-key") == {
+        "daily-one": {"text": "Read", "checked": False},
+        "daily-two": {"text": "Exercise", "checked": False},
+    }
+    fetcher.assert_called_once_with("habitica-user", "habitica-key")
+
+
+def test_fetch_cron_meta_preserves_upstream_failure(monkeypatch):
+    monkeypatch.setattr(
+        bot,
+        "fetch_day_status",
+        Mock(return_value=SimpleNamespace(ok=False, data=None)),
+    )
+
+    assert bot.fetch_cron_meta("habitica-user", "habitica-key") is None
+
+
+def test_refresh_day_command_does_not_mask_day_status_failure(monkeypatch):
+    update = SimpleNamespace()
+    context = SimpleNamespace(
+        user_data={"USER_ID": "habitica-user", "API_KEY": "habitica-key"},
+        bot=SimpleNamespace(send_message=AsyncMock()),
+    )
+    delivery = AsyncMock()
+    monkeypatch.setattr(bot, "fetch_cron_meta", Mock(return_value=None))
+    monkeypatch.setattr(bot, "topic_send", delivery)
+
+    run(bot.open_refresh_day_menu_for_chat(update, context, 303))
+
+    delivery.assert_awaited_once_with(
+        update,
+        context.bot.send_message,
+        chat_id=303,
+        text="⚠️ Could not check Habitica's day status. Please try again.",
+    )
+    assert "cron_meta" not in context.user_data
+
+
+def test_telegram_score_uses_shared_account_gameplay_lock(monkeypatch, tmp_path):
+    lock_path = tmp_path / "gameplay.lock"
+    lock_calls = []
+
+    @contextmanager
+    def tracked_lock(*, lock_path, timeout):
+        lock_calls.append((lock_path, timeout))
+        yield
+
+    upstream = Mock(return_value={"hp": 42})
+    monkeypatch.setattr(bot, "get_gameplay_lock_path", lambda _user_id: lock_path)
+    monkeypatch.setattr(bot, "acquire_runtime_lock", tracked_lock)
+    monkeypatch.setattr(bot, "_habitica_score_task", upstream)
+
+    result = LOCKED_SCORE_TASK(
+        "habitica-user", "habitica-key", "task-id", "up"
+    )
+
+    assert result == {"hp": 42}
+    assert lock_calls == [(lock_path, 0)]
+    upstream.assert_called_once_with(
+        "habitica-user", "habitica-key", "task-id", "up"
+    )
+
+
+def test_telegram_potion_rejects_busy_shared_gameplay_lock(monkeypatch, tmp_path):
+    lock_path = tmp_path / "gameplay.lock"
+    upstream = Mock(side_effect=AssertionError("busy mutation reached Habitica"))
+    monkeypatch.setattr(bot, "get_gameplay_lock_path", lambda _user_id: lock_path)
+    monkeypatch.setattr(bot, "_habitica_buy_potion", upstream)
+
+    def busy_lock(**_kwargs):
+        raise bot.RuntimeLockUnavailable
+
+    monkeypatch.setattr(bot, "acquire_runtime_lock", busy_lock)
+
+    assert LOCKED_BUY_POTION("habitica-user", "habitica-key") is False
+    upstream.assert_not_called()
+
+
+def test_refresh_day_callback_uses_shared_guarded_service(monkeypatch, tmp_path):
+    update, query = _callback_update("cron:run")
+    context = SimpleNamespace(
+        user_data={
+            "USER_ID": "habitica-user",
+            "API_KEY": "habitica-key",
+            "cron_meta": {
+                "selected-daily": {"checked": True, "text": "Read"},
+                "skipped-daily": {"checked": False, "text": "Exercise"},
+            },
+        },
+        bot=SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        bot,
+        "get_status",
+        Mock(side_effect=AssertionError("successful service snapshot must be reused")),
+    )
+    profile = SimpleNamespace(
+        to_payload=Mock(
+            return_value={
+                "profile": {"level": 20, "class": "warrior"},
+                "stats": {
+                    "hp": 50,
+                    "maxHp": 50,
+                    "exp": 100,
+                    "maxExp": 200,
+                    "mp": 30,
+                    "maxMp": 40,
+                    "gold": 10,
+                },
+            }
+        )
+    )
+    refresher = Mock(
+        return_value=SimpleNamespace(
+            ok=True,
+            data=SimpleNamespace(
+                status="refreshed",
+                refresh_required=False,
+                profile=profile,
+            ),
+        )
+    )
+    monkeypatch.setattr(bot, "refresh_habitica_day", refresher)
+    lock_calls = []
+
+    @contextmanager
+    def tracked_lock(*, lock_path, timeout):
+        lock_calls.append((lock_path, timeout))
+        yield
+
+    gameplay_lock = tmp_path / "gameplay.lock"
+    monkeypatch.setattr(bot, "get_gameplay_lock_path", lambda _user_id: gameplay_lock)
+    monkeypatch.setattr(bot, "acquire_runtime_lock", tracked_lock)
+    status_updater = AsyncMock()
+    monkeypatch.setattr(bot, "update_and_pin_status", status_updater)
+
+    run(bot.task_button_handler(update, context))
+
+    refresher.assert_called_once_with(
+        "habitica-user",
+        "habitica-key",
+        ("selected-daily",),
+    )
+    query.answer.assert_awaited_once()
+    assert query.answer.await_args.kwargs["show_alert"] is False
+    status_updater.assert_awaited_once_with(
+        context,
+        303,
+        stats_override={
+            "hp": 50,
+            "mp": 30,
+            "gp": 10,
+            "lvl": 20,
+            "exp": 100,
+            "toNextLevel": 200,
+        },
+    )
+    assert lock_calls == [(gameplay_lock, 0)]
+    assert "cron_meta" not in context.user_data
+
+
+def test_refresh_day_callback_rejects_when_shared_gameplay_lock_is_busy(monkeypatch):
+    update, query = _callback_update("cron:run")
+    context = SimpleNamespace(
+        user_data={
+            "USER_ID": "habitica-user",
+            "API_KEY": "habitica-key",
+            "cron_meta": {},
+        },
+        bot=SimpleNamespace(),
+    )
+    monkeypatch.setattr(bot, "get_gameplay_lock_path", lambda _user_id: Path("busy.lock"))
+
+    def busy_lock(**_kwargs):
+        raise bot.RuntimeLockUnavailable
+
+    monkeypatch.setattr(bot, "acquire_runtime_lock", busy_lock)
+    refresher = Mock(side_effect=AssertionError("busy callback reached day refresh"))
+    monkeypatch.setattr(bot, "refresh_habitica_day", refresher)
+
+    run(bot.task_button_handler(update, context))
+
+    refresher.assert_not_called()
+    query.answer.assert_awaited_once_with(
+        "⏳ Another gameplay action is in progress. Please wait.",
+        show_alert=True,
+    )
+    assert "cron_meta" in context.user_data
+
+
+def test_refresh_day_callback_keeps_only_safe_partial_retry_selection(monkeypatch):
+    update, query = _callback_update("cron:run")
+    context = SimpleNamespace(
+        user_data={
+            "USER_ID": "habitica-user",
+            "API_KEY": "habitica-key",
+            "cron_meta": {
+                "resolved-daily": {"checked": True, "text": "Read"},
+                "unresolved-daily": {"checked": True, "text": "Exercise"},
+                "skipped-daily": {"checked": False, "text": "Stretch"},
+            },
+        },
+        bot=SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        bot,
+        "refresh_habitica_day",
+        Mock(
+            return_value=SimpleNamespace(
+                ok=False,
+                data=SimpleNamespace(
+                    status="partial_failure",
+                    refresh_required=True,
+                    scored_daily_ids=("resolved-daily",),
+                    unresolved_daily_ids=("unresolved-daily",),
+                ),
+                error=SimpleNamespace(outcome_unknown=False),
+            )
+        ),
+    )
+    monkeypatch.setattr(bot, "fetch_cron_meta", Mock(return_value=None))
+
+    run(bot.task_button_handler(update, context))
+
+    assert context.user_data["cron_meta"] == {
+        "unresolved-daily": {"checked": True, "text": "Exercise"},
+        "skipped-daily": {"checked": False, "text": "Stretch"},
+    }
+    query.answer.assert_awaited_once_with(
+        "⚠️ Some Dailies remain unresolved. Review and submit again.",
+        show_alert=True,
+    )
+    query.edit_message_reply_markup.assert_awaited_once()
 
 
 def _freeze_utc(monkeypatch, utc_moment):
@@ -454,6 +729,7 @@ def _reminder_application(user_data):
 def test_reminder_tick_deduplicates_and_marks_changed_user_for_persistence(
     monkeypatch,
 ):
+    monkeypatch.setattr(bot.asyncio, "to_thread", _call_inline)
     _freeze_utc(
         monkeypatch,
         datetime(2026, 1, 2, 4, 30, tzinfo=timezone.utc),
@@ -497,6 +773,7 @@ def test_reminder_tick_deduplicates_and_marks_changed_user_for_persistence(
 def test_one_reminder_delivery_failure_does_not_block_the_next_task(
     monkeypatch,
 ):
+    monkeypatch.setattr(bot.asyncio, "to_thread", _call_inline)
     _freeze_utc(
         monkeypatch,
         datetime(2026, 1, 2, 12, 0, tzinfo=timezone.utc),
