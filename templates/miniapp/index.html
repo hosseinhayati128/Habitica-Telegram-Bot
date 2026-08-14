@@ -7,13 +7,57 @@
     <meta name="theme-color" content="#271b3d">
     <title>Habitica Companion</title>
     <script src="https://telegram.org/js/telegram-web-app.js?63"></script>
-    <script src="{{ url_for('static', filename='miniapp/theme-init.js') }}"></script>
-    <link rel="stylesheet" href="{{ url_for('static', filename='miniapp/app.css') }}">
-    <script defer src="{{ url_for('static', filename='miniapp/app.js') }}"></script>
+    <script src="{{ url_for('static', filename='miniapp/theme-init.js', v='20260814-gameplay') }}"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='miniapp/app.css', v='20260814-gameplay') }}">
+    <script defer src="{{ url_for('static', filename='miniapp/gameplay.js', v='20260814-gameplay') }}"></script>
+    <script defer src="{{ url_for('static', filename='miniapp/tasks.js', v='20260814-gameplay') }}"></script>
+    <script defer src="{{ url_for('static', filename='miniapp/app.js', v='20260814-gameplay') }}"></script>
   </head>
-  <body>
+  <body class="is-day-gated">
+    <section class="day-gate" id="day-gate" data-startup-state="checking_day" aria-labelledby="day-gate-title" aria-live="polite">
+      <div class="day-gate__panel">
+        <div class="day-gate__checking" id="day-gate-checking" role="status">
+          <span class="day-gate__crest" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M12 2.5 20 6v5.6c0 4.8-3.2 8.2-8 9.9-4.8-1.7-8-5.1-8-9.9V6z"/><path d="m8.2 12.1 2.4 2.4 5.2-5.2"/></svg>
+          </span>
+          <p class="eyebrow">Preparing your day</p>
+          <h1 id="day-gate-title" tabindex="-1">Checking Habitica</h1>
+          <p>We’re checking your Habitica day before enabling today’s tasks.</p>
+          <div class="day-gate__skeleton" aria-hidden="true"><span></span><span></span><span></span></div>
+        </div>
+
+        <div class="day-gate__review" id="day-gate-review" hidden>
+          <header class="day-gate__header">
+            <span class="day-gate__crest" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M5 3h14v18H5zM8 1v4m8-4v4M8 10h8m-8 4h5"/></svg>
+            </span>
+            <div>
+              <p class="eyebrow" id="day-review-label">Yesterday</p>
+              <h1 id="day-review-title" tabindex="-1">Before starting your new day</h1>
+            </div>
+          </header>
+          <p class="day-gate__lead" id="day-review-lead">Check any Dailies you completed but forgot to record.</p>
+          <p class="day-gate__warning" id="day-review-warning">Selected Dailies will be recorded as complete. Unselected due Dailies may cause Habitica damage.</p>
+          <p class="day-gate__error" id="day-review-error" role="alert" hidden></p>
+          <div class="day-review-list" id="day-review-list"></div>
+          <p class="day-review-selection" id="day-review-selection" aria-live="polite"></p>
+          <footer class="day-gate__actions">
+            <button class="primary-action day-review-submit" id="day-review-submit" type="button">Confirm and Start New Day</button>
+          </footer>
+        </div>
+
+        <div class="day-gate__failure" id="day-gate-failure" role="alert" hidden>
+          <span class="day-gate__crest day-gate__crest--error" aria-hidden="true">!</span>
+          <p class="eyebrow">Couldn’t check your day</p>
+          <h1 id="day-gate-failure-title" tabindex="-1">Normal gameplay is paused</h1>
+          <p id="day-gate-failure-message">Habitica could not confirm whether a day refresh is due.</p>
+          <button class="primary-action" id="day-gate-retry" type="button">Try again</button>
+        </div>
+      </div>
+    </section>
+
     <div class="safe-area-shell">
-      <div class="app-shell">
+      <div class="app-shell" id="app-shell" aria-hidden="true" inert>
         <header class="app-header">
           <a class="brand" href="#home" aria-label="Habitica Companion home">
             <span class="brand-mark" aria-hidden="true">
@@ -58,6 +102,47 @@
             </div>
           </div>
         </header>
+
+        <section class="task-mini-profile" id="mini-profile" data-task-mini-profile aria-label="Character status" aria-busy="true" hidden>
+          <div class="task-mini-profile__inner">
+            <div class="task-mini-profile__avatar" aria-hidden="true">
+              <img id="mini-avatar-image" alt="" hidden>
+              <span class="task-mini-profile__avatar-placeholder" id="mini-avatar-placeholder">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2 7 5v10l-7 5-7-5V7z"/><path class="avatar-placeholder-cut" d="m12 7 3 2v5l-3 2-3-2V9z"/></svg>
+              </span>
+            </div>
+
+            <div class="task-mini-profile__summary">
+              <div class="task-mini-profile__identity">
+                <p><span>Lv. <strong id="mini-level">—</strong></span> <span id="mini-class">Adventurer</span></p>
+                <p class="task-mini-profile__gold" id="mini-gold-wrap">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9 8h4.2a3 3 0 0 1 0 6H9m3-8v12m-4-7h5"/></svg>
+                  <span id="mini-gold">—</span>
+                </p>
+              </div>
+
+              <div class="task-mini-profile__stats" aria-label="Character stats">
+                <div class="mini-stat mini-stat--health">
+                  <span class="mini-stat__label">HP</span>
+                  <div class="mini-stat__track" role="progressbar" id="mini-health-track" aria-label="Health" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="mini-health-progress"></span></div>
+                  <span class="mini-stat__value" id="mini-health-value">— / —</span>
+                </div>
+                <div class="mini-stat mini-stat--experience">
+                  <span class="mini-stat__label">XP</span>
+                  <div class="mini-stat__track" role="progressbar" id="mini-experience-track" aria-label="Experience" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="mini-experience-progress"></span></div>
+                  <span class="mini-stat__value" id="mini-experience-value">— / —</span>
+                </div>
+                <div class="mini-stat mini-stat--mana" id="mini-mana-row" hidden>
+                  <span class="mini-stat__label">MP</span>
+                  <div class="mini-stat__track" role="progressbar" id="mini-mana-track" aria-label="Mana" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="mini-mana-progress"></span></div>
+                  <span class="mini-stat__value" id="mini-mana-value">— / —</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <button class="task-mini-profile__retry" id="mini-profile-retry" type="button" hidden>Retry status</button>
+        </section>
 
         <main class="app-content" id="main-content">
           <section class="view is-active" id="home-view" data-view="home" role="tabpanel" aria-labelledby="home-tab">
@@ -147,27 +232,108 @@
 
             <section class="coming-next" aria-labelledby="coming-next-title">
               <div>
-                <p class="eyebrow">Milestone one</p>
-                <h2 id="coming-next-title">Your command center is taking shape</h2>
-                <p>Task views arrive next. For now, your live character is always close at hand.</p>
+                <p class="eyebrow">Your command center</p>
+                <h2 id="coming-next-title">Turn plans into progress</h2>
+                <p>Score Habits, complete Dailies, and move Todos forward from the tabs below.</p>
               </div>
               <div class="quest-orbit" aria-hidden="true"><span></span><span></span><span></span></div>
             </section>
           </section>
 
-          <section class="view placeholder-view" id="habits-view" data-view="habits" role="tabpanel" aria-labelledby="habits-tab" hidden>
-            <div class="placeholder-art placeholder-habits" aria-hidden="true"><span>＋</span></div>
-            <p class="eyebrow">Coming next</p><h1>Habits</h1><p>Build momentum with every positive choice.</p>
+          <section class="view task-page task-page--habit" id="habits-view" data-view="habits" data-task-page="habit" role="tabpanel" aria-labelledby="habits-tab" aria-busy="false" hidden>
+            <header class="task-toolbar">
+              <div class="task-toolbar__title">
+                <h1>Habits</h1>
+                <p class="task-count" data-task-count aria-live="polite">0 tasks</p>
+              </div>
+              <div class="task-filters" aria-label="Filter Habits">
+                <button type="button" data-task-filter="all" data-task-type="habit" aria-pressed="true">All</button>
+                <button type="button" data-task-filter="positive" data-task-type="habit" aria-pressed="false">Positive</button>
+                <button type="button" data-task-filter="negative" data-task-type="habit" aria-pressed="false">Negative</button>
+              </div>
+            </header>
+            <div class="task-skeleton" data-task-loading aria-label="Loading Habits" role="status" hidden>
+              <span></span><span></span><span></span>
+            </div>
+            <div class="task-state task-state--error" data-task-error role="alert" hidden>
+              <span class="task-state__icon" aria-hidden="true">!</span>
+              <div><h2>Couldn’t load Habits</h2><p data-task-error-message>Please try again.</p></div>
+              <button type="button" data-task-refresh data-task-type="habit">Try again</button>
+            </div>
+            <div class="task-state task-state--empty" data-task-empty hidden>
+              <span class="task-state__icon" aria-hidden="true">＋</span>
+              <h2>No Habits here yet</h2>
+              <p>Add a Habit, or choose another filter.</p>
+            </div>
+            <div class="task-list-shell" data-task-list></div>
           </section>
-          <section class="view placeholder-view" id="dailies-view" data-view="dailies" role="tabpanel" aria-labelledby="dailies-tab" hidden>
-            <div class="placeholder-art placeholder-dailies" aria-hidden="true"><span>✓</span></div>
-            <p class="eyebrow">Coming next</p><h1>Dailies</h1><p>Keep your recurring quests on track.</p>
+
+          <section class="view task-page task-page--daily" id="dailies-view" data-view="dailies" data-task-page="daily" role="tabpanel" aria-labelledby="dailies-tab" aria-busy="false" hidden>
+            <header class="task-toolbar">
+              <div class="task-toolbar__title">
+                <h1>Dailies</h1>
+                <p class="task-count" data-task-count aria-live="polite">0 tasks</p>
+              </div>
+              <div class="task-filters" aria-label="Filter Dailies">
+                <button type="button" data-task-filter="due" data-task-type="daily" aria-pressed="true">Due</button>
+                <button type="button" data-task-filter="all" data-task-type="daily" aria-pressed="false">All</button>
+                <button type="button" data-task-filter="completed" data-task-type="daily" aria-pressed="false">Completed</button>
+              </div>
+            </header>
+            <div class="task-skeleton" data-task-loading aria-label="Loading Dailies" role="status" hidden>
+              <span></span><span></span><span></span>
+            </div>
+            <div class="task-state task-state--error" data-task-error role="alert" hidden>
+              <span class="task-state__icon" aria-hidden="true">!</span>
+              <div><h2>Couldn’t load Dailies</h2><p data-task-error-message>Please try again.</p></div>
+              <button type="button" data-task-refresh data-task-type="daily">Try again</button>
+            </div>
+            <div class="task-state task-state--empty" data-task-empty hidden>
+              <span class="task-state__icon" aria-hidden="true">✓</span>
+              <h2>No Dailies in this view</h2>
+              <p>You may be clear for today. Choose All to see every Daily.</p>
+            </div>
+            <div class="task-list-shell" data-task-list></div>
           </section>
-          <section class="view placeholder-view" id="todos-view" data-view="todos" role="tabpanel" aria-labelledby="todos-tab" hidden>
-            <div class="placeholder-art placeholder-todos" aria-hidden="true"><span>◆</span></div>
-            <p class="eyebrow">Coming next</p><h1>Todos</h1><p>Turn your next goal into experience.</p>
+
+          <section class="view task-page task-page--todo" id="todos-view" data-view="todos" data-task-page="todo" role="tabpanel" aria-labelledby="todos-tab" aria-busy="false" hidden>
+            <header class="task-toolbar">
+              <div class="task-toolbar__title">
+                <h1>Todos</h1>
+                <p class="task-count" data-task-count aria-live="polite">0 tasks</p>
+              </div>
+              <div class="task-filters task-filters--two" aria-label="Filter Todos">
+                <button type="button" data-task-filter="active" data-task-type="todo" aria-pressed="true">Active</button>
+                <button type="button" data-task-filter="completed" data-task-type="todo" aria-pressed="false">Completed</button>
+              </div>
+            </header>
+            <div class="task-skeleton" data-task-loading aria-label="Loading Todos" role="status" hidden>
+              <span></span><span></span><span></span>
+            </div>
+            <div class="task-state task-state--error" data-task-error role="alert" hidden>
+              <span class="task-state__icon" aria-hidden="true">!</span>
+              <div><h2>Couldn’t load Todos</h2><p data-task-error-message>Please try again.</p></div>
+              <button type="button" data-task-refresh data-task-type="todo">Try again</button>
+            </div>
+            <div class="task-state task-state--empty" data-task-empty hidden>
+              <span class="task-state__icon" aria-hidden="true">◆</span>
+              <h2>No Todos in this view</h2>
+              <p>Add your next objective, or check the other filter.</p>
+            </div>
+            <div class="task-list-shell" data-task-list></div>
           </section>
         </main>
+
+        <button class="task-fab" id="task-fab" type="button" data-task-add data-quick-add="true" aria-label="Add task" aria-haspopup="dialog" aria-controls="quick-add-dialog" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
+
+        <button class="potion-fab" id="potion-fab" type="button" aria-label="Buy and use Health Potion" aria-haspopup="dialog" aria-controls="potion-dialog" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M9 2h6v3l-1 1v2.1c3 1 5 3.8 5 7.1A6.8 6.8 0 0 1 12 22a6.8 6.8 0 0 1-7-6.8c0-3.3 2-6.1 5-7.1V6L9 5z"/>
+            <path d="M7.1 15.1c1.7.5 3.2.1 4.6-.5 1.8-.8 3.5-.8 5.2.1"/>
+          </svg>
+        </button>
 
         <nav class="bottom-nav" aria-label="Primary" role="tablist">
           <button class="nav-item is-active" id="home-tab" type="button" role="tab" aria-selected="true" aria-controls="home-view" data-tab="home">
@@ -185,5 +351,176 @@
         </nav>
       </div>
     </div>
+
+    <div class="task-toast" id="task-toast" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+
+    <dialog class="task-dialog potion-dialog" id="potion-dialog" aria-labelledby="potion-dialog-title">
+      <form id="potion-form">
+        <header class="potion-dialog__header">
+          <span class="potion-dialog__icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="M9 2h6v3l-1 1v2.1c3 1 5 3.8 5 7.1A6.8 6.8 0 0 1 12 22a6.8 6.8 0 0 1-7-6.8c0-3.3 2-6.1 5-7.1V6L9 5z"/>
+              <path d="M7.1 15.1c1.7.5 3.2.1 4.6-.5 1.8-.8 3.5-.8 5.2.1"/>
+            </svg>
+          </span>
+          <div><p class="eyebrow">Restore health</p><h2 id="potion-dialog-title">Health Potion</h2></div>
+          <button class="dialog-close" id="potion-close" type="button" aria-label="Close Health Potion">×</button>
+        </header>
+        <div class="potion-dialog__body">
+          <p class="potion-dialog__intro">Buy one potion and use it immediately. Habitica determines the final cost and healing.</p>
+          <dl class="potion-facts" aria-live="polite">
+            <div><dt>Health</dt><dd id="potion-health">— / —</dd></div>
+            <div><dt>Gold</dt><dd id="potion-gold">—</dd></div>
+            <div id="potion-price-row" hidden><dt>Price</dt><dd id="potion-price">—</dd></div>
+            <div id="potion-healing-row" hidden><dt>Healing</dt><dd id="potion-healing">—</dd></div>
+          </dl>
+          <p class="dialog-error" id="potion-error" role="alert" hidden></p>
+        </div>
+        <footer class="dialog-actions">
+          <button class="secondary-action" id="potion-cancel" type="button">Cancel</button>
+          <button class="primary-action" id="potion-submit" type="submit" disabled>Buy and Use</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog class="task-dialog quick-add-dialog" id="quick-add-dialog" aria-labelledby="quick-add-heading">
+      <form id="quick-add-form" novalidate>
+        <header class="quick-add-dialog__header">
+          <div>
+            <p class="eyebrow" id="quick-add-type-label">New task</p>
+            <h2 id="quick-add-heading">Quick add</h2>
+          </div>
+          <button class="dialog-close" id="quick-add-close" type="button" aria-label="Close quick add">×</button>
+        </header>
+        <div class="quick-add-dialog__body">
+          <label class="visually-hidden" for="quick-add-input">Task title</label>
+          <div class="quick-add-composer">
+            <input id="quick-add-input" name="text" type="text" maxlength="500" autocomplete="off" placeholder="What do you want to add?" required>
+            <button class="primary-action" id="quick-add-submit" type="submit">Add</button>
+          </div>
+          <p class="dialog-error" id="quick-add-error" role="alert" hidden></p>
+          <div class="quick-add-dialog__actions">
+            <button class="quick-add-more" id="quick-add-more" type="button">More options</button>
+            <button class="quick-add-cancel" id="quick-add-cancel" type="button">Cancel</button>
+          </div>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="task-dialog task-editor" id="task-editor-dialog" aria-labelledby="task-editor-title">
+      <form id="task-editor-form" novalidate>
+        <header class="editor-screen-header">
+          <button class="editor-back" id="editor-back" type="button" aria-label="Back to task list">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg>
+          </button>
+          <button id="task-editor-close" type="button" hidden>Close editor</button>
+          <div class="editor-screen-header__title">
+            <p class="eyebrow" id="task-editor-eyebrow">New quest</p>
+            <h2 id="task-editor-title">Add task</h2>
+          </div>
+          <div class="editor-screen-header__actions">
+            <button class="editor-delete" id="editor-delete" type="button" data-editor-delete aria-label="Delete task" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M9 7V4h6v3m2 0-1 13H8L7 7m3 4v5m4-5v5"/></svg><span>Delete</span>
+            </button>
+            <button class="editor-save" id="task-editor-submit" type="submit">Create task</button>
+          </div>
+        </header>
+
+        <div class="dialog-body">
+          <div class="form-field">
+            <label for="task-title">Title <span aria-hidden="true">*</span></label>
+            <input id="task-title" name="text" type="text" maxlength="500" autocomplete="off" required>
+          </div>
+          <div class="form-field">
+            <label for="task-notes">Notes <span class="optional-label">Optional</span></label>
+            <textarea id="task-notes" name="notes" rows="4" maxlength="10000"></textarea>
+          </div>
+          <div class="form-field">
+            <label for="task-priority">Difficulty</label>
+            <select id="task-priority" name="priority" required>
+              <option value="0.1">Trivial</option>
+              <option value="1" selected>Easy</option>
+              <option value="1.5">Medium</option>
+              <option value="2">Hard</option>
+            </select>
+          </div>
+
+          <fieldset class="editor-section" data-editor-fields="habit" hidden>
+            <legend>Scoring directions</legend>
+            <p class="field-hint">Enable at least one direction.</p>
+            <div class="choice-grid choice-grid--two">
+              <label class="choice-card choice-card--positive"><input id="habit-up" type="checkbox" checked><span><strong>Positive</strong><small>Show the + action</small></span></label>
+              <label class="choice-card choice-card--negative"><input id="habit-down" type="checkbox" checked><span><strong>Negative</strong><small>Show the − action</small></span></label>
+            </div>
+          </fieldset>
+
+          <div class="editor-section" data-editor-fields="daily" hidden>
+            <fieldset data-daily-simple-schedule>
+              <legend>Repeat days</legend>
+              <p class="field-hint">Choose the days this Daily is due.</p>
+              <div class="weekday-grid">
+                <label><input type="checkbox" name="repeat-day" value="su"><span>Sun</span></label>
+                <label><input type="checkbox" name="repeat-day" value="m"><span>Mon</span></label>
+                <label><input type="checkbox" name="repeat-day" value="t"><span>Tue</span></label>
+                <label><input type="checkbox" name="repeat-day" value="w"><span>Wed</span></label>
+                <label><input type="checkbox" name="repeat-day" value="th"><span>Thu</span></label>
+                <label><input type="checkbox" name="repeat-day" value="f"><span>Fri</span></label>
+                <label><input type="checkbox" name="repeat-day" value="s"><span>Sat</span></label>
+              </div>
+              <div class="form-field form-field--spaced">
+                <label for="daily-start-date">Start date <span class="optional-label">Optional</span></label>
+                <input id="daily-start-date" type="date">
+              </div>
+            </fieldset>
+            <div class="schedule-notice" data-daily-advanced-notice hidden>
+              <strong>Advanced schedule preserved</strong>
+              <p>This Daily uses a schedule that this editor cannot safely change. Other fields remain editable.</p>
+            </div>
+          </div>
+
+          <div class="editor-section" data-editor-fields="todo" hidden>
+            <div class="form-field">
+              <label for="todo-due-date">Due date <span class="optional-label">Optional</span></label>
+              <input id="todo-due-date" type="date">
+            </div>
+          </div>
+
+          <fieldset class="editor-section" id="checklist-editor" data-editor-checklist hidden>
+            <legend>Checklist <span class="optional-label">Optional</span></legend>
+            <p class="field-hint">Break the task into smaller steps.</p>
+            <div class="checklist-editor__items" id="checklist-editor-items"></div>
+            <button class="secondary-action checklist-add" id="checklist-add" type="button"><span aria-hidden="true">＋</span> Add checklist item</button>
+          </fieldset>
+
+          <p class="dialog-error" id="task-editor-error" role="alert" hidden></p>
+        </div>
+        <button id="task-editor-cancel" type="button" hidden>Cancel</button>
+      </form>
+    </dialog>
+
+    <dialog class="task-dialog delete-dialog" id="delete-dialog" aria-labelledby="delete-dialog-title">
+      <form id="delete-form">
+        <div class="delete-symbol" aria-hidden="true">!</div>
+        <h2 id="delete-dialog-title">Delete this task?</h2>
+        <p><strong id="delete-task-title"></strong> will be permanently deleted. This cannot be undone.</p>
+        <p class="dialog-error" id="delete-error" role="alert" hidden></p>
+        <footer class="dialog-actions">
+          <button class="secondary-action" id="delete-cancel" type="button" autofocus>Cancel</button>
+          <button class="danger-action" id="delete-confirm" type="submit">Delete</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog class="task-dialog confirm-dialog" id="discard-dialog" aria-labelledby="discard-dialog-title">
+      <form id="discard-form">
+        <div class="confirm-symbol" aria-hidden="true">?</div>
+        <h2 id="discard-dialog-title">Discard unsaved changes?</h2>
+        <p>Your edits have not been saved. Keep editing or discard them and return to the task list.</p>
+        <footer class="dialog-actions">
+          <button class="secondary-action" id="discard-cancel" type="button" autofocus>Keep editing</button>
+          <button class="danger-action" id="discard-confirm" type="submit">Discard changes</button>
+        </footer>
+      </form>
+    </dialog>
   </body>
 </html>

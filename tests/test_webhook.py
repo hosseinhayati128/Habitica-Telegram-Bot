@@ -449,6 +449,20 @@ def test_runtime_lock_timeout_is_bounded(monkeypatch):
     assert runtime_lock._configured_timeout() == runtime_lock.MAX_LOCK_TIMEOUT_SECONDS
 
 
+def test_gameplay_lock_path_is_private_and_bounded(monkeypatch, tmp_path):
+    import runtime_lock
+
+    monkeypatch.setenv("BOT_DATA_PATH", str(tmp_path / "state" / "botdata.pkl"))
+    paths = {
+        runtime_lock.get_gameplay_lock_path(f"habitica-user-{number}")
+        for number in range(200)
+    }
+
+    assert len(paths) <= runtime_lock.GAMEPLAY_LOCK_SHARDS
+    assert all(path.parent.name == ".miniapp-gameplay-locks" for path in paths)
+    assert all(stat.S_IMODE(path.parent.stat().st_mode) == 0o700 for path in paths)
+
+
 def test_runtime_lock_file_is_private(tmp_path):
     import runtime_lock
 

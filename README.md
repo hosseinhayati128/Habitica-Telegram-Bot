@@ -7,9 +7,10 @@ development and a synchronous Flask/WSGI deployment designed for PythonAnywhere.
 Try the public instance at [@HHabitica_bot](https://t.me/HHabitica_bot). This is a
 fan project and is not affiliated with or endorsed by Habitica.
 
-The same Flask application also serves a first-milestone Telegram Mini App with a
-live character overview, authenticated avatar, three appearance modes, and placeholder
-navigation for Habits, Dailies, and Todos.
+The same Flask application serves a Telegram Mini App with a live character overview,
+authenticated avatar, three appearance modes, and functional Habit, Daily, and Todo
+pages. Tasks can be created, edited, scored, completed, restored, and deleted without
+exposing Habitica credentials to the browser.
 
 ## Features and commands
 
@@ -23,6 +24,12 @@ navigation for Habits, Dailies, and Todos.
 - Flask webhook and authenticated reminder-tick endpoints for PythonAnywhere.
 - Telegram Mini App Home view with signed Telegram authentication and read-only access
   to the existing linked Habitica account.
+- Authenticated Mini App task views with filters, simple task editing, checklists,
+  completion, and Habit scoring.
+- A startup Record Yesterday gate that follows Habitica's own `needsCron`, timezone,
+  custom-day, and Daily-schedule rules before current-day scoring is enabled.
+- Compact authoritative Habit counters and a deliberate Health Potion action that
+  updates the shared Home/task profile without regenerating the avatar.
 
 | Command | Purpose |
 | --- | --- |
@@ -105,6 +112,7 @@ load a `.env` file.
 | `MINIAPP_DEV_MODE` | Local development only | Disabled. Set exactly `1` together with `MINIAPP_DEV_TELEGRAM_USER_ID` to open the Mini App outside Telegram. Never enable this in production. |
 | `MINIAPP_DEV_TELEGRAM_USER_ID` | Local development only | Existing linked Telegram user ID used only when development mode is explicitly enabled and the auth header is absent. |
 | `MINIAPP_AVATAR_REFRESH_COOLDOWN_SECONDS` | No | `30`, capped at 300. Reuses a recently rendered avatar instead of repeatedly launching Puppeteer for authenticated refresh replays. |
+| `HABITICA_CLIENT_ID` | Recommended | Habitica's public `x-client` identifier in `<author Habitica UUID>-<app name>` form. It is not a secret. The historical `habitica-telegram-bot` value remains the compatibility fallback. |
 
 Never commit real values. `.gitignore` excludes common secret files, pickle data,
 runtime locks, caches, and avatar output.
@@ -164,6 +172,20 @@ subsequent requests reuse the existing opaque avatar cache. The refresh button r
 `/miniapp/api/avatar?refresh=1` and requests regeneration, subject to the short
 server-side refresh cooldown.
 
+Task development uses the same signed-auth boundary. In explicit local development
+mode, the configured Telegram identity selects its already linked account; the browser
+still never receives either Habitica credential. Lists are fetched only when their tab
+is opened, and no task content is saved to LocalStorage, CloudStorage, or the pickle.
+All create/edit/score/delete requests therefore operate on the development account
+named by `MINIAPP_DEV_TELEGRAM_USER_ID`; use a non-production Habitica account when
+testing mutations.
+
+Every Mini App launch checks the linked account's authoritative Habitica day before it
+loads profile, avatar, or interactive tasks. If Record Yesterday is required, the
+blocking review submits selected Dailies and cron as real mutations. Use a disposable
+Habitica account when testing this flow: local development mode relaxes only Telegram
+launch authentication and does not simulate or sandbox Habitica actions.
+
 ## PythonAnywhere Flask/WSGI deployment
 
 The WSGI entry point is `webhook_app.flask_app`. It exposes:
@@ -173,6 +195,22 @@ The WSGI entry point is `webhook_app.flask_app`. It exposes:
 - `GET /miniapp/` for the Mini App frontend.
 - `GET /miniapp/api/me` for a signed, normalized Habitica character summary.
 - `GET /miniapp/api/avatar` for the signed user's locally rendered PNG.
+- `GET /miniapp/api/day-status` for the authoritative startup day gate.
+- `POST /miniapp/api/day-refresh` to record an allowlisted set of yesterday's Dailies
+  and then run Habitica cron once. Any number may be selected; the server records at
+  most eight per request and returns a manual continuation before cron when more remain.
+- `GET /miniapp/api/health-potion` for the normalized confirmation model and
+  a short-lived account-bound `purchaseIntent`; `POST /miniapp/api/health-potion`
+  consumes that intent for one deliberate purchase.
+- `GET /miniapp/api/tasks?type=habit|daily|todo` for normalized active task lists;
+  Todos also accept `completed=true|false`.
+- `POST /miniapp/api/tasks` to create a Habit, simple weekly Daily, or Todo.
+- `PATCH /miniapp/api/tasks/<uuid>` and `DELETE /miniapp/api/tasks/<uuid>` to edit or
+  delete an editable personal task.
+- `POST /miniapp/api/tasks/<uuid>/score` to score a Habit or change Daily/Todo
+  completion.
+- `POST /miniapp/api/tasks/<uuid>/checklist/<item_uuid>/score` to set the requested
+  checklist completion state safely.
 
 The webhook and tick routes serialize their complete persistence transaction with a Linux advisory
 lock next to the pickle file. Lock contention returns HTTP 503 rather than allowing
@@ -232,6 +270,7 @@ os.environ["TELEGRAM_WEBHOOK_SECRET"] = "replace-on-host"
 os.environ["TICK_TOKEN"] = "replace-on-host"
 os.environ["ALLOW_LEGACY_TICK_QUERY_TOKEN"] = "false"
 os.environ["MINIAPP_AUTH_MAX_AGE_SECONDS"] = "3600"
+os.environ["HABITICA_CLIENT_ID"] = "<public-author-habitica-uuid>-hhabitica"
 
 from webhook_app import flask_app as application
 ```
@@ -283,6 +322,26 @@ or Main Mini App. The client sends the untouched value as
 `Authorization: tma <initData>`; the server verifies Telegram's bot-token HMAC and
 freshness before reading persistence. No user ID from a URL, query parameter,
 `initDataUnsafe`, or browser storage is accepted for authorization.
+
+The same authentication runs before every task read and mutation. Credentials are
+resolved only from private server persistence and sent to Habitica in server-side
+headers; Mini App JavaScript receives only explicitly normalized task fields.
+
+Day refresh, task scoring, checklist scoring, and Potion purchase are serialized by a
+bounded set of private per-account gameplay lock shards. The service rechecks
+Habitica's `needsCron` at mutation boundaries because the official Habitica clients
+and another host cannot participate in a local file lock. Selected review IDs are
+validated against a freshly fetched eligible Daily set, and score/cron/purchase POSTs
+are never retried automatically when their outcome may be unknown.
+
+The Telegram refresh-day panel now keeps its checkboxes local until confirmation and
+submits the selected IDs through that same guarded service and gameplay lock. Ordinary
+Telegram task scoring, reward purchases, and Potion purchases use that account lock too.
+Potion confirmation intents are random, account-bound, valid for five minutes, and retained
+only in a bounded in-memory registry. Replaying the same terminal intent returns the
+same sanitized result without making a second Habitica purchase. Restarting the web
+worker safely invalidates outstanding intents; reopen the confirmation to get a new
+one.
 
 ## Reminder tick authentication and migration
 
@@ -381,6 +440,15 @@ npm ci
 npm test
 ```
 
+Focused task checks can be run while iterating:
+
+```bash
+python -m pytest tests/test_habitica_api.py tests/test_habitica_gameplay.py \
+  tests/test_miniapp_tasks.py tests/test_miniapp_task_routes.py \
+  tests/test_miniapp_frontend.py tests/test_bot_behavior.py
+node --test tests/miniapp_tasks.test.js tests/miniapp_gameplay.test.js
+```
+
 Use `npm run build:avatar` only when intentionally regenerating the tracked bundle.
 Before committing, review `git status` and ensure no pickle, token, `.env`, avatar
 payload, or runtime output is staged.
@@ -415,6 +483,20 @@ payload, or runtime output is staged.
   Python version, and WSGI `sys.path`, then reload the web app.
 - **Habitica actions fail:** verify credentials through `/relink` in a private chat.
   Never paste credentials into an issue, log, screenshot, or group chat.
+- **Task change says its outcome is unknown:** do not repeat the action immediately.
+  Let the page reconcile from Habitica or use its refresh control first; score and
+  checklist operations are intentionally never retried blindly.
+- **Mini App stays on Record Yesterday:** complete or explicitly submit the blocking
+  review. Browser midnight is intentionally ignored; if Habitica is unavailable, the
+  app cannot safely enable current-day scoring.
+- **Record Yesterday asks to continue:** all choices remain allowed, but a free-host
+  request records at most eight selected Dailies. Wait about one minute, then explicitly
+  submit the checked remainder. Cron does not run until every selected Daily is resolved.
+- **Potion action is unavailable:** resolve Record Yesterday first. Full health and
+  insufficient gold are normal gameplay results; authentication errors require
+  `/relink`, while an unknown purchase outcome should be reconciled before retrying.
+- **Potion confirmation expired:** close and reopen the Potion sheet to obtain a new
+  purchase intent. Do not resubmit an old or copied confirmation token.
 
 ## Security and privacy
 
@@ -440,8 +522,37 @@ payload, or runtime output is staged.
   process crash after an external Habitica mutation but before the journal is flushed
   can still leave an ambiguous replay; solving that fully needs a durable transactional
   design beyond a local pickle.
+- The Mini App supports personal Habits, Todos, and simple weekly Dailies. It displays
+  challenge/group or advanced-schedule tasks but keeps unsupported edits read-only;
+  tags, rewards, reminders, advanced recurrence, and drag ordering remain out of scope.
+- Editing an existing checklist is capped at one item operation per save to keep a
+  one-worker deployment responsive and reduce partial updates. Larger checklist edits
+  should be split across saves.
+- Habitica task mutations are not transactional. If a mutation response is lost, the
+  UI refreshes display state but blocks another conflicting mutation for the remainder
+  of that Mini App session; reopening the app is the explicit new intent. A partly
+  applied edit likewise requires authoritative refresh before further work.
+- Completed Todos are limited to Habitica's retained completed-Todo feed rather than a
+  permanent local archive; this project intentionally adds no task database or cache.
 - The runtime lock coordinates only processes on one Linux host that use these WSGI
   routes and the same `BOT_DATA_PATH`; it does not coordinate polling or another host.
+- Record Yesterday reproduces only the review state Habitica still exposes for the
+  immediately preceding user day. For multiple missed days it reports the count but
+  does not invent unavailable historical task states; Habitica cron remains
+  authoritative for missed-time effects.
+- Record Yesterday accepts all selected Dailies, but records at most eight per request
+  to reserve Habitica's shared per-user request budget for startup and post-cron sync.
+  A larger selection requires an explicit continuation after roughly one minute; no
+  mutating request is retried automatically, and cron waits for the final batch.
+- Habitica exposes current and last-cron numeric offsets but no trusted timezone ID;
+  the review uses the current offset for the visible yesterday date and the validated
+  last-cron offset for schedule conversion. Exact historical DST reconstruction is
+  therefore not possible after unusual timezone changes.
+- Local gameplay locks prevent duplicate Mini App requests on this host, but cannot
+  make a sequence of Habitica HTTP mutations atomic with the official app or another
+  client. A fresh `needsCron` read immediately precedes each selected Daily score and
+  cron, reducing the unavoidable final GET-to-POST race; an ambiguous response is
+  surfaced instead of blindly repeated.
 - `PicklePersistence` remains a non-database file format; the lock prevents concurrent
   writers but cannot make a write crash-proof. Keep private, quiesced backups as
   described above.

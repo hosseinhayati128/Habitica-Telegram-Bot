@@ -6,8 +6,10 @@
   "main": "render_avatar_from_json.js",
   "scripts": {
     "build:avatar": "browserify node_modules/habitica-avatar/habitica-avatar.js --standalone habiticaAvatar --outfile habitica-avatar.bundle.js",
-    "check:js": "node --check habitica-avatar.js && node --check habitica-avatar.bundle.js && node --check render_avatar.js && node --check render_avatar_from_json.js && node --check static/miniapp/theme-init.js && node --check static/miniapp/app.js",
-    "test": "npm run check:js"
+    "check:js": "node --check habitica-avatar.js && node --check habitica-avatar.bundle.js && node --check render_avatar.js && node --check render_avatar_from_json.js && node --check static/miniapp/theme-init.js && node --check static/miniapp/gameplay.js && node --check static/miniapp/tasks.js && node --check static/miniapp/app.js && node --check tests/visual_miniapp_redesign.js",
+    "test:miniapp": "node --test tests/miniapp_tasks.test.js tests/miniapp_redesign.test.js tests/miniapp_gameplay.test.js",
+    "visual:miniapp": "node tests/visual_miniapp_redesign.js",
+    "test": "npm run check:js && npm run test:miniapp"
   },
   "keywords": [
     "habitica",
