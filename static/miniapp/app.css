@@ -3719,8 +3719,8 @@ body:not([data-active-view="home"]) .app-content {
 .profile-card {
   position: relative;
   display: grid;
-  grid-template-columns: 68px minmax(0, 1fr);
-  gap: 14px;
+  grid-template-columns: 136px minmax(0, 1fr);
+  gap: 18px;
   min-height: 0;
   padding: 0;
   overflow: visible;
@@ -3744,10 +3744,10 @@ body:not([data-active-view="home"]) .app-content {
 }
 
 .avatar-frame {
-  width: 68px;
-  min-height: 68px;
-  height: 68px;
-  padding: 3px;
+  width: 136px;
+  min-height: 136px;
+  height: 136px;
+  padding: 4px;
   overflow: hidden;
   border: 1.5px solid var(--figma-gold);
   border-radius: 8px;
@@ -3756,30 +3756,32 @@ body:not([data-active-view="home"]) .app-content {
 }
 
 .avatar-backdrop {
-  inset: 3px;
+  inset: 4px;
   border-radius: 6px;
   background: var(--figma-raised);
 }
 
 .avatar-frame img {
-  inset: 3px;
-  width: calc(100% - 6px);
-  height: calc(100% - 6px);
-  object-fit: contain;
+  inset: 4px;
+  width: calc(100% - 8px);
+  height: calc(100% - 8px);
+  object-fit: cover;
+  object-position: 46% 44%;
+  transform: translate(-4%, -5%) scale(1.2);
+  transform-origin: center;
 }
 
 .avatar-placeholder {
-  inset: 3px;
-  font-size: 8px;
+  inset: 4px;
+  font-size: 10px;
   border-radius: 6px;
 }
 
 .gold-chip {
-  position: absolute;
-  top: 17px;
-  right: 0;
+  position: static;
   z-index: 3;
-  min-width: 101px;
+  width: 136px;
+  min-width: 0;
   min-height: 33px;
   padding: 8px 12px;
   gap: 6px;
@@ -3792,6 +3794,7 @@ body:not([data-active-view="home"]) .app-content {
   font-family: var(--font-ui);
   font-size: 13px;
   font-weight: 700;
+  margin-top: 10px;
 }
 
 .profile-details {
@@ -3801,7 +3804,7 @@ body:not([data-active-view="home"]) .app-content {
 .identity-block {
   align-self: center;
   min-width: 0;
-  padding-right: 108px;
+  padding-right: 0;
 }
 
 .identity-heading {
@@ -3982,20 +3985,21 @@ body:not([data-active-view="home"]) .app-content {
   height: 3px;
   content: "";
   border-radius: 2px;
-  background: linear-gradient(90deg, var(--figma-gold) 0 66%, var(--elegant-track) 66%);
-}
-
-.quest-log__row:nth-of-type(3)::after {
-  background: linear-gradient(90deg, var(--figma-gold) 0 40%, var(--elegant-track) 40%);
-}
-
-.quest-log__row:last-child::after {
-  background: var(--figma-gold);
+  background: linear-gradient(
+    90deg,
+    var(--figma-gold) 0 var(--quest-progress, 0%),
+    var(--elegant-track) var(--quest-progress, 0%)
+  );
 }
 
 .quest-log__row span {
   font-size: 13px;
   font-weight: 600;
+}
+
+.quest-log__row strong {
+  color: var(--figma-text);
+  font: inherit;
 }
 
 .quest-log__row small {
@@ -4010,7 +4014,7 @@ body:not([data-active-view="home"]) .app-content {
   position: relative;
   top: 0;
   width: min(calc(100% - 48px), 582px);
-  min-height: 68px;
+  min-height: 112px;
   margin: 8px auto 12px;
   padding: 0;
   border: 1px solid var(--figma-border);
@@ -4021,9 +4025,9 @@ body:not([data-active-view="home"]) .app-content {
 
 .task-mini-profile__inner {
   display: grid;
-  grid-template-columns: 44px minmax(0, 1fr);
+  grid-template-columns: 88px minmax(0, 1fr);
   gap: 12px;
-  min-height: 66px;
+  min-height: 110px;
   padding: 11px 12px;
   overflow: hidden;
   color: var(--figma-text);
@@ -4034,19 +4038,23 @@ body:not([data-active-view="home"]) .app-content {
 }
 
 .task-mini-profile__avatar {
-  width: 44px;
-  height: 44px;
+  width: 88px;
+  height: 88px;
   padding: 2px;
+  overflow: hidden;
   border: 1.5px solid var(--figma-gold);
   border-radius: 8px;
   background: var(--figma-raised);
 }
 
 .task-mini-profile__avatar img {
-  width: 40px;
-  height: 40px;
-  object-fit: contain;
+  width: 84px;
+  height: 84px;
+  object-fit: cover;
+  object-position: 46% 44%;
   border-radius: 6px;
+  transform: translate(-4%, -5%) scale(1.2);
+  transform-origin: center;
 }
 
 .task-mini-profile__summary {
@@ -5167,7 +5175,7 @@ body:not([data-active-view="home"]) .app-content {
   }
 
   .identity-block {
-    padding-right: 76px;
+    padding-right: 0;
   }
 
   .task-row__title {

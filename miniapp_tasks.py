@@ -485,6 +485,61 @@ def normalize_tasks(raw_tasks: Any) -> list[dict[str, Any]] | None:
     return normalized
 
 
+def quest_log_summary(
+    habits: list[dict[str, Any]],
+    dailies: list[dict[str, Any]],
+    active_todos: list[dict[str, Any]],
+    completed_todos: list[dict[str, Any]],
+    *,
+    today: date,
+) -> dict[str, dict[str, int]]:
+    """Return privacy-safe, real task counts for the Home quest log.
+
+    Habit progress reflects a Habit with activity in its current counter
+    period. Daily progress includes only tasks due today. Completed To-Dos are
+    included only when Habitica reports that they completed on the device's
+    requested local date, avoiding an all-time completed count.
+    """
+
+    habit_rows = [task for task in habits if task.get("type") == "habit"]
+    scored_habits = sum(
+        1
+        for task in habit_rows
+        if max(
+            task.get("counterUp") if isinstance(task.get("counterUp"), int) else 0,
+            task.get("counterDown") if isinstance(task.get("counterDown"), int) else 0,
+        )
+        > 0
+    )
+    due_dailies = [
+        task
+        for task in dailies
+        if task.get("type") == "daily" and task.get("dueToday") is True
+    ]
+    completed_dailies = sum(task.get("completed") is True for task in due_dailies)
+    open_todos = [
+        task
+        for task in active_todos
+        if task.get("type") == "todo" and task.get("completed") is not True
+    ]
+    today_text = today.isoformat()
+    todos_completed_today = [
+        task
+        for task in completed_todos
+        if task.get("type") == "todo"
+        and task.get("completed") is True
+        and task.get("dateCompleted") == today_text
+    ]
+    return {
+        "habits": {"total": len(habit_rows), "completed": scored_habits},
+        "dailies": {"total": len(due_dailies), "completed": completed_dailies},
+        "todos": {
+            "total": len(open_todos) + len(todos_completed_today),
+            "completed": len(todos_completed_today),
+        },
+    }
+
+
 def checklist_changes(
     existing: list[dict[str, Any]], requested: list[dict[str, Any]]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:

@@ -179,6 +179,69 @@ def test_authenticated_lists_use_explicit_history_false(
     assert response.headers["Cache-Control"] == "no-store"
 
 
+def test_task_summary_uses_real_private_counts_without_leaking_tasks(
+    app, monkeypatch, frozen_time
+):
+    import Habitica_API
+
+    calls = []
+    fixtures = {
+        "habits": [raw_task("habit", counterUp=3, counterDown=0)],
+        "dailys": [raw_task("daily", completed=True, isDue=True)],
+        "todos": [raw_task("todo", completed=False)],
+        "completedTodos": [
+            raw_task("todo", completed=True, dateCompleted="2026-08-22")
+        ],
+    }
+
+    def list_tasks(user, key, task_type, *, history):
+        calls.append((user, key, task_type, history))
+        return ok(fixtures[task_type])
+
+    monkeypatch.setattr(Habitica_API, "get_tasks_result", list_tasks)
+    response = app.test_client().get(
+        "/miniapp/api/task-summary?today=2026-08-22", headers=auth_header()
+    )
+
+    assert response.status_code == 200
+    assert response.json == {
+        "ok": True,
+        "summary": {
+            "habits": {"total": 1, "completed": 1},
+            "dailies": {"total": 1, "completed": 1},
+            "todos": {"total": 2, "completed": 1},
+        },
+    }
+    assert calls == [
+        ("habitica-user", "habitica-key", "habits", False),
+        ("habitica-user", "habitica-key", "dailys", False),
+        ("habitica-user", "habitica-key", "todos", False),
+        ("habitica-user", "habitica-key", "completedTodos", False),
+    ]
+    body = response.get_data(as_text=True)
+    assert "private note" not in body
+    assert "must-not-leak" not in body
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+@pytest.mark.parametrize("today", ["", "2026-8-22", "not-a-date", "2026-02-30"])
+def test_task_summary_rejects_invalid_local_dates_without_upstream(
+    app, monkeypatch, frozen_time, today
+):
+    import Habitica_API
+
+    monkeypatch.setattr(
+        Habitica_API,
+        "get_tasks_result",
+        lambda *_args, **_kwargs: pytest.fail("upstream must not be called"),
+    )
+    response = app.test_client().get(
+        f"/miniapp/api/task-summary?today={today}", headers=auth_header()
+    )
+    assert response.status_code == 400
+    assert response.json["error"]["code"] == "invalid_request"
+
+
 @pytest.mark.parametrize(
     "query",
     ["", "type=reward", "type=daily&completed=true", "type=todo&completed=yes"],

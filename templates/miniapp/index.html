@@ -232,11 +232,11 @@
             </div>
 
             <section class="coming-next quest-log" aria-labelledby="coming-next-title">
-              <div class="quest-log__heading"><h2 id="coming-next-title">Today’s Quest Log</h2><span class="quest-log__status">Active</span></div>
+              <div class="quest-log__heading"><h2 id="coming-next-title">Today’s Quest Log</h2><span class="quest-log__status" id="quest-log-status" aria-live="polite">Loading</span></div>
               <div class="quest-log__divider" aria-hidden="true"></div>
-              <button class="quest-log__row" type="button" data-summary-tab="habits"><span>Habits</span><small>Build momentum</small></button>
-              <button class="quest-log__row" type="button" data-summary-tab="dailies"><span>Dailies</span><small>Stay on schedule</small></button>
-              <button class="quest-log__row" type="button" data-summary-tab="todos"><span>To-Dos</span><small>Finish your quests</small></button>
+              <button class="quest-log__row" type="button" data-summary-tab="habits" aria-busy="true"><span><strong data-summary-total>—</strong> Habits</span><small data-summary-progress>Loading…</small></button>
+              <button class="quest-log__row" type="button" data-summary-tab="dailies" aria-busy="true"><span><strong data-summary-total>—</strong> Dailies</span><small data-summary-progress>Loading…</small></button>
+              <button class="quest-log__row" type="button" data-summary-tab="todos" aria-busy="true"><span><strong data-summary-total>—</strong> To-Dos</span><small data-summary-progress>Loading…</small></button>
             </section>
           </section>
 

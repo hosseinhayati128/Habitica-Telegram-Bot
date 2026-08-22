@@ -21,6 +21,9 @@
     profilePayload: null,
     profileMutationSequence: 0,
     profileLoaded: false,
+    questSummaryLoaded: false,
+    questSummaryRequest: null,
+    questSummaryGeneration: 0,
     taskProfileStarted: false,
     homeStarted: false,
     refreshing: false,
@@ -98,6 +101,7 @@
     goldValue: document.getElementById("gold-value"),
     avatarImage: document.getElementById("avatar-image"),
     avatarPlaceholder: document.getElementById("avatar-placeholder"),
+    questLogStatus: document.getElementById("quest-log-status"),
     miniProfile: document.getElementById("mini-profile"),
     miniProfileRetry: document.getElementById("mini-profile-retry"),
     miniAvatarImage: document.getElementById("mini-avatar-image"),
@@ -398,6 +402,72 @@
     return new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(number);
   }
 
+  function localIsoDate(value = new Date()) {
+    const pad = (part) => String(part).padStart(2, "0");
+    return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`;
+  }
+
+  function questLogRows() {
+    return [...document.querySelectorAll("[data-summary-tab]")];
+  }
+
+  function renderQuestLog(summary) {
+    const copy = {
+      habits: { noun: "Habits", verb: "scored" },
+      dailies: { noun: "Dailies", verb: "completed" },
+      todos: { noun: "To-Dos", verb: "completed" },
+    };
+    questLogRows().forEach((row) => {
+      const key = row.dataset.summaryTab;
+      const values = summary[key];
+      const labels = copy[key];
+      if (!values || !labels) return;
+      row.querySelector("[data-summary-total]").textContent = String(values.total);
+      row.querySelector("[data-summary-progress]").textContent = `${values.completed} / ${values.total} ${labels.verb}`;
+      row.style.setProperty("--quest-progress", `${progressPercent(values.completed, values.total)}%`);
+      row.setAttribute("aria-busy", "false");
+      row.setAttribute("aria-label", `${values.completed} of ${values.total} ${labels.noun} ${labels.verb}`);
+    });
+    elements.questLogStatus.textContent = "Live";
+    state.questSummaryLoaded = true;
+  }
+
+  function renderQuestLogError() {
+    questLogRows().forEach((row) => {
+      row.querySelector("[data-summary-total]").textContent = "—";
+      row.querySelector("[data-summary-progress]").textContent = "Refresh to retry";
+      row.style.setProperty("--quest-progress", "0%");
+      row.setAttribute("aria-busy", "false");
+    });
+    elements.questLogStatus.textContent = "Unavailable";
+  }
+
+  async function loadQuestLog({ force = false } = {}) {
+    if (!force && state.questSummaryRequest) return state.questSummaryRequest;
+    if (!force && state.questSummaryLoaded) return true;
+    const generation = state.questSummaryGeneration + 1;
+    state.questSummaryGeneration = generation;
+    elements.questLogStatus.textContent = state.questSummaryLoaded ? "Updating" : "Loading";
+    questLogRows().forEach((row) => row.setAttribute("aria-busy", "true"));
+    let pending;
+    pending = (async () => {
+      try {
+        const payload = await requestJson(`${API_BASE}/task-summary?today=${encodeURIComponent(localIsoDate())}`);
+        const summary = window.HabiticaTaskUI.normalizeQuestLogSummary(payload);
+        if (generation !== state.questSummaryGeneration) return state.questSummaryLoaded;
+        renderQuestLog(summary);
+        return true;
+      } catch (_error) {
+        if (generation === state.questSummaryGeneration) renderQuestLogError();
+        return false;
+      } finally {
+        if (state.questSummaryRequest === pending) state.questSummaryRequest = null;
+      }
+    })();
+    state.questSummaryRequest = pending;
+    return pending;
+  }
+
   function progressPercent(current, maximum) {
     const safeCurrent = finiteNumber(current);
     const safeMaximum = finiteNumber(maximum);
@@ -420,7 +490,7 @@
     const track = document.getElementById(`mini-${prefix}-track`);
     if (!value || !progress || !track) return;
     const percent = progressPercent(current, maximum);
-    value.textContent = `${displayStat(current)} / ${displayStat(maximum)}`;
+    value.textContent = `${displayStat(current)}/${displayStat(maximum)}`;
     track.setAttribute("aria-valuenow", String(Math.round(percent)));
     window.requestAnimationFrame(() => { progress.style.width = `${percent}%`; });
   }
@@ -674,23 +744,28 @@
     elements.profileCard.classList.add("is-refreshing");
     if (userInitiated) haptic("impact", "light");
 
-    // PythonAnywhere free web apps may have one worker.  Profile-first ordering
-    // guarantees an expensive first avatar render cannot sit ahead of the text.
+    // PythonAnywhere free web apps may have one worker. Profile and compact task
+    // counts load before the expensive first avatar render.
     const profileOk = await loadProfile();
+    const summaryOk = await loadQuestLog({ force: userInitiated });
     const avatarOk = await loadAvatar(forceAvatar);
 
     state.refreshing = false;
     elements.refreshButton.disabled = false;
     elements.refreshButton.classList.remove("is-spinning");
     elements.profileCard.classList.remove("is-refreshing");
-    if (userInitiated) haptic("notification", profileOk && avatarOk ? "success" : "error");
-    return profileOk && avatarOk;
+    if (userInitiated) haptic("notification", profileOk && summaryOk && avatarOk ? "success" : "error");
+    return profileOk && summaryOk && avatarOk;
   }
 
   function ensureHomeLoaded() {
-    if (state.homeStarted) return;
+    if (state.homeStarted) {
+      if (!state.questSummaryLoaded) void loadQuestLog();
+      return;
+    }
     if (state.profileLoaded) {
       state.homeStarted = true;
+      if (!state.questSummaryLoaded) void loadQuestLog();
       if (!state.avatarUrl) void loadAvatar(false);
       return;
     }
@@ -889,6 +964,7 @@
     if (types.length) {
       taskController?.invalidate?.(types);
       await taskController?.refreshTypes?.(types);
+      void loadQuestLog({ force: true });
     }
     state.dayReview = null;
     state.selectedDailyIds.clear();
@@ -1943,7 +2019,10 @@
       requestJson,
       announce,
       haptic,
-      onMutationConfirmed: scheduleProfileRefresh,
+      onMutationConfirmed: (detail) => {
+        scheduleProfileRefresh(detail);
+        void loadQuestLog({ force: true });
+      },
       onDayRefreshRequired: requireDayReview,
       apiBase: API_BASE,
       limits: { title: 500, notes: 10000, checklistItems: 100, checklistText: 500 },

@@ -100,6 +100,28 @@
     };
   }
 
+  function normalizeQuestLogSummary(payload) {
+    if (!payload || payload.ok !== true || !payload.summary || typeof payload.summary !== "object") {
+      throw new TypeError("Quest log response is incomplete.");
+    }
+    const summary = {};
+    ["habits", "dailies", "todos"].forEach((key) => {
+      const row = payload.summary[key];
+      if (
+        !row
+        || !Number.isSafeInteger(row.total)
+        || row.total < 0
+        || !Number.isSafeInteger(row.completed)
+        || row.completed < 0
+        || row.completed > row.total
+      ) {
+        throw new TypeError("Quest log counts are invalid.");
+      }
+      summary[key] = Object.freeze({ total: row.total, completed: row.completed });
+    });
+    return Object.freeze(summary);
+  }
+
   // Mirrors Habitica's current getTaskColor thresholds. Invalid values are
   // deliberately neutral instead of falling through to the strongest color.
   function taskColorToken(value) {
@@ -181,6 +203,7 @@
       dueToday: raw.dueToday === true,
       streak: finiteNumber(raw.streak),
       date: typeof raw.date === "string" && raw.date ? raw.date : null,
+      dateCompleted: typeof raw.dateCompleted === "string" && raw.dateCompleted ? raw.dateCompleted : null,
       startDate: typeof raw.startDate === "string" && raw.startDate ? raw.startDate : null,
       repeatDays: normalizeRepeatDays(raw.repeatDays == null ? raw.repeat : raw.repeatDays),
       scheduleEditable: raw.scheduleEditable === true,
@@ -1545,6 +1568,7 @@
     normalizeHabitCounter,
     normalizeCounterFrequency,
     habitCounterSummary,
+    normalizeQuestLogSummary,
     displayText,
     setSafeText,
     normalizeRepeatDays,
