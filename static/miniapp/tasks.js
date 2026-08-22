@@ -790,7 +790,6 @@
       content.append(createElement(doc, "span", "task-row__title", task.text || "Untitled task"));
       if (task.notes) content.append(createElement(doc, "span", "task-row__notes", task.notes));
       appendCompactMetadata(doc, content, task);
-      appendHabitCounter(doc, content, task);
       return content;
     }
 
@@ -824,6 +823,7 @@
       if (task.type === "habit") {
         card.append(habitScoreEdge(doc, task, "up"));
         card.append(taskContentButton(doc, task));
+        appendHabitCounter(doc, card, task);
         card.append(habitScoreEdge(doc, task, "down"));
       } else {
         card.append(completionControl(doc, task));

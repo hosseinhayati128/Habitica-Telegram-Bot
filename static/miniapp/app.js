@@ -201,8 +201,8 @@
   function syncTelegramChrome(effectiveTheme) {
     if (!telegram) return;
     const dark = effectiveTheme === "dark";
-    const pageColor = dark ? "#15111c" : "#f5f3f8";
-    const navColor = dark ? "#211a2e" : "#ffffff";
+    const pageColor = dark ? "#0b080f" : "#e7e3ea";
+    const navColor = dark ? "#14121b" : "#f2eff4";
     try {
       if (isTelegramVersionAtLeast("6.1")) {
         telegram.setBackgroundColor?.(pageColor);
@@ -231,7 +231,7 @@
     document.documentElement.style.colorScheme = effective;
     document.querySelector('meta[name="theme-color"]')?.setAttribute(
       "content",
-      effective === "dark" ? "#15111c" : "#f5f3f8",
+      effective === "dark" ? "#0b080f" : "#e7e3ea",
     );
     updateThemeControls();
     syncTelegramChrome(effective);
@@ -757,7 +757,7 @@
       ? (state.startupState === "refreshing_day" ? "Starting New Day…" : "Recording Activity…")
       : (state.dayOutcomeUnknown
           ? "Check Day Status"
-          : (state.dayReview?.dailies?.length ? "Confirm and Start New Day" : "Start New Day"));
+          : (state.dayReview?.dailies?.length ? "Start My Day" : "Start New Day"));
     elements.dayReviewSubmit.disabled = state.daySubmitting;
     elements.dayReviewList.querySelectorAll('input[type="checkbox"]').forEach((input) => {
       input.disabled = state.daySubmitting;
@@ -1068,7 +1068,7 @@
 
   function renderPotionDialog() {
     const stats = state.potionInfo?.stats || state.profilePayload?.stats || {};
-    elements.potionDialogTitle.textContent = state.potionInfo?.name || "Health Potion";
+    elements.potionDialogTitle.textContent = `Use ${state.potionInfo?.name || "Health Potion"}?`;
     elements.potionHealth.textContent = `${displayStat(stats.hp)} / ${displayStat(stats.maxHp)}`;
     elements.potionGold.textContent = displayGold(stats.gold);
     const price = state.potionInfo?.price;
@@ -1092,7 +1092,9 @@
                   ? "Health is Full"
                   : (cannotAfford
                       ? "Not Enough Gold"
-                      : (hasPurchaseIntent ? "Buy and Use" : "Reopen to Retry")))));
+                       : (hasPurchaseIntent
+                           ? `Drink Potion${finiteNumber(price) === null ? "" : ` (${displayGold(price)} GP)`}`
+                           : "Reopen to Retry")))));
     elements.potionSubmit.disabled = state.potionLoading
       || state.potionSubmitting
       || state.potionOutcomeUnknown
@@ -1722,7 +1724,10 @@
     elements.quickAddError.hidden = true;
     elements.quickAddError.textContent = "";
     elements.quickAddTypeLabel.textContent = `New ${taskTypeLabel(type)}`;
-    elements.quickAddSubmit.textContent = `Add ${taskTypeLabel(type)}`;
+    elements.quickAddSubmit.textContent = "Scribe Task";
+    elements.quickAddForm.querySelectorAll('[name="quick-add-type"]').forEach((control) => {
+      control.checked = control.value === type;
+    });
     setQuickAddSubmitting(false);
     showDialog(elements.quickAddDialog);
     window.requestAnimationFrame(() => elements.quickAddInput.focus());
@@ -1739,7 +1744,11 @@
       elements.quickAddForm.reportValidity();
       return;
     }
+    const selectedType = elements.quickAddForm.querySelector('[name="quick-add-type"]:checked')?.value;
+    const selectedPriority = elements.quickAddForm.querySelector('[name="quick-add-priority"]:checked')?.value;
+    if (["habit", "daily", "todo"].includes(selectedType)) state.quickAddType = selectedType;
     const draft = window.HabiticaTaskUI.quickAddDefaults(state.quickAddType, elements.quickAddInput.value);
+    if (["0.1", "1", "1.5", "2"].includes(selectedPriority)) draft.priority = selectedPriority;
     const validation = window.HabiticaTaskUI.validateTaskDraft(draft);
     if (!validation.ok) {
       elements.quickAddError.textContent = Object.values(validation.errors)[0] || "Enter a task title.";
@@ -1973,6 +1982,11 @@
     const previous = state.activeTab;
     if (!initial && previous !== name) state.scrollPositions[previous] = window.scrollY;
     state.activeTab = name;
+    document.body.dataset.activeView = name;
+    const brandLabel = document.querySelector(".brand > span:last-child");
+    if (brandLabel) {
+      brandLabel.textContent = ({ home: "Habitica", habits: "Habits", dailies: "Dailies", todos: "To-Do’s" })[name] || "Habitica";
+    }
     document.querySelectorAll("[data-tab]").forEach((tab) => {
       const active = tab === target;
       tab.classList.toggle("is-active", active);
@@ -2017,6 +2031,9 @@
         event.preventDefault();
         activateTab(tabs[nextIndex].dataset.tab, { focus: true });
       });
+    });
+    document.querySelectorAll("[data-summary-tab]").forEach((control) => {
+      control.addEventListener("click", () => activateTab(control.dataset.summaryTab));
     });
     const requestedTab = window.location.hash.slice(1);
     const initialTab = ["home", "habits", "dailies", "todos"].includes(requestedTab) ? requestedTab : "home";
@@ -2076,6 +2093,13 @@
     initializeProfileCoordinator();
     initializeTaskController();
     installTaskDialogs();
+    elements.quickAddForm.querySelectorAll('[name="quick-add-type"]').forEach((control) => {
+      control.addEventListener("change", () => {
+        if (!control.checked || !["habit", "daily", "todo"].includes(control.value)) return;
+        state.quickAddType = control.value;
+        elements.quickAddTypeLabel.textContent = `New ${taskTypeLabel(control.value)}`;
+      });
+    });
     installGameplayControls();
     installTabs();
     document.querySelector(".brand")?.addEventListener("click", (event) => {
