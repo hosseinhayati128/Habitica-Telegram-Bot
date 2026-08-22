@@ -3,6 +3,8 @@
 
   const THEME_KEY = "hh_theme_mode";
   const THEME_MODES = new Set(["auto", "light", "dark"]);
+  const DISPLAY_SCALE_KEY = "hh_display_scale";
+  const DISPLAY_SCALES = new Set(["0.8", "0.9", "1", "1.1", "1.2"]);
   const API_BASE = "/miniapp/api";
   const telegram = window.Telegram?.WebApp ?? null;
   const gameplay = window.HabiticaGameplayUI ?? null;
@@ -15,6 +17,10 @@
       ? document.documentElement.dataset.themeMode
       : "auto",
     themeGeneration: 0,
+    displayScale: DISPLAY_SCALES.has(document.documentElement.dataset.displayScale)
+      ? document.documentElement.dataset.displayScale
+      : "1",
+    displayScaleGeneration: 0,
     avatarUrl: null,
     avatarRequest: null,
     avatarGeneration: 0,
@@ -118,6 +124,7 @@
     noticeRetry: document.getElementById("notice-retry"),
     themeButton: document.getElementById("theme-button"),
     themeMenu: document.getElementById("theme-menu"),
+    displayScaleValue: document.getElementById("display-scale-value"),
     taskToast: document.getElementById("task-toast"),
     editorDialog: document.getElementById("task-editor-dialog"),
     editorForm: document.getElementById("task-editor-form"),
@@ -222,8 +229,15 @@
     document.querySelectorAll("[data-theme-choice]").forEach((option) => {
       option.setAttribute("aria-checked", String(option.dataset.themeChoice === state.themeMode));
     });
-    const names = { auto: "Auto", light: "Light", dark: "Dark" };
-    elements.themeButton.setAttribute("aria-label", `Appearance: ${names[state.themeMode]}`);
+  }
+
+  function updateDisplayScaleControls() {
+    const percent = `${Math.round(Number(state.displayScale) * 100)}%`;
+    document.querySelectorAll("[data-display-scale]").forEach((option) => {
+      option.setAttribute("aria-checked", String(option.dataset.displayScale === state.displayScale));
+    });
+    elements.displayScaleValue.textContent = percent;
+    elements.themeButton.setAttribute("aria-label", `Open settings. Display size ${percent}`);
   }
 
   function applyTheme(mode, { persist = false, mirrorCloud = false } = {}) {
@@ -270,11 +284,53 @@
     }
   }
 
+  function applyDisplayScale(scale, { persist = false, mirrorCloud = false } = {}) {
+    if (!DISPLAY_SCALES.has(scale)) return;
+    state.displayScale = scale;
+    document.documentElement.dataset.displayScale = scale;
+    document.documentElement.style.setProperty("--display-scale", scale);
+    document.documentElement.style.setProperty("--minimum-layout-width", `${280 / Number(scale)}px`);
+    document.documentElement.style.zoom = scale;
+    updateDisplayScaleControls();
+    if (persist) {
+      state.displayScaleGeneration += 1;
+      try {
+        window.localStorage.setItem(DISPLAY_SCALE_KEY, scale);
+      } catch (_error) {
+        // The in-memory selection remains useful when storage is disabled.
+      }
+    }
+    if (mirrorCloud && isTelegramVersionAtLeast("6.9")) {
+      try {
+        telegram?.CloudStorage?.setItem(DISPLAY_SCALE_KEY, scale, () => {});
+      } catch (_error) {
+        // CloudStorage is best-effort and never authoritative.
+      }
+    }
+  }
+
+  function loadCloudDisplayScale() {
+    if (!isTelegramVersionAtLeast("6.9") || !telegram?.CloudStorage?.getItem) return;
+    const generationAtRequest = state.displayScaleGeneration;
+    try {
+      telegram.CloudStorage.getItem(DISPLAY_SCALE_KEY, (error, value) => {
+        if (
+          error
+          || generationAtRequest !== state.displayScaleGeneration
+          || !DISPLAY_SCALES.has(value)
+        ) return;
+        if (value !== state.displayScale) applyDisplayScale(value, { persist: true });
+      });
+    } catch (_error) {
+      // LocalStorage remains the fallback.
+    }
+  }
+
   function setThemeMenuOpen(open) {
     elements.themeMenu.hidden = !open;
     elements.themeButton.setAttribute("aria-expanded", String(open));
     if (open) {
-      elements.themeMenu.querySelector('[aria-checked="true"]')?.focus();
+      elements.themeMenu.querySelector('[data-theme-choice][aria-checked="true"]')?.focus();
     }
   }
 
@@ -2134,18 +2190,29 @@
         elements.themeButton.focus();
       });
     });
-    const themeOptions = [...document.querySelectorAll("[data-theme-choice]")];
+    document.querySelectorAll("[data-display-scale]").forEach((option) => {
+      option.addEventListener("click", () => {
+        const choice = option.dataset.displayScale;
+        if (choice !== state.displayScale) {
+          applyDisplayScale(choice, { persist: true, mirrorCloud: true });
+          haptic("selection");
+        }
+      });
+    });
+    const settingsOptions = [
+      ...document.querySelectorAll("[data-theme-choice], [data-display-scale]"),
+    ];
     elements.themeMenu.addEventListener("keydown", (event) => {
-      const index = themeOptions.indexOf(document.activeElement);
+      const index = settingsOptions.indexOf(document.activeElement);
       if (index < 0) return;
       let next = null;
-      if (event.key === "ArrowDown") next = (index + 1) % themeOptions.length;
-      if (event.key === "ArrowUp") next = (index - 1 + themeOptions.length) % themeOptions.length;
+      if (event.key === "ArrowDown" || event.key === "ArrowRight") next = (index + 1) % settingsOptions.length;
+      if (event.key === "ArrowUp" || event.key === "ArrowLeft") next = (index - 1 + settingsOptions.length) % settingsOptions.length;
       if (event.key === "Home") next = 0;
-      if (event.key === "End") next = themeOptions.length - 1;
+      if (event.key === "End") next = settingsOptions.length - 1;
       if (next === null) return;
       event.preventDefault();
-      themeOptions[next].focus();
+      settingsOptions[next].focus();
     });
     document.addEventListener("pointerdown", (event) => {
       if (!elements.themeMenu.hidden && !event.target.closest(".theme-control")) setThemeMenuOpen(false);
@@ -2163,11 +2230,14 @@
       if (state.themeMode === "auto" && !isTelegramLaunch) applyTheme("auto");
     });
     updateThemeControls();
+    updateDisplayScaleControls();
     loadCloudTheme();
+    loadCloudDisplayScale();
   }
 
   function initialize() {
     applyTheme(state.themeMode);
+    applyDisplayScale(state.displayScale);
     installThemeControls();
     initializeProfileCoordinator();
     initializeTaskController();

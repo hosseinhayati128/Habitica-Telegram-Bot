@@ -77,28 +77,45 @@
               </svg>
             </button>
             <div class="theme-control">
-              <button class="icon-button" id="theme-button" type="button" aria-label="Choose appearance" aria-expanded="false" aria-controls="theme-menu">
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9Zm0 15.7A6.7 6.7 0 0 1 9.4 5.8 9.3 9.3 0 0 0 18.2 15a6.7 6.7 0 0 1-6.2 3.7Z"/>
+              <button class="icon-button" id="theme-button" type="button" aria-label="Open settings" aria-expanded="false" aria-controls="theme-menu">
+                <svg class="settings-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="2">
+                  <path d="M4 7h10M18 7h2M4 17h2M10 17h10M14 4v6M6 14v6"/>
                 </svg>
               </button>
-              <div class="theme-menu" id="theme-menu" role="menu" aria-label="Appearance" hidden>
+              <div class="theme-menu" id="theme-menu" role="dialog" aria-label="Settings" hidden>
+                <p class="theme-menu-heading">Settings</p>
                 <p class="theme-menu-title">Appearance</p>
-                <button class="theme-option" type="button" role="menuitemradio" data-theme-choice="auto" aria-checked="true">
-                  <span class="theme-option-icon theme-option-auto" aria-hidden="true"></span>
-                  <span><strong>Auto</strong><small>Follow Telegram</small></span>
-                  <span class="theme-option-check" aria-hidden="true">✓</span>
-                </button>
-                <button class="theme-option" type="button" role="menuitemradio" data-theme-choice="light" aria-checked="false">
-                  <span class="theme-option-icon theme-option-light" aria-hidden="true"></span>
-                  <span><strong>Light</strong><small>Bright and clear</small></span>
-                  <span class="theme-option-check" aria-hidden="true">✓</span>
-                </button>
-                <button class="theme-option" type="button" role="menuitemradio" data-theme-choice="dark" aria-checked="false">
-                  <span class="theme-option-icon theme-option-dark" aria-hidden="true"></span>
-                  <span><strong>Dark</strong><small>Easy on the eyes</small></span>
-                  <span class="theme-option-check" aria-hidden="true">✓</span>
-                </button>
+                <div class="theme-choice-options" role="radiogroup" aria-label="Appearance">
+                  <button class="theme-option" type="button" role="radio" data-theme-choice="auto" aria-checked="true">
+                    <span class="theme-option-icon theme-option-auto" aria-hidden="true"></span>
+                    <span><strong>Auto</strong><small>Follow Telegram</small></span>
+                    <span class="theme-option-check" aria-hidden="true">✓</span>
+                  </button>
+                  <button class="theme-option" type="button" role="radio" data-theme-choice="light" aria-checked="false">
+                    <span class="theme-option-icon theme-option-light" aria-hidden="true"></span>
+                    <span><strong>Light</strong><small>Bright and clear</small></span>
+                    <span class="theme-option-check" aria-hidden="true">✓</span>
+                  </button>
+                  <button class="theme-option" type="button" role="radio" data-theme-choice="dark" aria-checked="false">
+                    <span class="theme-option-icon theme-option-dark" aria-hidden="true"></span>
+                    <span><strong>Dark</strong><small>Easy on the eyes</small></span>
+                    <span class="theme-option-check" aria-hidden="true">✓</span>
+                  </button>
+                </div>
+                <div class="display-size-setting">
+                  <div class="display-size-setting__heading">
+                    <span>Display size</span>
+                    <output id="display-scale-value">100%</output>
+                  </div>
+                  <p>Make the entire app smaller or larger on this device.</p>
+                  <div class="display-scale-options" role="radiogroup" aria-label="Display size">
+                    <button type="button" role="radio" data-display-scale="0.8" aria-checked="false" aria-label="80 percent display size">80%</button>
+                    <button type="button" role="radio" data-display-scale="0.9" aria-checked="false" aria-label="90 percent display size">90%</button>
+                    <button type="button" role="radio" data-display-scale="1" aria-checked="true" aria-label="100 percent display size">100%</button>
+                    <button type="button" role="radio" data-display-scale="1.1" aria-checked="false" aria-label="110 percent display size">110%</button>
+                    <button type="button" role="radio" data-display-scale="1.2" aria-checked="false" aria-label="120 percent display size">120%</button>
+                  </div>
+                </div>
               </div>
             </div>
           </div>

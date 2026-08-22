@@ -888,6 +888,28 @@ async function taskLayoutMetrics(page) {
   });
 }
 
+async function taskBottomClearance(page) {
+  await page.evaluate(() => window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "instant" }));
+  await page.waitForFunction(() => (
+    window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 2
+  ));
+  return page.evaluate(() => {
+    const rows = [...document.querySelectorAll("[data-view]:not([hidden]) .task-row")];
+    const lastRow = rows.at(-1)?.getBoundingClientRect();
+    const nav = document.querySelector(".bottom-nav")?.getBoundingClientRect();
+    const floatingTops = ["#potion-fab", "#task-fab"]
+      .map((selector) => document.querySelector(selector))
+      .filter((node) => node && !node.hidden)
+      .map((node) => node.getBoundingClientRect().top);
+    const obstructionTop = Math.min(nav?.top ?? window.innerHeight, ...floatingTops);
+    return {
+      clearance: lastRow ? obstructionTop - lastRow.bottom : null,
+      lastRowBottom: lastRow?.bottom ?? null,
+      obstructionTop,
+    };
+  });
+}
+
 function assertTaskLayout(metrics, { requireDensity = false } = {}) {
   assert(metrics.rowHeights.length > 0, "A representative task list must render.");
   assert(metrics.simpleHeights.every((height) => height >= 58 && height <= 76), `Simple rows escaped 58–76px: ${metrics.simpleHeights}`);
@@ -940,6 +962,7 @@ async function captureResponsiveViews(browser, origin, manifest, metricsLog) {
     { width: 360, view: "dailies" },
     { width: 390, view: "habits" },
     { width: 430, view: "todos" },
+    { width: 568, height: 900, view: "habits" },
     { width: 768, view: "dailies" },
   ];
   for (const theme of ["light", "dark"]) {
@@ -954,6 +977,12 @@ async function captureResponsiveViews(browser, origin, manifest, metricsLog) {
         await waitForTaskView(page);
         const metrics = await taskLayoutMetrics(page);
         assertTaskLayout(metrics, { requireDensity: configuration.width === 390 });
+        const bottomClearance = await taskBottomClearance(page);
+        assert(
+          bottomClearance.clearance >= 16,
+          `The final task has only ${bottomClearance.clearance}px clearance above floating controls.`,
+        );
+        metrics.bottomClearance = bottomClearance;
         metricsLog[label] = metrics;
         await screenshot(page, `task-${label}.png`, manifest, { state: "task-list", ...configuration, theme });
         assertClean(errors, label);
@@ -961,6 +990,86 @@ async function captureResponsiveViews(browser, origin, manifest, metricsLog) {
         await page.close();
       }
     }
+  }
+}
+
+async function captureDisplaySettings(browser, origin, manifest) {
+  const { page, errors } = await openFixture(browser, origin, {
+    width: 568,
+    height: 900,
+    theme: "dark",
+    view: "habits",
+    sid: "display-settings",
+  });
+  try {
+    await waitForTaskView(page);
+    const defaultHeight = await page.$eval(".task-row", (row) => row.getBoundingClientRect().height);
+    await page.click("#theme-button");
+    await page.waitForSelector("#theme-menu:not([hidden])");
+    await page.click('[data-display-scale="0.8"]');
+    const compact = await page.evaluate(() => ({
+      scale: document.documentElement.dataset.displayScale,
+      zoom: document.documentElement.style.zoom,
+      stored: localStorage.getItem("hh_display_scale"),
+      rowHeight: document.querySelector(".task-row")?.getBoundingClientRect().height,
+      selected: document.querySelector('[data-display-scale="0.8"]')?.getAttribute("aria-checked"),
+      output: document.querySelector("#display-scale-value")?.textContent,
+    }));
+    assert.equal(compact.scale, "0.8");
+    assert.equal(compact.zoom, "0.8");
+    assert.equal(compact.stored, "0.8");
+    assert.equal(compact.selected, "true");
+    assert.equal(compact.output, "80%");
+    assert(compact.rowHeight < defaultHeight * 0.85, "The 80% setting did not visibly compact the task rows.");
+    await screenshot(page, "state-display-settings-80-dark-568.png", manifest, {
+      state: "display-settings",
+      width: 568,
+      height: 900,
+      theme: "dark",
+      displayScale: 0.8,
+    });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForFunction(() => document.documentElement.dataset.displayScale === "0.8");
+    assert.equal(
+      await page.evaluate(() => document.documentElement.dataset.displayScale),
+      "0.8",
+      "Display size must persist across reloads.",
+    );
+    await page.evaluate(() => localStorage.setItem("hh_display_scale", "1.2"));
+    await page.setViewport({ width: 320, height: VIEWPORT_HEIGHT, deviceScaleFactor: 1 });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await waitForTaskView(page);
+    await page.click("#theme-button");
+    await page.waitForSelector("#theme-menu:not([hidden])");
+    const large = await page.evaluate(() => {
+      const menu = document.querySelector("#theme-menu")?.getBoundingClientRect();
+      return {
+        scale: document.documentElement.dataset.displayScale,
+        zoom: document.documentElement.style.zoom,
+        horizontalOverflow: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) - window.innerWidth,
+        menuLeft: menu?.left ?? -1,
+        menuRight: menu?.right ?? -1,
+      };
+    });
+    assert.equal(large.scale, "1.2");
+    assert.equal(large.zoom, "1.2");
+    assert(large.horizontalOverflow <= 1, `The 120% setting overflows by ${large.horizontalOverflow}px.`);
+    assert(
+      large.menuLeft >= 0 && large.menuRight <= 320 + 0.5,
+      `The enlarged Settings panel escapes the viewport (${large.menuLeft}–${large.menuRight}px).`,
+    );
+    const largeClearance = await taskBottomClearance(page);
+    assert(largeClearance.clearance >= 16, "The 120% setting puts the final task beneath the floating controls.");
+    await screenshot(page, "state-display-settings-120-dark-320.png", manifest, {
+      state: "display-settings",
+      width: 320,
+      theme: "dark",
+      displayScale: 1.2,
+    });
+    await page.evaluate(() => localStorage.setItem("hh_display_scale", "1"));
+    assertClean(errors, "display settings");
+  } finally {
+    await page.close();
   }
 }
 
@@ -1631,6 +1740,7 @@ async function main() {
     });
     await captureHomeViews(browser, origin, manifest, metrics);
     await captureResponsiveViews(browser, origin, manifest, metrics);
+    await captureDisplaySettings(browser, origin, manifest);
     await captureTaskVariantsAndEditors(browser, origin, manifest);
     await captureQuickAdd(browser, origin, manifest);
     await captureEditorAndDelete(browser, origin, manifest);
