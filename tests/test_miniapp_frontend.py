@@ -109,13 +109,27 @@ def test_profile_state_is_shared_without_refreshing_avatar_after_scores():
     assert "state.profilePayload" in application
     assert "renderMiniProfile" in application
     assert "scheduleProfileRefresh" in application
-    assert "onMutationConfirmed: scheduleProfileRefresh" in application
+    assert "scheduleProfileRefresh(detail)" in application
     assert "profileCoordinator?.scheduleMutationRefresh" in application
     assert "onMutationConfirmed(detail)" in tasks
     assert "profilePatch" in tasks
     score_callback = application[application.index("function scheduleProfileRefresh") :]
     score_callback = score_callback[: score_callback.index("async function ensureTaskProfileLoaded")]
     assert "loadAvatar" not in score_callback
+
+
+def test_task_scores_defer_and_coalesce_expensive_home_summary_refreshes():
+    application = (ROOT / "static" / "miniapp" / "app.js").read_text()
+
+    assert "questSummaryDirty: false" in application
+    assert "function markQuestLogDirty()" in application
+    assert "if (state.questSummaryRequest) return state.questSummaryRequest" in application
+    assert "if (!state.questSummaryLoaded || state.questSummaryDirty) void loadQuestLog()" in application
+
+    callback = application[application.index("onMutationConfirmed: (detail) =>") :]
+    callback = callback[: callback.index("onDayRefreshRequired:")]
+    assert "markQuestLogDirty()" in callback
+    assert "loadQuestLog" not in callback
 
 
 def test_collapsed_tasks_use_separate_content_and_scoring_actions():

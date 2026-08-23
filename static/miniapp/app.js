@@ -28,8 +28,9 @@
     profileMutationSequence: 0,
     profileLoaded: false,
     questSummaryLoaded: false,
+    questSummaryDirty: false,
     questSummaryRequest: null,
-    questSummaryGeneration: 0,
+    questSummaryRevision: 0,
     taskProfileStarted: false,
     homeStarted: false,
     refreshing: false,
@@ -498,26 +499,43 @@
     elements.questLogStatus.textContent = "Unavailable";
   }
 
+  function markQuestLogDirty() {
+    state.questSummaryDirty = true;
+    state.questSummaryRevision += 1;
+    if (state.questSummaryLoaded) elements.questLogStatus.textContent = "Update pending";
+  }
+
   async function loadQuestLog({ force = false } = {}) {
-    if (!force && state.questSummaryRequest) return state.questSummaryRequest;
-    if (!force && state.questSummaryLoaded) return true;
-    const generation = state.questSummaryGeneration + 1;
-    state.questSummaryGeneration = generation;
+    // A summary request expands into four Habitica task-list reads. Always
+    // share an in-flight request, including forced/manual refreshes, so rapid
+    // task mutations cannot create overlapping batches.
+    if (state.questSummaryRequest) return state.questSummaryRequest;
+    if (!force && state.questSummaryLoaded && !state.questSummaryDirty) return true;
+    const revision = state.questSummaryRevision;
     elements.questLogStatus.textContent = state.questSummaryLoaded ? "Updating" : "Loading";
     questLogRows().forEach((row) => row.setAttribute("aria-busy", "true"));
     let pending;
+    let staleDuringRequest = false;
     pending = (async () => {
       try {
         const payload = await requestJson(`${API_BASE}/task-summary?today=${encodeURIComponent(localIsoDate())}`);
         const summary = window.HabiticaTaskUI.normalizeQuestLogSummary(payload);
-        if (generation !== state.questSummaryGeneration) return state.questSummaryLoaded;
+        if (revision !== state.questSummaryRevision) {
+          staleDuringRequest = true;
+          if (state.questSummaryLoaded) elements.questLogStatus.textContent = "Update pending";
+          return state.questSummaryLoaded;
+        }
         renderQuestLog(summary);
+        state.questSummaryDirty = false;
         return true;
       } catch (_error) {
-        if (generation === state.questSummaryGeneration) renderQuestLogError();
+        if (revision === state.questSummaryRevision) renderQuestLogError();
         return false;
       } finally {
         if (state.questSummaryRequest === pending) state.questSummaryRequest = null;
+        // If data changed while Home was already loading, perform one trailing
+        // refresh after the current batch instead of overlapping it.
+        if (staleDuringRequest && state.activeTab === "home") void loadQuestLog();
       }
     })();
     state.questSummaryRequest = pending;
@@ -816,12 +834,12 @@
 
   function ensureHomeLoaded() {
     if (state.homeStarted) {
-      if (!state.questSummaryLoaded) void loadQuestLog();
+      if (!state.questSummaryLoaded || state.questSummaryDirty) void loadQuestLog();
       return;
     }
     if (state.profileLoaded) {
       state.homeStarted = true;
-      if (!state.questSummaryLoaded) void loadQuestLog();
+      if (!state.questSummaryLoaded || state.questSummaryDirty) void loadQuestLog();
       if (!state.avatarUrl) void loadAvatar(false);
       return;
     }
@@ -2077,7 +2095,9 @@
       haptic,
       onMutationConfirmed: (detail) => {
         scheduleProfileRefresh(detail);
-        void loadQuestLog({ force: true });
+        // Task pages already hold the confirmed mutation. Defer the expensive
+        // four-list Home summary until Home is opened or explicitly refreshed.
+        markQuestLogDirty();
       },
       onDayRefreshRequired: requireDayReview,
       apiBase: API_BASE,
