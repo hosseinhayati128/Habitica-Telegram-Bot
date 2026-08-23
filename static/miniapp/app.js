@@ -666,6 +666,9 @@
   }
 
   function mutationProfilePatch(payload) {
+    if (payload?.profilePatch && typeof payload.profilePatch === "object") {
+      return payload.profilePatch;
+    }
     const envelope = gameplay?.profileEnvelope?.(payload);
     if (!envelope) return null;
     return {
@@ -765,12 +768,17 @@
     }
   }
 
-  function scheduleProfileRefresh(detail = {}) {
-    if (!profileCoordinator) initializeProfileCoordinator();
+  function applyConfirmedProfilePatch(detail = {}) {
     const sequence = Number.isInteger(detail.sequence) ? detail.sequence : 0;
     const isNewest = sequence >= state.profileMutationSequence;
-    if (isNewest) state.profileMutationSequence = sequence;
-    profileCoordinator?.scheduleMutationRefresh(isNewest ? detail.profilePatch || null : null);
+    if (!isNewest) return false;
+    state.profileMutationSequence = sequence;
+    const patch = detail.profilePatch;
+    if (!patch || typeof patch !== "object" || Object.keys(patch).length === 0) {
+      showProfileRefreshWarning();
+      return false;
+    }
+    return applyProfilePatch(patch);
   }
 
   async function ensureTaskProfileLoaded() {
@@ -1321,16 +1329,13 @@
         body: { purchaseIntent: state.potionPurchaseIntent },
       });
       const patch = mutationProfilePatch(payload);
-      // The server has confirmed this intent terminal even when Habitica's
-      // follow-up stats are unusable. Never turn that confirmed purchase into
-      // a retryable/unknown action; synchronize once through the safe GET.
+      // A successful Habitica response confirms the mutation and carries the
+      // new character statistics. Do not spend another request re-reading /me.
       state.potionPurchaseIntent = null;
-      if (patch && state.profilePayload && profileCoordinator) {
-        profileCoordinator.scheduleMutationRefresh(patch);
-      } else if (patch && state.profilePayload) {
+      if (patch && Object.keys(patch).length > 0 && state.profilePayload) {
         applyProfilePatch(patch);
       } else {
-        await loadProfile();
+        showProfileRefreshWarning();
       }
       state.potionSubmitting = false;
       closeDialog(elements.potionDialog);
@@ -2094,7 +2099,8 @@
       announce,
       haptic,
       onMutationConfirmed: (detail) => {
-        scheduleProfileRefresh(detail);
+        if (detail.kind === "checklist") return;
+        applyConfirmedProfilePatch(detail);
         // Task pages already hold the confirmed mutation. Defer the expensive
         // four-list Home summary until Home is opened or explicitly refreshed.
         markQuestLogDirty();
@@ -2163,7 +2169,7 @@
       const type = { habits: "habit", dailies: "daily", todos: "todo" }[name];
       elements.taskFab.dataset.taskType = type;
       elements.taskFab.setAttribute("aria-label", `Quick add ${taskTypeLabel(type)}`);
-      void taskController?.activate(name);
+      void taskController?.activate(name, { refresh: !initial && previous !== name });
       void ensureTaskProfileLoaded();
     }
     if (!initial && previous !== name) {

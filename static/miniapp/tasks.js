@@ -1443,11 +1443,11 @@
       return load(type);
     }
 
-    async function activate(view) {
+    async function activate(view, activateOptions = {}) {
       const type = canonicalType(view);
       state.activeView = type ? TYPE_TO_VIEW[type] : view;
       if (!type) return false;
-      return load(type);
+      return load(type, { force: activateOptions.refresh === true });
     }
 
     async function refresh(view) {

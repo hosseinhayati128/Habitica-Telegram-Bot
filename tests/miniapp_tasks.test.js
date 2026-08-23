@@ -248,7 +248,7 @@ test("setSafeText assigns literal untrusted task content without touching innerH
   assert.equal(globalThis.pwned, undefined);
 });
 
-test("controller lazy-loads each collection once and refreshes only the requested type", async () => {
+test("controller lazy-loads collections and can refresh one when its tab is reopened", async () => {
   const calls = [];
   const controller = tasks.createTaskController({
     root: null,
@@ -262,11 +262,13 @@ test("controller lazy-loads each collection once and refreshes only the requeste
   await controller.activate("habits");
   await controller.activate("habits");
   await controller.activate("dailies");
+  await controller.activate("habits", { refresh: true });
   await controller.refresh("habits");
 
   assert.deepEqual(calls.map((call) => call.path), [
     "/miniapp/api/tasks?type=habit",
     "/miniapp/api/tasks?type=daily",
+    "/miniapp/api/tasks?type=habit",
     "/miniapp/api/tasks?type=habit",
   ]);
   assert.ok(calls.every((call) => call.options.method === "GET"));
