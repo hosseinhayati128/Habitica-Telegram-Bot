@@ -19,6 +19,7 @@ function task(overrides = {}) {
     dueToday: false,
     streak: 0,
     date: null,
+    dateCompleted: null,
     startDate: null,
     repeatDays: [],
     scheduleEditable: false,
@@ -26,6 +27,29 @@ function task(overrides = {}) {
     ...overrides,
   };
 }
+
+test("normalizeQuestLogSummary accepts bounded counts and rejects malformed data", () => {
+  const payload = {
+    ok: true,
+    summary: {
+      habits: { total: 4, completed: 3 },
+      dailies: { total: 2, completed: 1 },
+      todos: { total: 0, completed: 0 },
+    },
+  };
+  assert.deepEqual(tasks.normalizeQuestLogSummary(payload), payload.summary);
+  assert.throws(
+    () => tasks.normalizeQuestLogSummary({
+      ...payload,
+      summary: { ...payload.summary, habits: { total: 1, completed: 2 } },
+    }),
+    /invalid/i,
+  );
+  assert.throws(
+    () => tasks.normalizeQuestLogSummary({ ...payload, summary: { habits: payload.summary.habits } }),
+    /invalid|incomplete/i,
+  );
+});
 
 test("dedupeTasks preserves first position and applies final normalized value", () => {
   const result = tasks.dedupeTasks([

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 
 from miniapp_tasks import (
@@ -11,6 +13,7 @@ from miniapp_tasks import (
     normalize_task,
     normalize_tasks,
     optimistic_scored_task,
+    quest_log_summary,
     task_color_token,
     upstream_list_type,
     validate_task_payload,
@@ -336,6 +339,33 @@ def test_normalize_tasks_rejects_malformed_collection_and_deduplicates():
     first = raw_task()
     assert normalize_tasks([first, dict(first)]) == [normalize_task(first)]
     assert normalize_tasks([first, {"bad": "shape"}]) is None
+
+
+def test_quest_log_summary_uses_current_activity_due_dailies_and_local_todo_date():
+    summary = quest_log_summary(
+        [
+            {"type": "habit", "counterUp": 2, "counterDown": 0},
+            {"type": "habit", "counterUp": 0, "counterDown": 0},
+            {"type": "habit", "counterUp": 0, "counterDown": 1},
+        ],
+        [
+            {"type": "daily", "dueToday": True, "completed": True},
+            {"type": "daily", "dueToday": True, "completed": False},
+            {"type": "daily", "dueToday": False, "completed": True},
+        ],
+        [{"type": "todo", "completed": False}],
+        [
+            {"type": "todo", "completed": True, "dateCompleted": "2026-08-22"},
+            {"type": "todo", "completed": True, "dateCompleted": "2026-08-21"},
+        ],
+        today=date(2026, 8, 22),
+    )
+
+    assert summary == {
+        "habits": {"total": 3, "completed": 2},
+        "dailies": {"total": 2, "completed": 1},
+        "todos": {"total": 2, "completed": 1},
+    }
 
 
 def test_checklist_diff_rejects_unknown_ids_and_is_deterministic():

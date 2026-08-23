@@ -521,6 +521,25 @@ async function handleApi(request, response, url, session) {
     return;
   }
 
+  if (url.pathname === "/miniapp/api/task-summary" && request.method === "GET") {
+    const habits = session.tasks.filter((task) => task.type === "habit");
+    const dailies = session.tasks.filter((task) => task.type === "daily" && task.dueToday);
+    const openTodos = session.tasks.filter((task) => task.type === "todo" && !task.completed);
+    const completedTodos = session.tasks.filter((task) => task.type === "todo" && task.completed);
+    sendJson(response, 200, {
+      ok: true,
+      summary: {
+        habits: {
+          total: habits.length,
+          completed: habits.filter((task) => task.counterUp > 0 || task.counterDown > 0).length,
+        },
+        dailies: { total: dailies.length, completed: dailies.filter((task) => task.completed).length },
+        todos: { total: openTodos.length + completedTodos.length, completed: completedTodos.length },
+      },
+    });
+    return;
+  }
+
   if (url.pathname === "/miniapp/api/tasks" && request.method === "GET") {
     session.taskListRequests += 1;
     if (session.scenario === "loading") await delay(1800);
@@ -661,12 +680,29 @@ async function fixtureHandler(request, response) {
 
     if (url.pathname.startsWith("/static/miniapp/")) {
       const fileName = path.basename(url.pathname);
-      if (!["theme-init.js", "app.css", "gameplay.js", "tasks.js", "app.js"].includes(fileName)) {
+      const applicationFiles = ["theme-init.js", "app.css", "gameplay.js", "tasks.js", "app.js"];
+      const fontFiles = [
+        "InstrumentSerif-Regular.ttf",
+        "Geist-Regular.woff2",
+        "Geist-Medium.woff2",
+        "Geist-SemiBold.woff2",
+        "Geist-Bold.woff2",
+      ];
+      if (!applicationFiles.includes(fileName) && !fontFiles.includes(fileName)) {
         sendJson(response, 404, { ok: false });
         return;
       }
-      const body = await fs.promises.readFile(path.join(STATIC_ROOT, fileName));
-      const contentType = fileName.endsWith(".css") ? "text/css; charset=utf-8" : "text/javascript; charset=utf-8";
+      const filePath = fontFiles.includes(fileName)
+        ? path.join(STATIC_ROOT, "fonts", fileName)
+        : path.join(STATIC_ROOT, fileName);
+      const body = await fs.promises.readFile(filePath);
+      const contentType = fileName.endsWith(".css")
+        ? "text/css; charset=utf-8"
+        : fileName.endsWith(".woff2")
+          ? "font/woff2"
+          : fileName.endsWith(".ttf")
+            ? "font/ttf"
+            : "text/javascript; charset=utf-8";
       sendBytes(response, 200, contentType, body);
       return;
     }
@@ -705,7 +741,16 @@ function findExecutable() {
   } catch (_error) {
     // Continue through the ordinary system browser candidates.
   }
-  return ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"]
+  const programFiles = String(process.env.ProgramFiles || process.env.PROGRAMFILES || "").trim();
+  const localAppData = String(process.env.LOCALAPPDATA || "").trim();
+  return [
+    programFiles && path.join(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
+    localAppData && path.join(localAppData, "Google", "Chrome", "Application", "chrome.exe"),
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+  ]
+    .filter(Boolean)
     .find((candidate) => fs.existsSync(candidate));
 }
 
@@ -742,6 +787,48 @@ async function waitForTaskView(page) {
   await page.waitForFunction(() => document.querySelector(".task-row__content")?.getBoundingClientRect().height >= 58);
 }
 
+async function captureHomeViews(browser, origin, manifest, metricsLog) {
+  const configurations = [
+    { width: 320, theme: "light" },
+    { width: 390, theme: "dark" },
+  ];
+  for (const configuration of configurations) {
+    const label = `home-${configuration.width}-${configuration.theme}`;
+    const { page, errors } = await openFixture(browser, origin, {
+      ...configuration,
+      view: "home",
+      sid: `responsive-${label}`,
+    });
+    try {
+      await page.waitForFunction(() => document.querySelector("#profile-card")?.getAttribute("aria-busy") === "false");
+      const homeMetrics = await page.evaluate(() => {
+        const profile = document.querySelector("#profile-card")?.getBoundingClientRect();
+        const stats = document.querySelector(".stats-list")?.getBoundingClientRect();
+        const quest = document.querySelector(".quest-log")?.getBoundingClientRect();
+        return {
+          horizontalOverflow: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) - window.innerWidth,
+          profileLeft: profile?.left ?? -1,
+          profileRight: profile?.right ?? -1,
+          statsHeight: stats?.height ?? 0,
+          questHeight: quest?.height ?? 0,
+        };
+      });
+      assert(homeMetrics.horizontalOverflow <= 1, `Home overflows horizontally by ${homeMetrics.horizontalOverflow}px.`);
+      assert(homeMetrics.profileLeft >= 0 && homeMetrics.profileRight <= configuration.width + 0.5, "Home profile escapes the viewport.");
+      assert(homeMetrics.statsHeight >= 128, `Home stats collapsed to ${homeMetrics.statsHeight}px.`);
+      assert(homeMetrics.questHeight >= 180, `Quest log collapsed to ${homeMetrics.questHeight}px.`);
+      metricsLog[label] = homeMetrics;
+      await screenshot(page, `home-${configuration.width}-${configuration.theme}.png`, manifest, {
+        state: "home",
+        ...configuration,
+      });
+      assertClean(errors, label);
+    } finally {
+      await page.close();
+    }
+  }
+}
+
 async function taskLayoutMetrics(page) {
   return page.evaluate(() => {
     const rows = [...document.querySelectorAll(".task-row")];
@@ -760,6 +847,19 @@ async function taskLayoutMetrics(page) {
     const navRect = nav?.getBoundingClientRect();
     const potionRect = potion && !potion.hidden ? potion.getBoundingClientRect() : null;
     const addRect = add && !add.hidden ? add.getBoundingClientRect() : null;
+    const counterPlacements = [...document.querySelectorAll(".task-row__counter")].map((counter) => {
+      const row = counter.closest(".task-row");
+      const trailingAction = row?.querySelector(".task-row__edge--negative");
+      const counterRect = counter.getBoundingClientRect();
+      const rowRect = row?.getBoundingClientRect();
+      const trailingRect = trailingAction?.getBoundingClientRect();
+      return {
+        parentIsRow: counter.parentElement === row,
+        rightGap: trailingRect ? trailingRect.left - counterRect.right : null,
+        counterCenter: counterRect.left + counterRect.width / 2,
+        rowCenter: rowRect ? rowRect.left + rowRect.width / 2 : null,
+      };
+    });
     return {
       rowHeights: rows.map((row) => row.getBoundingClientRect().height),
       simpleHeights: simpleRows.map((row) => row.getBoundingClientRect().height),
@@ -780,9 +880,32 @@ async function taskLayoutMetrics(page) {
       navTop: navRect?.top || null,
       potionVisible: Boolean(potionRect && potionRect.width > 0),
       addVisible: Boolean(addRect && addRect.width > 0),
+      counterPlacements,
       floatingOverlap: potionRect && addRect
         ? !(potionRect.right <= addRect.left || addRect.right <= potionRect.left || potionRect.bottom <= addRect.top || addRect.bottom <= potionRect.top)
         : false,
+    };
+  });
+}
+
+async function taskBottomClearance(page) {
+  await page.evaluate(() => window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "instant" }));
+  await page.waitForFunction(() => (
+    window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 2
+  ));
+  return page.evaluate(() => {
+    const rows = [...document.querySelectorAll("[data-view]:not([hidden]) .task-row")];
+    const lastRow = rows.at(-1)?.getBoundingClientRect();
+    const nav = document.querySelector(".bottom-nav")?.getBoundingClientRect();
+    const floatingTops = ["#potion-fab", "#task-fab"]
+      .map((selector) => document.querySelector(selector))
+      .filter((node) => node && !node.hidden)
+      .map((node) => node.getBoundingClientRect().top);
+    const obstructionTop = Math.min(nav?.top ?? window.innerHeight, ...floatingTops);
+    return {
+      clearance: lastRow ? obstructionTop - lastRow.bottom : null,
+      lastRowBottom: lastRow?.bottom ?? null,
+      obstructionTop,
     };
   });
 }
@@ -792,12 +915,20 @@ function assertTaskLayout(metrics, { requireDensity = false } = {}) {
   assert(metrics.simpleHeights.every((height) => height >= 58 && height <= 76), `Simple rows escaped 58–76px: ${metrics.simpleHeights}`);
   assert(metrics.noteHeights.every((height) => height >= 58 && height <= 92), `Rows with notes exceeded 92px: ${metrics.noteHeights}`);
   assert(metrics.actionSizes.every(({ width, height }) => width >= 44 && height >= 44), `Task actions are smaller than 44px: ${JSON.stringify(metrics.actionSizes)}`);
-  assert(metrics.miniHeight >= 64 && metrics.miniHeight <= 82, `Mini profile is ${metrics.miniHeight}px, outside 64–82px.`);
+  assert(metrics.miniHeight >= 104 && metrics.miniHeight <= 122, `Mini profile is ${metrics.miniHeight}px, outside 104–122px.`);
   assert(metrics.miniToolbarGap === null || metrics.miniToolbarGap >= -0.5, `Mini profile overlaps the task toolbar by ${-metrics.miniToolbarGap}px.`);
   assert(metrics.horizontalOverflow <= 1, `Page overflows horizontally by ${metrics.horizontalOverflow}px.`);
   assert.equal(metrics.potionVisible, true, "The Potion action must remain visible on task pages.");
   assert.equal(metrics.addVisible, true, "The Add action must remain visible on task pages.");
   assert.equal(metrics.floatingOverlap, false, "Potion and Add actions must not overlap.");
+  assert(metrics.counterPlacements.every(({ parentIsRow, rightGap, counterCenter, rowCenter }) => (
+    parentIsRow
+    && rightGap !== null
+    && rightGap >= 0
+    && rightGap <= 12
+    && rowCenter !== null
+    && counterCenter > rowCenter
+  )), `Habit counters are not aligned at the row's trailing edge: ${JSON.stringify(metrics.counterPlacements)}`);
   if (requireDensity) assert(metrics.visibleRows >= 5, `Only ${metrics.visibleRows} task rows are fully visible at 390px.`);
 }
 
@@ -831,6 +962,7 @@ async function captureResponsiveViews(browser, origin, manifest, metricsLog) {
     { width: 360, view: "dailies" },
     { width: 390, view: "habits" },
     { width: 430, view: "todos" },
+    { width: 568, height: 900, view: "habits" },
     { width: 768, view: "dailies" },
   ];
   for (const theme of ["light", "dark"]) {
@@ -845,6 +977,12 @@ async function captureResponsiveViews(browser, origin, manifest, metricsLog) {
         await waitForTaskView(page);
         const metrics = await taskLayoutMetrics(page);
         assertTaskLayout(metrics, { requireDensity: configuration.width === 390 });
+        const bottomClearance = await taskBottomClearance(page);
+        assert(
+          bottomClearance.clearance >= 16,
+          `The final task has only ${bottomClearance.clearance}px clearance above floating controls.`,
+        );
+        metrics.bottomClearance = bottomClearance;
         metricsLog[label] = metrics;
         await screenshot(page, `task-${label}.png`, manifest, { state: "task-list", ...configuration, theme });
         assertClean(errors, label);
@@ -852,6 +990,86 @@ async function captureResponsiveViews(browser, origin, manifest, metricsLog) {
         await page.close();
       }
     }
+  }
+}
+
+async function captureDisplaySettings(browser, origin, manifest) {
+  const { page, errors } = await openFixture(browser, origin, {
+    width: 568,
+    height: 900,
+    theme: "dark",
+    view: "habits",
+    sid: "display-settings",
+  });
+  try {
+    await waitForTaskView(page);
+    const defaultHeight = await page.$eval(".task-row", (row) => row.getBoundingClientRect().height);
+    await page.click("#theme-button");
+    await page.waitForSelector("#theme-menu:not([hidden])");
+    await page.click('[data-display-scale="0.8"]');
+    const compact = await page.evaluate(() => ({
+      scale: document.documentElement.dataset.displayScale,
+      zoom: document.documentElement.style.zoom,
+      stored: localStorage.getItem("hh_display_scale"),
+      rowHeight: document.querySelector(".task-row")?.getBoundingClientRect().height,
+      selected: document.querySelector('[data-display-scale="0.8"]')?.getAttribute("aria-checked"),
+      output: document.querySelector("#display-scale-value")?.textContent,
+    }));
+    assert.equal(compact.scale, "0.8");
+    assert.equal(compact.zoom, "0.8");
+    assert.equal(compact.stored, "0.8");
+    assert.equal(compact.selected, "true");
+    assert.equal(compact.output, "80%");
+    assert(compact.rowHeight < defaultHeight * 0.85, "The 80% setting did not visibly compact the task rows.");
+    await screenshot(page, "state-display-settings-80-dark-568.png", manifest, {
+      state: "display-settings",
+      width: 568,
+      height: 900,
+      theme: "dark",
+      displayScale: 0.8,
+    });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForFunction(() => document.documentElement.dataset.displayScale === "0.8");
+    assert.equal(
+      await page.evaluate(() => document.documentElement.dataset.displayScale),
+      "0.8",
+      "Display size must persist across reloads.",
+    );
+    await page.evaluate(() => localStorage.setItem("hh_display_scale", "1.2"));
+    await page.setViewport({ width: 320, height: VIEWPORT_HEIGHT, deviceScaleFactor: 1 });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await waitForTaskView(page);
+    await page.click("#theme-button");
+    await page.waitForSelector("#theme-menu:not([hidden])");
+    const large = await page.evaluate(() => {
+      const menu = document.querySelector("#theme-menu")?.getBoundingClientRect();
+      return {
+        scale: document.documentElement.dataset.displayScale,
+        zoom: document.documentElement.style.zoom,
+        horizontalOverflow: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) - window.innerWidth,
+        menuLeft: menu?.left ?? -1,
+        menuRight: menu?.right ?? -1,
+      };
+    });
+    assert.equal(large.scale, "1.2");
+    assert.equal(large.zoom, "1.2");
+    assert(large.horizontalOverflow <= 1, `The 120% setting overflows by ${large.horizontalOverflow}px.`);
+    assert(
+      large.menuLeft >= 0 && large.menuRight <= 320 + 0.5,
+      `The enlarged Settings panel escapes the viewport (${large.menuLeft}–${large.menuRight}px).`,
+    );
+    const largeClearance = await taskBottomClearance(page);
+    assert(largeClearance.clearance >= 16, "The 120% setting puts the final task beneath the floating controls.");
+    await screenshot(page, "state-display-settings-120-dark-320.png", manifest, {
+      state: "display-settings",
+      width: 320,
+      theme: "dark",
+      displayScale: 1.2,
+    });
+    await page.evaluate(() => localStorage.setItem("hh_display_scale", "1"));
+    assertClean(errors, "display settings");
+  } finally {
+    await page.close();
   }
 }
 
@@ -1207,7 +1425,7 @@ async function capturePotionAndCounters(browser, origin, manifest) {
     await taskPage.page.click("#potion-submit");
     await taskPage.page.waitForFunction(() => !document.querySelector("#potion-dialog")?.hasAttribute("open"));
     await taskPage.page.waitForFunction(() => (
-      document.querySelector("#mini-health-value")?.textContent === "50 / 50"
+      document.querySelector("#mini-health-value")?.textContent === "50/50"
       && document.querySelector("#mini-gold")?.textContent.replace(/\D/g, "") === "3822"
     ));
     assert.equal(session.potionPosts, 1, "Potion confirmation must send one POST.");
@@ -1520,7 +1738,9 @@ async function main() {
       headless: "shell",
       args: ["--no-sandbox", "--disable-setuid-sandbox", "--hide-scrollbars"],
     });
+    await captureHomeViews(browser, origin, manifest, metrics);
     await captureResponsiveViews(browser, origin, manifest, metrics);
+    await captureDisplaySettings(browser, origin, manifest);
     await captureTaskVariantsAndEditors(browser, origin, manifest);
     await captureQuickAdd(browser, origin, manifest);
     await captureEditorAndDelete(browser, origin, manifest);

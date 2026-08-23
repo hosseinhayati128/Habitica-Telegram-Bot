@@ -14,6 +14,7 @@ import time
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import date
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,7 @@ from miniapp_tasks import (
     normalize_task,
     normalize_tasks,
     optimistic_scored_task,
+    quest_log_summary,
     upstream_list_type,
     validate_task_id,
     validate_task_payload,
@@ -1376,6 +1378,56 @@ def miniapp_tasks_list():
             HTTPStatus.BAD_GATEWAY,
         )
     return _private_json({"ok": True, "tasks": tasks}, HTTPStatus.OK)
+
+
+@miniapp_blueprint.get("/api/task-summary")
+def miniapp_task_summary():
+    account, error_response = _authenticated_account()
+    if error_response is not None:
+        return error_response
+    assert account is not None
+
+    today_raw = request.args.get("today")
+    try:
+        local_today = date.fromisoformat(today_raw) if isinstance(today_raw, str) else None
+    except ValueError:
+        local_today = None
+    if local_today is None or local_today.isoformat() != today_raw:
+        return _error(
+            "invalid_request",
+            "The local date is invalid.",
+            HTTPStatus.BAD_REQUEST,
+        )
+
+    from Habitica_API import get_tasks_result
+
+    normalized: dict[str, list[dict[str, Any]]] = {}
+    for key, list_type in (
+        ("habits", "habits"),
+        ("dailies", "dailys"),
+        ("active_todos", "todos"),
+        ("completed_todos", "completedTodos"),
+    ):
+        result = get_tasks_result(*_task_account_args(account), list_type, history=False)
+        if not result.ok:
+            return _habitica_error_response(result)
+        tasks = normalize_tasks(result.data)
+        if tasks is None:
+            return _error(
+                "habitica_unavailable",
+                "Habitica returned an unexpected task list.",
+                HTTPStatus.BAD_GATEWAY,
+            )
+        normalized[key] = tasks
+
+    summary = quest_log_summary(
+        normalized["habits"],
+        normalized["dailies"],
+        normalized["active_todos"],
+        normalized["completed_todos"],
+        today=local_today,
+    )
+    return _private_json({"ok": True, "summary": summary}, HTTPStatus.OK)
 
 
 @miniapp_blueprint.post("/api/tasks")

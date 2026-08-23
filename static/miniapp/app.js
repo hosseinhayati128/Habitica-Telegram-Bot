@@ -3,6 +3,8 @@
 
   const THEME_KEY = "hh_theme_mode";
   const THEME_MODES = new Set(["auto", "light", "dark"]);
+  const DISPLAY_SCALE_KEY = "hh_display_scale";
+  const DISPLAY_SCALES = new Set(["0.8", "0.9", "1", "1.1", "1.2"]);
   const API_BASE = "/miniapp/api";
   const telegram = window.Telegram?.WebApp ?? null;
   const gameplay = window.HabiticaGameplayUI ?? null;
@@ -15,12 +17,19 @@
       ? document.documentElement.dataset.themeMode
       : "auto",
     themeGeneration: 0,
+    displayScale: DISPLAY_SCALES.has(document.documentElement.dataset.displayScale)
+      ? document.documentElement.dataset.displayScale
+      : "1",
+    displayScaleGeneration: 0,
     avatarUrl: null,
     avatarRequest: null,
     avatarGeneration: 0,
     profilePayload: null,
     profileMutationSequence: 0,
     profileLoaded: false,
+    questSummaryLoaded: false,
+    questSummaryRequest: null,
+    questSummaryGeneration: 0,
     taskProfileStarted: false,
     homeStarted: false,
     refreshing: false,
@@ -98,6 +107,7 @@
     goldValue: document.getElementById("gold-value"),
     avatarImage: document.getElementById("avatar-image"),
     avatarPlaceholder: document.getElementById("avatar-placeholder"),
+    questLogStatus: document.getElementById("quest-log-status"),
     miniProfile: document.getElementById("mini-profile"),
     miniProfileRetry: document.getElementById("mini-profile-retry"),
     miniAvatarImage: document.getElementById("mini-avatar-image"),
@@ -114,6 +124,7 @@
     noticeRetry: document.getElementById("notice-retry"),
     themeButton: document.getElementById("theme-button"),
     themeMenu: document.getElementById("theme-menu"),
+    displayScaleValue: document.getElementById("display-scale-value"),
     taskToast: document.getElementById("task-toast"),
     editorDialog: document.getElementById("task-editor-dialog"),
     editorForm: document.getElementById("task-editor-form"),
@@ -201,8 +212,8 @@
   function syncTelegramChrome(effectiveTheme) {
     if (!telegram) return;
     const dark = effectiveTheme === "dark";
-    const pageColor = dark ? "#15111c" : "#f5f3f8";
-    const navColor = dark ? "#211a2e" : "#ffffff";
+    const pageColor = dark ? "#0b080f" : "#e7e3ea";
+    const navColor = dark ? "#14121b" : "#f2eff4";
     try {
       if (isTelegramVersionAtLeast("6.1")) {
         telegram.setBackgroundColor?.(pageColor);
@@ -218,8 +229,15 @@
     document.querySelectorAll("[data-theme-choice]").forEach((option) => {
       option.setAttribute("aria-checked", String(option.dataset.themeChoice === state.themeMode));
     });
-    const names = { auto: "Auto", light: "Light", dark: "Dark" };
-    elements.themeButton.setAttribute("aria-label", `Appearance: ${names[state.themeMode]}`);
+  }
+
+  function updateDisplayScaleControls() {
+    const percent = `${Math.round(Number(state.displayScale) * 100)}%`;
+    document.querySelectorAll("[data-display-scale]").forEach((option) => {
+      option.setAttribute("aria-checked", String(option.dataset.displayScale === state.displayScale));
+    });
+    elements.displayScaleValue.textContent = percent;
+    elements.themeButton.setAttribute("aria-label", `Open settings. Display size ${percent}`);
   }
 
   function applyTheme(mode, { persist = false, mirrorCloud = false } = {}) {
@@ -231,7 +249,7 @@
     document.documentElement.style.colorScheme = effective;
     document.querySelector('meta[name="theme-color"]')?.setAttribute(
       "content",
-      effective === "dark" ? "#15111c" : "#f5f3f8",
+      effective === "dark" ? "#0b080f" : "#e7e3ea",
     );
     updateThemeControls();
     syncTelegramChrome(effective);
@@ -266,11 +284,53 @@
     }
   }
 
+  function applyDisplayScale(scale, { persist = false, mirrorCloud = false } = {}) {
+    if (!DISPLAY_SCALES.has(scale)) return;
+    state.displayScale = scale;
+    document.documentElement.dataset.displayScale = scale;
+    document.documentElement.style.setProperty("--display-scale", scale);
+    document.documentElement.style.setProperty("--minimum-layout-width", `${280 / Number(scale)}px`);
+    document.documentElement.style.zoom = scale;
+    updateDisplayScaleControls();
+    if (persist) {
+      state.displayScaleGeneration += 1;
+      try {
+        window.localStorage.setItem(DISPLAY_SCALE_KEY, scale);
+      } catch (_error) {
+        // The in-memory selection remains useful when storage is disabled.
+      }
+    }
+    if (mirrorCloud && isTelegramVersionAtLeast("6.9")) {
+      try {
+        telegram?.CloudStorage?.setItem(DISPLAY_SCALE_KEY, scale, () => {});
+      } catch (_error) {
+        // CloudStorage is best-effort and never authoritative.
+      }
+    }
+  }
+
+  function loadCloudDisplayScale() {
+    if (!isTelegramVersionAtLeast("6.9") || !telegram?.CloudStorage?.getItem) return;
+    const generationAtRequest = state.displayScaleGeneration;
+    try {
+      telegram.CloudStorage.getItem(DISPLAY_SCALE_KEY, (error, value) => {
+        if (
+          error
+          || generationAtRequest !== state.displayScaleGeneration
+          || !DISPLAY_SCALES.has(value)
+        ) return;
+        if (value !== state.displayScale) applyDisplayScale(value, { persist: true });
+      });
+    } catch (_error) {
+      // LocalStorage remains the fallback.
+    }
+  }
+
   function setThemeMenuOpen(open) {
     elements.themeMenu.hidden = !open;
     elements.themeButton.setAttribute("aria-expanded", String(open));
     if (open) {
-      elements.themeMenu.querySelector('[aria-checked="true"]')?.focus();
+      elements.themeMenu.querySelector('[data-theme-choice][aria-checked="true"]')?.focus();
     }
   }
 
@@ -398,6 +458,72 @@
     return new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(number);
   }
 
+  function localIsoDate(value = new Date()) {
+    const pad = (part) => String(part).padStart(2, "0");
+    return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`;
+  }
+
+  function questLogRows() {
+    return [...document.querySelectorAll("[data-summary-tab]")];
+  }
+
+  function renderQuestLog(summary) {
+    const copy = {
+      habits: { noun: "Habits", verb: "scored" },
+      dailies: { noun: "Dailies", verb: "completed" },
+      todos: { noun: "To-Dos", verb: "completed" },
+    };
+    questLogRows().forEach((row) => {
+      const key = row.dataset.summaryTab;
+      const values = summary[key];
+      const labels = copy[key];
+      if (!values || !labels) return;
+      row.querySelector("[data-summary-total]").textContent = String(values.total);
+      row.querySelector("[data-summary-progress]").textContent = `${values.completed} / ${values.total} ${labels.verb}`;
+      row.style.setProperty("--quest-progress", `${progressPercent(values.completed, values.total)}%`);
+      row.setAttribute("aria-busy", "false");
+      row.setAttribute("aria-label", `${values.completed} of ${values.total} ${labels.noun} ${labels.verb}`);
+    });
+    elements.questLogStatus.textContent = "Live";
+    state.questSummaryLoaded = true;
+  }
+
+  function renderQuestLogError() {
+    questLogRows().forEach((row) => {
+      row.querySelector("[data-summary-total]").textContent = "—";
+      row.querySelector("[data-summary-progress]").textContent = "Refresh to retry";
+      row.style.setProperty("--quest-progress", "0%");
+      row.setAttribute("aria-busy", "false");
+    });
+    elements.questLogStatus.textContent = "Unavailable";
+  }
+
+  async function loadQuestLog({ force = false } = {}) {
+    if (!force && state.questSummaryRequest) return state.questSummaryRequest;
+    if (!force && state.questSummaryLoaded) return true;
+    const generation = state.questSummaryGeneration + 1;
+    state.questSummaryGeneration = generation;
+    elements.questLogStatus.textContent = state.questSummaryLoaded ? "Updating" : "Loading";
+    questLogRows().forEach((row) => row.setAttribute("aria-busy", "true"));
+    let pending;
+    pending = (async () => {
+      try {
+        const payload = await requestJson(`${API_BASE}/task-summary?today=${encodeURIComponent(localIsoDate())}`);
+        const summary = window.HabiticaTaskUI.normalizeQuestLogSummary(payload);
+        if (generation !== state.questSummaryGeneration) return state.questSummaryLoaded;
+        renderQuestLog(summary);
+        return true;
+      } catch (_error) {
+        if (generation === state.questSummaryGeneration) renderQuestLogError();
+        return false;
+      } finally {
+        if (state.questSummaryRequest === pending) state.questSummaryRequest = null;
+      }
+    })();
+    state.questSummaryRequest = pending;
+    return pending;
+  }
+
   function progressPercent(current, maximum) {
     const safeCurrent = finiteNumber(current);
     const safeMaximum = finiteNumber(maximum);
@@ -420,7 +546,7 @@
     const track = document.getElementById(`mini-${prefix}-track`);
     if (!value || !progress || !track) return;
     const percent = progressPercent(current, maximum);
-    value.textContent = `${displayStat(current)} / ${displayStat(maximum)}`;
+    value.textContent = `${displayStat(current)}/${displayStat(maximum)}`;
     track.setAttribute("aria-valuenow", String(Math.round(percent)));
     window.requestAnimationFrame(() => { progress.style.width = `${percent}%`; });
   }
@@ -674,23 +800,28 @@
     elements.profileCard.classList.add("is-refreshing");
     if (userInitiated) haptic("impact", "light");
 
-    // PythonAnywhere free web apps may have one worker.  Profile-first ordering
-    // guarantees an expensive first avatar render cannot sit ahead of the text.
+    // PythonAnywhere free web apps may have one worker. Profile and compact task
+    // counts load before the expensive first avatar render.
     const profileOk = await loadProfile();
+    const summaryOk = await loadQuestLog({ force: userInitiated });
     const avatarOk = await loadAvatar(forceAvatar);
 
     state.refreshing = false;
     elements.refreshButton.disabled = false;
     elements.refreshButton.classList.remove("is-spinning");
     elements.profileCard.classList.remove("is-refreshing");
-    if (userInitiated) haptic("notification", profileOk && avatarOk ? "success" : "error");
-    return profileOk && avatarOk;
+    if (userInitiated) haptic("notification", profileOk && summaryOk && avatarOk ? "success" : "error");
+    return profileOk && summaryOk && avatarOk;
   }
 
   function ensureHomeLoaded() {
-    if (state.homeStarted) return;
+    if (state.homeStarted) {
+      if (!state.questSummaryLoaded) void loadQuestLog();
+      return;
+    }
     if (state.profileLoaded) {
       state.homeStarted = true;
+      if (!state.questSummaryLoaded) void loadQuestLog();
       if (!state.avatarUrl) void loadAvatar(false);
       return;
     }
@@ -757,7 +888,7 @@
       ? (state.startupState === "refreshing_day" ? "Starting New Day…" : "Recording Activity…")
       : (state.dayOutcomeUnknown
           ? "Check Day Status"
-          : (state.dayReview?.dailies?.length ? "Confirm and Start New Day" : "Start New Day"));
+          : (state.dayReview?.dailies?.length ? "Start My Day" : "Start New Day"));
     elements.dayReviewSubmit.disabled = state.daySubmitting;
     elements.dayReviewList.querySelectorAll('input[type="checkbox"]').forEach((input) => {
       input.disabled = state.daySubmitting;
@@ -889,6 +1020,7 @@
     if (types.length) {
       taskController?.invalidate?.(types);
       await taskController?.refreshTypes?.(types);
+      void loadQuestLog({ force: true });
     }
     state.dayReview = null;
     state.selectedDailyIds.clear();
@@ -1068,7 +1200,7 @@
 
   function renderPotionDialog() {
     const stats = state.potionInfo?.stats || state.profilePayload?.stats || {};
-    elements.potionDialogTitle.textContent = state.potionInfo?.name || "Health Potion";
+    elements.potionDialogTitle.textContent = `Use ${state.potionInfo?.name || "Health Potion"}?`;
     elements.potionHealth.textContent = `${displayStat(stats.hp)} / ${displayStat(stats.maxHp)}`;
     elements.potionGold.textContent = displayGold(stats.gold);
     const price = state.potionInfo?.price;
@@ -1092,7 +1224,9 @@
                   ? "Health is Full"
                   : (cannotAfford
                       ? "Not Enough Gold"
-                      : (hasPurchaseIntent ? "Buy and Use" : "Reopen to Retry")))));
+                       : (hasPurchaseIntent
+                           ? `Drink Potion${finiteNumber(price) === null ? "" : ` (${displayGold(price)} GP)`}`
+                           : "Reopen to Retry")))));
     elements.potionSubmit.disabled = state.potionLoading
       || state.potionSubmitting
       || state.potionOutcomeUnknown
@@ -1722,7 +1856,10 @@
     elements.quickAddError.hidden = true;
     elements.quickAddError.textContent = "";
     elements.quickAddTypeLabel.textContent = `New ${taskTypeLabel(type)}`;
-    elements.quickAddSubmit.textContent = `Add ${taskTypeLabel(type)}`;
+    elements.quickAddSubmit.textContent = "Scribe Task";
+    elements.quickAddForm.querySelectorAll('[name="quick-add-type"]').forEach((control) => {
+      control.checked = control.value === type;
+    });
     setQuickAddSubmitting(false);
     showDialog(elements.quickAddDialog);
     window.requestAnimationFrame(() => elements.quickAddInput.focus());
@@ -1739,7 +1876,11 @@
       elements.quickAddForm.reportValidity();
       return;
     }
+    const selectedType = elements.quickAddForm.querySelector('[name="quick-add-type"]:checked')?.value;
+    const selectedPriority = elements.quickAddForm.querySelector('[name="quick-add-priority"]:checked')?.value;
+    if (["habit", "daily", "todo"].includes(selectedType)) state.quickAddType = selectedType;
     const draft = window.HabiticaTaskUI.quickAddDefaults(state.quickAddType, elements.quickAddInput.value);
+    if (["0.1", "1", "1.5", "2"].includes(selectedPriority)) draft.priority = selectedPriority;
     const validation = window.HabiticaTaskUI.validateTaskDraft(draft);
     if (!validation.ok) {
       elements.quickAddError.textContent = Object.values(validation.errors)[0] || "Enter a task title.";
@@ -1934,7 +2075,10 @@
       requestJson,
       announce,
       haptic,
-      onMutationConfirmed: scheduleProfileRefresh,
+      onMutationConfirmed: (detail) => {
+        scheduleProfileRefresh(detail);
+        void loadQuestLog({ force: true });
+      },
       onDayRefreshRequired: requireDayReview,
       apiBase: API_BASE,
       limits: { title: 500, notes: 10000, checklistItems: 100, checklistText: 500 },
@@ -1973,6 +2117,11 @@
     const previous = state.activeTab;
     if (!initial && previous !== name) state.scrollPositions[previous] = window.scrollY;
     state.activeTab = name;
+    document.body.dataset.activeView = name;
+    const brandLabel = document.querySelector(".brand > span:last-child");
+    if (brandLabel) {
+      brandLabel.textContent = ({ home: "Habitica", habits: "Habits", dailies: "Dailies", todos: "To-Do’s" })[name] || "Habitica";
+    }
     document.querySelectorAll("[data-tab]").forEach((tab) => {
       const active = tab === target;
       tab.classList.toggle("is-active", active);
@@ -2018,6 +2167,9 @@
         activateTab(tabs[nextIndex].dataset.tab, { focus: true });
       });
     });
+    document.querySelectorAll("[data-summary-tab]").forEach((control) => {
+      control.addEventListener("click", () => activateTab(control.dataset.summaryTab));
+    });
     const requestedTab = window.location.hash.slice(1);
     const initialTab = ["home", "habits", "dailies", "todos"].includes(requestedTab) ? requestedTab : "home";
     state.requestedTab = initialTab;
@@ -2038,18 +2190,29 @@
         elements.themeButton.focus();
       });
     });
-    const themeOptions = [...document.querySelectorAll("[data-theme-choice]")];
+    document.querySelectorAll("[data-display-scale]").forEach((option) => {
+      option.addEventListener("click", () => {
+        const choice = option.dataset.displayScale;
+        if (choice !== state.displayScale) {
+          applyDisplayScale(choice, { persist: true, mirrorCloud: true });
+          haptic("selection");
+        }
+      });
+    });
+    const settingsOptions = [
+      ...document.querySelectorAll("[data-theme-choice], [data-display-scale]"),
+    ];
     elements.themeMenu.addEventListener("keydown", (event) => {
-      const index = themeOptions.indexOf(document.activeElement);
+      const index = settingsOptions.indexOf(document.activeElement);
       if (index < 0) return;
       let next = null;
-      if (event.key === "ArrowDown") next = (index + 1) % themeOptions.length;
-      if (event.key === "ArrowUp") next = (index - 1 + themeOptions.length) % themeOptions.length;
+      if (event.key === "ArrowDown" || event.key === "ArrowRight") next = (index + 1) % settingsOptions.length;
+      if (event.key === "ArrowUp" || event.key === "ArrowLeft") next = (index - 1 + settingsOptions.length) % settingsOptions.length;
       if (event.key === "Home") next = 0;
-      if (event.key === "End") next = themeOptions.length - 1;
+      if (event.key === "End") next = settingsOptions.length - 1;
       if (next === null) return;
       event.preventDefault();
-      themeOptions[next].focus();
+      settingsOptions[next].focus();
     });
     document.addEventListener("pointerdown", (event) => {
       if (!elements.themeMenu.hidden && !event.target.closest(".theme-control")) setThemeMenuOpen(false);
@@ -2067,15 +2230,25 @@
       if (state.themeMode === "auto" && !isTelegramLaunch) applyTheme("auto");
     });
     updateThemeControls();
+    updateDisplayScaleControls();
     loadCloudTheme();
+    loadCloudDisplayScale();
   }
 
   function initialize() {
     applyTheme(state.themeMode);
+    applyDisplayScale(state.displayScale);
     installThemeControls();
     initializeProfileCoordinator();
     initializeTaskController();
     installTaskDialogs();
+    elements.quickAddForm.querySelectorAll('[name="quick-add-type"]').forEach((control) => {
+      control.addEventListener("change", () => {
+        if (!control.checked || !["habit", "daily", "todo"].includes(control.value)) return;
+        state.quickAddType = control.value;
+        elements.quickAddTypeLabel.textContent = `New ${taskTypeLabel(control.value)}`;
+      });
+    });
     installGameplayControls();
     installTabs();
     document.querySelector(".brand")?.addEventListener("click", (event) => {
