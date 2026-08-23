@@ -1185,6 +1185,49 @@ def test_edit_reconciles_checklist_operations(app, monkeypatch, frozen_time):
     assert response.json["task"]["checklist"][0]["text"] == "new"
 
 
+def test_edit_adds_multiple_todo_checklist_items_in_one_save(app, monkeypatch, frozen_time):
+    import Habitica_API
+
+    old = raw_task("todo", checklist=[])
+    second_item_id = "323e4567-e89b-42d3-a456-426614174002"
+    calls = []
+    monkeypatch.setattr(Habitica_API, "get_task_result", lambda *_args: ok(old))
+
+    def add_item(_user, _key, _task_id, item):
+        calls.append(item)
+        checklist = [
+            {"id": ITEM_ID, "text": "First step", "completed": False},
+        ]
+        if len(calls) == 2:
+            checklist.append(
+                {"id": second_item_id, "text": "Second step", "completed": False}
+            )
+        return ok(raw_task("todo", checklist=checklist))
+
+    monkeypatch.setattr(Habitica_API, "add_checklist_item_result", add_item)
+    response = app.test_client().patch(
+        f"/miniapp/api/tasks/{TASK_ID}",
+        headers=auth_header(),
+        json={
+            "revision": revision_for(old),
+            "checklist": [
+                {"text": "First step", "completed": False},
+                {"text": "Second step", "completed": False},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls == [
+        {"text": "First step", "completed": False},
+        {"text": "Second step", "completed": False},
+    ]
+    assert [item["text"] for item in response.json["task"]["checklist"]] == [
+        "First step",
+        "Second step",
+    ]
+
+
 def test_delete_checks_capability_and_returns_minimal_tombstone(app, monkeypatch, frozen_time):
     import Habitica_API
 

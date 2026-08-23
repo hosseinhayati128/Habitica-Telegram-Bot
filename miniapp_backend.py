@@ -56,7 +56,9 @@ _CLASS_LABELS = {
 DEFAULT_AVATAR_REFRESH_COOLDOWN_SECONDS = 30.0
 MAX_AVATAR_REFRESH_COOLDOWN_SECONDS = 300.0
 MAX_TASK_REQUEST_BYTES = 128 * 1024
-MAX_CHECKLIST_MUTATIONS_PER_EDIT = 1
+# Each checklist change is one Habitica request. Keep multi-item edits useful
+# while bounding a single save well below Habitica's shared request quota.
+MAX_CHECKLIST_MUTATIONS_PER_EDIT = 8
 TASK_MUTATION_LOCK_SHARDS = 32
 # ``refresh_day`` performs one score plus an immediately preceding day-state
 # read per selection. It processes this many per request, then returns an
