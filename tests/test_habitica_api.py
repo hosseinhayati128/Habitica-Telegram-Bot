@@ -753,6 +753,38 @@ def test_typed_success_rejects_invalid_json_envelope_or_shape(monkeypatch, respo
     assert result.error.outcome_unknown is False
 
 
+def test_typed_tag_helpers_use_official_routes_and_never_retry(monkeypatch):
+    tag = {"id": "123e4567-e89b-42d3-a456-426614174010", "name": "list:Work"}
+    responses = iter(
+        [
+            FakeResponse(payload={"success": True, "data": [tag]}),
+            FakeResponse(status_code=201, payload={"success": True, "data": tag}),
+            FakeResponse(payload={"success": True, "data": tag}),
+            FakeResponse(payload={"success": True, "data": {}}),
+        ]
+    )
+    calls = []
+
+    def request(*args, **kwargs):
+        calls.append((args, kwargs))
+        return next(responses)
+
+    monkeypatch.setattr(api.requests, "request", request)
+
+    assert api.get_tags_result(USER_ID, API_KEY).data == [tag]
+    assert api.create_tag_result(USER_ID, API_KEY, "list:Work").data == tag
+    assert api.update_tag_result(USER_ID, API_KEY, tag["id"], "list:Career").data == tag
+    assert api.delete_tag_result(USER_ID, API_KEY, tag["id"]).data == {}
+    assert [call[0] for call in calls] == [
+        ("GET", f"{api.BASE_URL}/tags"),
+        ("POST", f"{api.BASE_URL}/tags"),
+        ("PUT", f"{api.BASE_URL}/tags/{tag['id']}"),
+        ("DELETE", f"{api.BASE_URL}/tags/{tag['id']}"),
+    ]
+    assert calls[1][1]["json"] == {"name": "list:Work"}
+    assert calls[2][1]["json"] == {"name": "list:Career"}
+
+
 def test_typed_invalid_success_response_marks_mutation_outcome_unknown(monkeypatch):
     install_response(
         monkeypatch,

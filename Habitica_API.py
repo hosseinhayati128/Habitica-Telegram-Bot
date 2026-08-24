@@ -351,6 +351,77 @@ def get_user_result(user_id: str, api_key: str) -> HabiticaResult[dict]:
     )
 
 
+def get_tags_result(user_id: str, api_key: str) -> HabiticaResult[list[dict]]:
+    """Fetch the authenticated user's ordered Habitica tags."""
+    return _task_api_request(
+        "GET",
+        "/tags",
+        user_id,
+        api_key,
+        expected_data_type=list,
+        list_items_are_objects=True,
+    )
+
+
+def create_tag_result(
+    user_id: str,
+    api_key: str,
+    name: str,
+) -> HabiticaResult[dict]:
+    """Create one Habitica tag without retrying the mutation."""
+    if not isinstance(name, str) or not name:
+        return _invalid_input("POST")
+    return _task_api_request(
+        "POST",
+        "/tags",
+        user_id,
+        api_key,
+        expected_data_type=dict,
+        mutation=True,
+        json={"name": name},
+    )
+
+
+def update_tag_result(
+    user_id: str,
+    api_key: str,
+    tag_id: str,
+    name: str,
+) -> HabiticaResult[dict]:
+    """Rename one owned Habitica tag."""
+    quoted_tag_id = _quoted_identifier(tag_id)
+    if quoted_tag_id is None or not isinstance(name, str) or not name:
+        return _invalid_input("PUT")
+    return _task_api_request(
+        "PUT",
+        f"/tags/{quoted_tag_id}",
+        user_id,
+        api_key,
+        expected_data_type=dict,
+        mutation=True,
+        json={"name": name},
+    )
+
+
+def delete_tag_result(
+    user_id: str,
+    api_key: str,
+    tag_id: str,
+) -> HabiticaResult[dict]:
+    """Delete one Habitica tag; Habitica removes it from tasks atomically."""
+    quoted_tag_id = _quoted_identifier(tag_id)
+    if quoted_tag_id is None:
+        return _invalid_input("DELETE")
+    return _task_api_request(
+        "DELETE",
+        f"/tags/{quoted_tag_id}",
+        user_id,
+        api_key,
+        expected_data_type=dict,
+        mutation=True,
+    )
+
+
 def get_content_result(
     user_id: str,
     api_key: str,

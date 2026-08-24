@@ -31,6 +31,17 @@
     daily: Object.freeze(["due", "all", "completed"]),
     todo: Object.freeze(["active", "completed"]),
   });
+  const TODO_SMART_VIEWS = Object.freeze([
+    "inbox",
+    "today",
+    "upcoming",
+    "overdue",
+    "no-date",
+    "all",
+    "completed",
+  ]);
+  const TODO_SMART_VIEW_SET = new Set(TODO_SMART_VIEWS);
+  const TODO_VIEW_STORAGE_KEY = "hh_todo_view_v1";
   const TASK_COLOR_TOKENS = Object.freeze([
     "worst",
     "worse",
@@ -167,6 +178,14 @@
     });
   }
 
+  function normalizeTagIds(value) {
+    if (!Array.isArray(value)) return [];
+    const seen = new Set();
+    return value.filter((tagId) => (
+      typeof tagId === "string" && tagId && !seen.has(tagId) && seen.add(tagId)
+    ));
+  }
+
   /**
    * Validate the browser-facing, already-whitelisted task shape. This is not a
    * substitute for server validation; it keeps malformed responses out of UI state.
@@ -208,6 +227,7 @@
       repeatDays: normalizeRepeatDays(raw.repeatDays == null ? raw.repeat : raw.repeatDays),
       scheduleEditable: raw.scheduleEditable === true,
       checklist: normalizeChecklist(raw.checklist),
+      tagIds: normalizeTagIds(raw.tagIds),
       revision: typeof raw.revision === "string" ? raw.revision : "",
       canEdit: raw.canEdit !== false,
       canDelete: raw.canDelete !== false,
@@ -219,6 +239,7 @@
       ...task,
       repeatDays: [...task.repeatDays],
       checklist: task.checklist.map((item) => ({ ...item })),
+      tagIds: [...task.tagIds],
     };
   }
 
@@ -345,6 +366,113 @@
     return tasks.filter((task) => task.completed !== true);
   }
 
+  function todoListViewId(listId) {
+    return typeof listId === "string" && listId ? `list:${listId}` : "inbox";
+  }
+
+  function todoListIdFromView(view) {
+    return typeof view === "string" && view.startsWith("list:") && view.length > 5
+      ? view.slice(5)
+      : null;
+  }
+
+  function normalizeTodoListPayload(payload) {
+    if (!payload || payload.ok !== true || !Array.isArray(payload.lists)) {
+      throw taskError("List response was incomplete.", "invalid_response");
+    }
+    const seen = new Set();
+    const lists = payload.lists.map((raw, index) => {
+      if (
+        !raw
+        || typeof raw !== "object"
+        || typeof raw.id !== "string"
+        || !raw.id
+        || typeof raw.name !== "string"
+        || !raw.name.trim()
+        || seen.has(raw.id)
+      ) throw taskError("List response was invalid.", "invalid_response");
+      seen.add(raw.id);
+      return { id: raw.id, name: raw.name.trim(), order: Number.isSafeInteger(raw.order) ? raw.order : index };
+    });
+    lists.sort((left, right) => left.order - right.order);
+    const ordinaryTags = Array.isArray(payload.ordinaryTags)
+      ? payload.ordinaryTags.filter((tag) => tag && typeof tag.id === "string" && typeof tag.name === "string")
+        .map((tag) => ({ id: tag.id, name: tag.name, order: Number.isSafeInteger(tag.order) ? tag.order : 0 }))
+      : [];
+    return { lists, ordinaryTags };
+  }
+
+  function primaryTodoListId(task, lists) {
+    if (!task || !Array.isArray(task.tagIds) || !Array.isArray(lists)) return null;
+    const listIds = new Set(lists.map((list) => list.id));
+    const matches = [...new Set(task.tagIds.filter((tagId) => listIds.has(tagId)))];
+    return matches.length === 1 ? matches[0] : null;
+  }
+
+  function todoViewIsValid(view, lists) {
+    if (TODO_SMART_VIEW_SET.has(view)) return true;
+    const listId = todoListIdFromView(view);
+    return Boolean(listId && Array.isArray(lists) && lists.some((list) => list.id === listId));
+  }
+
+  function todoViewLabel(view, lists) {
+    const labels = {
+      inbox: "Inbox",
+      today: "Today",
+      upcoming: "Upcoming",
+      overdue: "Overdue",
+      "no-date": "No Date",
+      all: "All Todos",
+      completed: "Completed",
+    };
+    if (labels[view]) return labels[view];
+    const listId = todoListIdFromView(view);
+    return lists.find((list) => list.id === listId)?.name || "Inbox";
+  }
+
+  function todoTasksForView(tasks, view, lists, today) {
+    const source = Array.isArray(tasks) ? tasks : [];
+    if (view === "completed") return source.filter((task) => task.completed === true);
+    const active = source.filter((task) => task.completed !== true);
+    const listId = todoListIdFromView(view);
+    if (listId) return active.filter((task) => primaryTodoListId(task, lists) === listId);
+    if (view === "today") return active.filter((task) => task.date === today);
+    if (view === "upcoming") return active.filter((task) => task.date && task.date > today);
+    if (view === "overdue") return active.filter((task) => task.date && task.date < today);
+    if (view === "no-date") return active.filter((task) => !task.date);
+    if (view === "all") return active;
+    return active.filter((task) => primaryTodoListId(task, lists) === null);
+  }
+
+  function todoViewCounts(tasks, lists, today) {
+    const counts = {};
+    TODO_SMART_VIEWS.filter((view) => view !== "completed").forEach((view) => {
+      counts[view] = todoTasksForView(tasks, view, lists, today).length;
+    });
+    lists.forEach((list) => {
+      counts[todoListViewId(list.id)] = todoTasksForView(
+        tasks,
+        todoListViewId(list.id),
+        lists,
+        today,
+      ).length;
+    });
+    return counts;
+  }
+
+  function groupAllTodos(tasks, lists) {
+    const active = Array.isArray(tasks) ? tasks.filter((task) => task.completed !== true) : [];
+    const groups = [{ id: "inbox", label: "Inbox", tasks: [] }]
+      .concat(lists.map((list) => ({ id: todoListViewId(list.id), label: list.name, tasks: [] })));
+    const byId = new Map(groups.map((group) => [group.id, group]));
+    active.forEach((task) => {
+      const listId = primaryTodoListId(task, lists);
+      const key = listId ? todoListViewId(listId) : "inbox";
+      (byId.get(key) || byId.get("inbox")).tasks.push(task);
+    });
+    return groups.filter((group) => group.tasks.length);
+  }
+
   function groupDailyTasks(tasks) {
     const groups = { due: [], notDue: [], completed: [] };
     (Array.isArray(tasks) ? tasks : []).forEach((task) => {
@@ -389,7 +517,7 @@
       startDate: "",
       checklist: [],
     });
-    if (type === "todo") Object.assign(draft, { date: null, checklist: [] });
+    if (type === "todo") Object.assign(draft, { date: null, checklist: [], listId: null });
     return draft;
   }
 
@@ -472,6 +600,12 @@
       if (date && !isIsoDate(date)) errors.date = "Enter a valid due date.";
       value.date = date || null;
       value.checklist = checklist;
+      if (Object.prototype.hasOwnProperty.call(draft, "listId")) {
+        if (!(draft.listId === null || typeof draft.listId === "string")) {
+          errors.listId = "Choose a valid list.";
+        }
+        value.listId = typeof draft.listId === "string" && draft.listId ? draft.listId : null;
+      }
     }
 
     return { ok: Object.keys(errors).length === 0, errors, value };
@@ -520,10 +654,37 @@
     return merged;
   }
 
-  function createTaskState() {
+  function storedTodoView() {
+    try {
+      const value = globalThis.localStorage?.getItem?.(TODO_VIEW_STORAGE_KEY);
+      return typeof value === "string" && value ? value : "inbox";
+    } catch (_error) {
+      return "inbox";
+    }
+  }
+
+  function persistTodoView(view) {
+    try {
+      globalThis.localStorage?.setItem?.(TODO_VIEW_STORAGE_KEY, view);
+    } catch (_error) {
+      // The selected view is harmless convenience state; storage is optional.
+    }
+  }
+
+  function createTaskState(options = {}) {
     return {
       activeView: null,
       filters: { habit: "all", daily: "due", todo: "active" },
+      todoView: typeof options.todoView === "string" && options.todoView
+        ? options.todoView
+        : "inbox",
+      todoLists: {
+        lists: [],
+        ordinaryTags: [],
+        loaded: false,
+        loading: false,
+        error: null,
+      },
       collections: {
         habit: createCollection(),
         daily: createCollection(),
@@ -630,10 +791,11 @@
       : function noop() {};
     const apiBase = typeof options.apiBase === "string" ? options.apiBase.replace(/\/$/, "") : "/miniapp/api";
     const limits = { ...DEFAULT_LIMITS, ...(options.limits || {}) };
-    const state = createTaskState();
+    const state = createTaskState({ todoView: options.initialTodoView || storedTodoView() });
     const requests = new Map();
     let destroyed = false;
     let mutationSequence = 0;
+    let authoritativeToday = isIsoDate(options.today) ? options.today : new Date().toISOString().slice(0, 10);
 
     function notifyMutationConfirmed(detail) {
       try {
@@ -655,7 +817,7 @@
 
     function collectionKey(typeValue) {
       const type = canonicalType(typeValue);
-      if (type === "todo") return state.filters.todo === "completed" ? "todoCompleted" : "todoActive";
+      if (type === "todo") return state.todoView === "completed" ? "todoCompleted" : "todoActive";
       return type;
     }
 
@@ -675,7 +837,7 @@
     function taskRoute(typeValue) {
       const type = canonicalType(typeValue);
       if (type === "todo") {
-        return `${apiBase}/tasks?type=todo&completed=${state.filters.todo === "completed" ? "true" : "false"}`;
+        return `${apiBase}/tasks?type=todo&completed=${state.todoView === "completed" ? "true" : "false"}`;
       }
       return `${apiBase}/tasks?type=${encodeURIComponent(type)}`;
     }
@@ -724,6 +886,14 @@
 
     function visibleTasks(type, collection) {
       const tasks = collectionTasks(collection);
+      if (type === "todo") {
+        return todoTasksForView(
+          tasks.map((task) => classificationTask(task)),
+          state.todoView,
+          state.todoLists.lists,
+          authoritativeToday,
+        );
+      }
       const filter = state.filters[type];
       return tasks.filter((task) => filterTasks(type, [classificationTask(task)], filter).length === 1);
     }
@@ -813,6 +983,11 @@
       content.append(createElement(doc, "span", "task-row__title", task.text || "Untitled task"));
       if (task.notes) content.append(createElement(doc, "span", "task-row__notes", task.notes));
       appendCompactMetadata(doc, content, task);
+      if (task.type === "todo") {
+        const listId = primaryTodoListId(task, state.todoLists.lists);
+        const listName = state.todoLists.lists.find((list) => list.id === listId)?.name || "Inbox";
+        content.append(createElement(doc, "span", "task-row__list-badge", listName));
+      }
       return content;
     }
 
@@ -866,6 +1041,95 @@
       parent.append(list);
     }
 
+    function renderTodoListControls(page, tasks) {
+      const selector = page.querySelector("[data-todo-list-selector]");
+      if (selector) {
+        const label = todoViewLabel(state.todoView, state.todoLists.lists);
+        const labelNode = selector.querySelector("[data-todo-current-label]");
+        if (labelNode) setSafeText(labelNode, label);
+        selector.disabled = state.todoLists.loading;
+        selector.setAttribute("aria-expanded", String(
+          page.ownerDocument.querySelector("#todo-list-sheet")?.open === true,
+        ));
+      }
+
+      const sheet = page.ownerDocument.querySelector("#todo-list-sheet");
+      const optionsNode = sheet?.querySelector("[data-todo-list-options]");
+      if (!optionsNode) return;
+      optionsNode.replaceChildren();
+      const doc = page.ownerDocument;
+      if (state.todoLists.error) {
+        const error = createElement(doc, "div", "todo-sheet__error");
+        error.append(
+          createElement(doc, "strong", "", "Could not load lists"),
+          createElement(doc, "p", "", publicErrorMessage(state.todoLists.error, "load Todo lists")),
+        );
+        const retry = createElement(doc, "button", "secondary-action", "Try again");
+        retry.type = "button";
+        retry.dataset.todoListsRetry = "true";
+        error.append(retry);
+        optionsNode.append(error);
+        return;
+      }
+      if (state.todoLists.loading && !state.todoLists.loaded) {
+        const loading = createElement(doc, "p", "todo-sheet__loading", "Loading lists…");
+        loading.setAttribute("role", "status");
+        optionsNode.append(loading);
+        return;
+      }
+
+      const counts = todoViewCounts(tasks, state.todoLists.lists, authoritativeToday);
+      const addSection = (title, entries) => {
+        const section = createElement(doc, "section", "todo-sheet__section");
+        section.append(createElement(doc, "h3", "todo-sheet__section-title", title));
+        const list = createElement(doc, "div", "todo-sheet__choices");
+        entries.forEach(({ id, label, count, icon }) => {
+          const button = createElement(doc, "button", "todo-sheet__choice");
+          button.type = "button";
+          button.dataset.todoView = id;
+          button.setAttribute("aria-pressed", String(state.todoView === id));
+          if (state.todoView === id) button.classList.add("is-active");
+          button.append(
+            createElement(doc, "span", "todo-sheet__choice-icon", icon),
+            createElement(doc, "span", "todo-sheet__choice-label", label),
+            createElement(doc, "span", "todo-sheet__choice-count", String(count)),
+          );
+          list.append(button);
+        });
+        section.append(list);
+        optionsNode.append(section);
+      };
+
+      const completedCount = state.collections.todoCompleted.loaded
+        ? collectionTasks(state.collections.todoCompleted).length
+        : "—";
+      addSection("Smart Views", [
+        { id: "inbox", label: "Inbox", count: counts.inbox || 0, icon: "⌂" },
+        { id: "today", label: "Today", count: counts.today || 0, icon: "\u25cf" },
+        { id: "upcoming", label: "Upcoming", count: counts.upcoming || 0, icon: "↗" },
+        { id: "overdue", label: "Overdue", count: counts.overdue || 0, icon: "!" },
+        { id: "no-date", label: "No Date", count: counts["no-date"] || 0, icon: "–" },
+        { id: "all", label: "All Todos", count: counts.all || 0, icon: "≡" },
+        { id: "completed", label: "Completed", count: completedCount, icon: "✓" },
+      ]);
+      addSection("My Lists", state.todoLists.lists.map((list) => ({
+        id: todoListViewId(list.id),
+        label: list.name,
+        count: counts[todoListViewId(list.id)] || 0,
+        icon: "◆",
+      })));
+
+      const actions = createElement(doc, "div", "todo-sheet__actions");
+      const add = createElement(doc, "button", "todo-sheet__action", "＋ New List");
+      add.type = "button";
+      add.dataset.todoListNew = "true";
+      const manage = createElement(doc, "button", "todo-sheet__action", "Manage Lists");
+      manage.type = "button";
+      manage.dataset.todoListsManage = "true";
+      actions.append(add, manage);
+      optionsNode.append(actions);
+    }
+
     function renderPage(typeValue) {
       const type = canonicalType(typeValue);
       if (!type) return;
@@ -874,17 +1138,34 @@
       const doc = page.ownerDocument;
       const key = collectionKey(type);
       const collection = state.collections[key];
-      const tasks = visibleTasks(type, collection);
+      const todoMetadataBlocked = type === "todo" && !state.todoLists.loaded
+        && (state.todoLists.loading || state.todoLists.error);
+      const tasks = todoMetadataBlocked ? [] : visibleTasks(type, collection);
       const focused = doc.activeElement && doc.activeElement.dataset
         ? doc.activeElement.dataset.focusKey
         : null;
 
-      page.setAttribute("aria-busy", String(collection.loading || collection.refreshing));
+      page.setAttribute("aria-busy", String(
+        collection.loading || collection.refreshing || (type === "todo" && state.todoLists.loading),
+      ));
       const count = page.querySelector("[data-task-count]");
       if (count) {
         const countLabel = `${tasks.length} ${tasks.length === 1 ? "task" : "tasks"}`;
         setSafeText(count, String(tasks.length));
         count.setAttribute("aria-label", countLabel);
+      }
+      if (type === "todo") {
+        renderTodoListControls(page, collectionTasks(state.collections.todoActive));
+        const emptyTitle = page.querySelector("[data-todo-empty-title]");
+        const emptyMessage = page.querySelector("[data-todo-empty-message]");
+        const label = todoViewLabel(state.todoView, state.todoLists.lists);
+        if (emptyTitle) setSafeText(emptyTitle, state.todoView === "completed" ? "No completed Todos" : `${label} is clear`);
+        if (emptyMessage) setSafeText(
+          emptyMessage,
+          state.todoView === "completed"
+            ? "Completed Todos will appear here after you finish them."
+            : "Choose another view or add a Todo here.",
+        );
       }
       const collectionPending = taskHasCollectionPending(type);
       page.querySelectorAll("[data-task-filter]").forEach((button) => {
@@ -897,18 +1178,26 @@
       if (addButton) addButton.disabled = state.pending.has(pendingKey("create", type));
 
       const loading = page.querySelector("[data-task-loading]");
-      if (loading) loading.hidden = !collection.loading;
+      if (loading) loading.hidden = !(collection.loading || (type === "todo" && state.todoLists.loading));
       const errorBox = page.querySelector("[data-task-error]");
-      if (errorBox) errorBox.hidden = !collection.error;
+      const pageError = collection.error || (type === "todo" ? state.todoLists.error : null);
+      if (errorBox) errorBox.hidden = !pageError;
       const errorMessage = page.querySelector("[data-task-error-message]");
-      if (errorMessage && collection.error) setSafeText(errorMessage, publicErrorMessage(collection.error, `load ${TYPE_TO_VIEW[type]}`));
+      if (errorMessage && pageError) setSafeText(errorMessage, publicErrorMessage(pageError, `load ${TYPE_TO_VIEW[type]}`));
       const empty = page.querySelector("[data-task-empty]");
-      if (empty) empty.hidden = !collection.loaded || collection.loading || tasks.length > 0;
+      if (empty) empty.hidden = !collection.loaded || collection.loading || todoMetadataBlocked || tasks.length > 0;
 
       const container = page.querySelector("[data-task-list]");
       if (!container) return;
       container.replaceChildren();
-      if (type === "daily" && state.filters.daily === "all") {
+      if (type === "todo" && state.todoView === "all") {
+        groupAllTodos(tasks, state.todoLists.lists).forEach((group) => {
+          const section = createElement(doc, "section", "task-group");
+          section.append(createElement(doc, "h2", "task-group__title", `${group.label} · ${group.tasks.length}`));
+          appendTaskList(doc, section, group.tasks);
+          container.append(section);
+        });
+      } else if (type === "daily" && state.filters.daily === "all") {
         const classified = tasks.map((task) => classificationTask(task));
         const groups = groupDailyTasks(classified);
         const actualById = new Map(tasks.map((task) => [task.id, task]));
@@ -925,6 +1214,15 @@
         });
       } else {
         appendTaskList(doc, container, tasks);
+      }
+
+      if (type === "todo" && state.todoView === "completed" && collection.loaded) {
+        container.append(createElement(
+          doc,
+          "p",
+          "todo-completed-limit",
+          "Habitica provides only your 30 most recently completed Todos.",
+        ));
       }
 
       if (focused) {
@@ -964,6 +1262,44 @@
         const current = findTask(incoming.id);
         return mergeTaskPreservingPending(current, incoming, state.pending, incoming.id);
       });
+    }
+
+    async function loadTodoLists({ force = false } = {}) {
+      const metadata = state.todoLists;
+      if (metadata.loaded && !force) {
+        renderPage("todo");
+        return true;
+      }
+      if (requests.has("todoLists")) return requests.get("todoLists");
+      metadata.loading = true;
+      metadata.error = null;
+      renderPage("todo");
+      const pendingRequest = (async () => {
+        try {
+          const payload = await requestJson(`${apiBase}/todo-lists`, { method: "GET" });
+          const normalized = normalizeTodoListPayload(payload);
+          metadata.lists = normalized.lists;
+          metadata.ordinaryTags = normalized.ordinaryTags;
+          metadata.loaded = true;
+          metadata.loading = false;
+          if (!todoViewIsValid(state.todoView, metadata.lists)) {
+            state.todoView = "inbox";
+            persistTodoView(state.todoView);
+          }
+          renderPage("todo");
+          return true;
+        } catch (error) {
+          metadata.loading = false;
+          metadata.error = error;
+          renderPage("todo");
+          announce(publicErrorMessage(error, "load Todo lists"), "error");
+          return false;
+        } finally {
+          requests.delete("todoLists");
+        }
+      })();
+      requests.set("todoLists", pendingRequest);
+      return pendingRequest;
     }
 
     async function load(typeValue, { force = false, authoritative = false } = {}) {
@@ -1072,6 +1408,93 @@
       requested.forEach((type) => relevantCollections(type).forEach(resetCollection));
       requested.forEach(renderPage);
       return requested.size;
+    }
+
+    function setToday(value) {
+      if (!isIsoDate(value)) return false;
+      authoritativeToday = value;
+      renderPage("todo");
+      return true;
+    }
+
+    function todoListContext(task = null) {
+      const selectedListId = task
+        ? primaryTodoListId(task, state.todoLists.lists)
+        : todoListIdFromView(state.todoView);
+      const taskTagIds = new Set(task?.tagIds || []);
+      return {
+        lists: state.todoLists.lists.map((list) => ({ ...list })),
+        ordinaryTags: state.todoLists.ordinaryTags
+          .filter((tag) => taskTagIds.has(tag.id))
+          .map((tag) => ({ ...tag })),
+        selectedListId,
+      };
+    }
+
+    async function setTodoView(view) {
+      if (!todoViewIsValid(view, state.todoLists.lists)) {
+        throw taskError("Todo view is invalid.", "invalid_request");
+      }
+      state.todoView = view;
+      state.filters.todo = view === "completed" ? "completed" : "active";
+      persistTodoView(view);
+      renderPage("todo");
+      return load("todo");
+    }
+
+    async function createTodoList(name) {
+      const payload = await requestJson(`${apiBase}/todo-lists`, {
+        method: "POST",
+        body: { name },
+      });
+      if (payload?.ok !== true) throw taskError("List response was incomplete.", "invalid_response");
+      if (payload.reloadRequired === true || !payload.list) {
+        await loadTodoLists({ force: true });
+        return null;
+      }
+      const list = normalizeTodoListPayload({ ok: true, lists: [payload.list], ordinaryTags: [] }).lists[0];
+      list.order = state.todoLists.lists.length;
+      state.todoLists.lists.push(list);
+      state.todoView = todoListViewId(list.id);
+      persistTodoView(state.todoView);
+      renderPage("todo");
+      announce(`${list.name} created.`, "success");
+      return { ...list };
+    }
+
+    async function renameTodoList(listId, name) {
+      const existing = state.todoLists.lists.find((list) => list.id === listId);
+      if (!existing) throw taskError("This list no longer exists.", "list_not_found");
+      const payload = await requestJson(`${apiBase}/todo-lists/${encodeURIComponent(listId)}`, {
+        method: "PATCH",
+        body: { name },
+      });
+      if (payload?.ok !== true) throw taskError("List response was incomplete.", "invalid_response");
+      if (payload.reloadRequired === true || !payload.list) {
+        await loadTodoLists({ force: true });
+        return null;
+      }
+      existing.name = payload.list.name;
+      renderPage("todo");
+      announce(`${existing.name} renamed.`, "success");
+      return { ...existing };
+    }
+
+    async function deleteTodoList(listId) {
+      const existing = state.todoLists.lists.find((list) => list.id === listId);
+      if (!existing) throw taskError("This list no longer exists.", "list_not_found");
+      const payload = await requestJson(`${apiBase}/todo-lists/${encodeURIComponent(listId)}`, {
+        method: "DELETE",
+      });
+      if (payload?.ok !== true || payload.deleted?.id !== listId) {
+        throw taskError("List response was incomplete.", "invalid_response");
+      }
+      state.todoLists.lists = state.todoLists.lists.filter((list) => list.id !== listId);
+      if (todoListIdFromView(state.todoView) === listId) state.todoView = "inbox";
+      persistTodoView(state.todoView);
+      renderPage("todo");
+      announce(`${existing.name} deleted. Its Todos are now in Inbox.`, "success");
+      return true;
     }
 
     async function refreshTypes(typeValues = TYPES) {
@@ -1438,6 +1861,7 @@
     async function setFilter(typeValue, filter) {
       const type = canonicalType(typeValue);
       if (!type || !FILTERS[type].includes(filter)) throw taskError("Filter is invalid.", "invalid_request");
+      if (type === "todo") return setTodoView(filter === "completed" ? "completed" : "inbox");
       state.filters[type] = filter;
       renderPage(type);
       return load(type);
@@ -1447,11 +1871,25 @@
       const type = canonicalType(view);
       state.activeView = type ? TYPE_TO_VIEW[type] : view;
       if (!type) return false;
+      if (type === "todo") {
+        const [listsLoaded, tasksLoaded] = await Promise.all([
+          loadTodoLists({ force: activateOptions.refresh === true }),
+          load(type, { force: activateOptions.refresh === true }),
+        ]);
+        return listsLoaded && tasksLoaded;
+      }
       return load(type, { force: activateOptions.refresh === true });
     }
 
     async function refresh(view) {
       const type = canonicalType(view || state.activeView);
+      if (type === "todo") {
+        const [listsLoaded, tasksLoaded] = await Promise.all([
+          loadTodoLists({ force: true }),
+          load(type, { force: true }),
+        ]);
+        return listsLoaded && tasksLoaded;
+      }
       return type ? load(type, { force: true }) : false;
     }
 
@@ -1466,6 +1904,36 @@
     }
 
     function handleClick(event) {
+      const todoSelector = event.target && typeof event.target.closest === "function"
+        ? event.target.closest("[data-todo-list-selector]")
+        : null;
+      if (todoSelector) {
+        dispatch("miniapp:todo-list-selector-open", {});
+        return;
+      }
+      const todoView = event.target && typeof event.target.closest === "function"
+        ? event.target.closest("[data-todo-view]")
+        : null;
+      if (todoView) {
+        void setTodoView(todoView.dataset.todoView)
+          .then(() => dispatch("miniapp:todo-list-selector-close", {}))
+          .catch(() => {});
+        return;
+      }
+      if (event.target?.closest?.("[data-todo-list-new]")) {
+        dispatch("miniapp:todo-list-selector-close", {});
+        dispatch("miniapp:todo-list-create", {});
+        return;
+      }
+      if (event.target?.closest?.("[data-todo-lists-manage]")) {
+        dispatch("miniapp:todo-list-selector-close", {});
+        dispatch("miniapp:todo-lists-manage", {});
+        return;
+      }
+      if (event.target?.closest?.("[data-todo-lists-retry]")) {
+        void loadTodoLists({ force: true });
+        return;
+      }
       const filter = event.target && typeof event.target.closest === "function"
         ? event.target.closest("[data-task-filter]")
         : null;
@@ -1542,7 +2010,14 @@
       activate,
       refresh,
       load,
+      loadTodoLists,
       setFilter,
+      setTodoView,
+      setToday,
+      todoListContext,
+      createTodoList,
+      renameTodoList,
+      deleteTodoList,
       createTask,
       updateTask,
       deleteTask,
@@ -1562,6 +2037,7 @@
     PRIORITIES,
     DEFAULT_LIMITS,
     FILTERS,
+    TODO_SMART_VIEWS,
     TASK_COLOR_TOKENS,
     canonicalType,
     taskColorToken,
@@ -1573,6 +2049,7 @@
     setSafeText,
     normalizeRepeatDays,
     normalizeTask,
+    normalizeTagIds,
     cloneTask,
     dedupeTasks,
     createCollection,
@@ -1585,6 +2062,15 @@
     removeCollectionTask,
     visibleHabitDirections,
     filterTasks,
+    todoListViewId,
+    todoListIdFromView,
+    normalizeTodoListPayload,
+    primaryTodoListId,
+    todoViewIsValid,
+    todoViewLabel,
+    todoTasksForView,
+    todoViewCounts,
+    groupAllTodos,
     groupDailyTasks,
     difficultyLabel,
     compactTaskMetadata,

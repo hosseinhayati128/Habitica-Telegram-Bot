@@ -136,11 +136,13 @@ class DayStatus:
     review_label: str | None
     dailies: tuple[ReviewDaily, ...]
     profile: UserSnapshot | None = None
+    today: date | None = None
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "refreshRequired": self.refresh_required,
             "profile": self.profile.to_payload() if self.profile is not None else None,
+            "today": self.today.isoformat() if self.today is not None else None,
         }
         if self.refresh_required:
             payload.update(
@@ -360,6 +362,21 @@ def _days_since(
 def day_refresh_required(user: Mapping[str, Any]) -> bool:
     """Trust only Habitica's literal boolean ``needsCron`` signal."""
     return isinstance(user, Mapping) and user.get("needsCron") is True
+
+
+def current_habitica_date(
+    user: Mapping[str, Any],
+    *,
+    now: datetime | None = None,
+) -> date:
+    """Return the current Habitica day using the user's timezone and day start."""
+
+    preferences = _mapping(user.get("preferences"))
+    return _start_of_habitica_day(
+        _utc_now(now),
+        timezone_utc_offset=_utc_offset_from_preferences(preferences),
+        day_start=_day_start(preferences),
+    ).date()
 
 
 def compute_days_missed(
@@ -706,7 +723,16 @@ def evaluate_day_status(
     if not isinstance(user, Mapping) or not isinstance(user.get("needsCron"), bool):
         return GameplayResult(error=GameplayError("invalid_response"))
     if not day_refresh_required(user):
-        return GameplayResult(data=DayStatus(False, 0, None, (), _snapshot(user)))
+        return GameplayResult(
+            data=DayStatus(
+                False,
+                0,
+                None,
+                (),
+                _snapshot(user),
+                current_habitica_date(user, now=now),
+            )
+        )
     try:
         missed = max(1, compute_days_missed(user, now=now))
     except ValueError:
@@ -719,6 +745,7 @@ def evaluate_day_status(
             label,
             eligible_review_dailies(dailies, user=user, now=now),
             _snapshot(user),
+            current_habitica_date(user, now=now),
         )
     )
 
@@ -761,7 +788,14 @@ def fetch_day_status(
         return GameplayResult(error=_upstream_error(user_result))
     if user_result.data.get("needsCron") is False:
         return GameplayResult(
-            data=DayStatus(False, 0, None, (), _snapshot(user_result.data))
+            data=DayStatus(
+                False,
+                0,
+                None,
+                (),
+                _snapshot(user_result.data),
+                current_habitica_date(user_result.data, now=now),
+            )
         )
     if user_result.data.get("needsCron") is not True:
         return GameplayResult(error=GameplayError("invalid_response"))
@@ -1342,6 +1376,7 @@ __all__ = [
     "ReviewDaily",
     "UserSnapshot",
     "compute_days_missed",
+    "current_habitica_date",
     "day_refresh_required",
     "eligible_review_dailies",
     "evaluate_day_status",

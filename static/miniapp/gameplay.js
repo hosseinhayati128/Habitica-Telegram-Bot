@@ -71,8 +71,12 @@
       throw new TypeError("Day status response was incomplete.");
     }
     const refreshRequired = raw.refreshRequired === true;
+    const today = typeof raw.today === "string" && /^\d{4}-\d{2}-\d{2}$/.test(raw.today)
+      ? raw.today
+      : null;
     return {
       refreshRequired,
+      today,
       daysMissed: refreshRequired ? Math.max(1, safeNonnegativeInteger(raw.daysMissed, 1)) : 0,
       reviewLabel: displayText(raw.reviewLabel, "Yesterday") || "Yesterday",
       dailies: refreshRequired ? normalizeReviewDailies(raw.dailies) : [],

@@ -43,6 +43,18 @@ from miniapp_tasks import (
     validate_task_id,
     validate_task_payload,
 )
+from miniapp_todo_lists import (
+    TodoListValidationError,
+    duplicate_list_name,
+    find_owned_list,
+    list_tag_name,
+    normalize_user_tags,
+    ordinary_tags_from_tags,
+    tags_for_list_assignment,
+    todo_lists_from_tags,
+    validate_list_id,
+    validate_list_name,
+)
 
 miniapp_blueprint = Blueprint("miniapp", __name__, url_prefix="/miniapp")
 LOGGER = logging.getLogger(__name__)
@@ -730,6 +742,35 @@ def _task_account_args(account: LinkedHabiticaAccount) -> tuple[str, str]:
     return account.habitica_user_id, account.habitica_api_key
 
 
+def _load_todo_list_metadata(account: LinkedHabiticaAccount):
+    """Load and whitelist ordered user tags once for one request."""
+
+    from Habitica_API import get_tags_result
+
+    result = get_tags_result(*_task_account_args(account))
+    if not result.ok:
+        return None, None, _habitica_error_response(result)
+    tags = normalize_user_tags(result.data)
+    if tags is None:
+        return None, None, _error(
+            "habitica_unavailable",
+            "Habitica returned unexpected tag metadata.",
+            HTTPStatus.BAD_GATEWAY,
+        )
+    return tags, todo_lists_from_tags(tags), None
+
+
+def _todo_list_response(tags: list[dict[str, Any]], lists: list[dict[str, Any]]):
+    return _private_json(
+        {
+            "ok": True,
+            "lists": lists,
+            "ordinaryTags": ordinary_tags_from_tags(tags),
+        },
+        HTTPStatus.OK,
+    )
+
+
 def _load_task(account: LinkedHabiticaAccount, task_id: str):
     from Habitica_API import get_task_result
 
@@ -1330,6 +1371,166 @@ def miniapp_health_potion_purchase():
     return _terminalize_potion_purchase_intent(account, token_digest, response)
 
 
+@miniapp_blueprint.get("/api/todo-lists")
+def miniapp_todo_lists_get():
+    account, error_response = _authenticated_account()
+    if error_response is not None:
+        return error_response
+    assert account is not None
+    tags, lists, metadata_error = _load_todo_list_metadata(account)
+    if metadata_error is not None:
+        return metadata_error
+    assert tags is not None and lists is not None
+    return _todo_list_response(tags, lists)
+
+
+@miniapp_blueprint.post("/api/todo-lists")
+def miniapp_todo_lists_create():
+    account, error_response = _authenticated_account()
+    if error_response is not None:
+        return error_response
+    assert account is not None
+    try:
+        body = _request_json_object()
+        if set(body) != {"name"}:
+            raise TodoListValidationError("unsupported list fields")
+        name = validate_list_name(body.get("name"))
+    except (TaskValidationError, TodoListValidationError):
+        return _error("invalid_request", "The list name is invalid.", HTTPStatus.BAD_REQUEST)
+
+    try:
+        with acquire_runtime_lock(lock_path=_task_mutation_lock_path(account, "todo-lists")):
+            _tags, lists, metadata_error = _load_todo_list_metadata(account)
+            if metadata_error is not None:
+                return metadata_error
+            assert lists is not None
+            if duplicate_list_name(lists, name):
+                return _error(
+                    "duplicate_list",
+                    "A list with this name already exists.",
+                    HTTPStatus.CONFLICT,
+                )
+
+            from Habitica_API import create_tag_result
+
+            result = create_tag_result(
+                *_task_account_args(account),
+                list_tag_name(name),
+            )
+            if not result.ok:
+                return _habitica_error_response(result, mutation=True)
+            normalized = normalize_user_tags([result.data])
+            created = todo_lists_from_tags(normalized or [])
+            if len(created) != 1:
+                return _private_json(
+                    {"ok": True, "list": None, "reloadRequired": True},
+                    HTTPStatus.CREATED,
+                )
+            created[0]["order"] = len(lists)
+            return _private_json({"ok": True, "list": created[0]}, HTTPStatus.CREATED)
+    except RuntimeLockUnavailable:
+        return _error(
+            "conflict",
+            "Lists are already being changed. Please wait and refresh.",
+            HTTPStatus.CONFLICT,
+        )
+
+
+@miniapp_blueprint.patch("/api/todo-lists/<tag_id>")
+def miniapp_todo_lists_update(tag_id: str):
+    account, error_response = _authenticated_account()
+    if error_response is not None:
+        return error_response
+    assert account is not None
+    try:
+        tag_id = validate_list_id(tag_id, optional=False)
+        body = _request_json_object()
+        if set(body) != {"name"}:
+            raise TodoListValidationError("unsupported list fields")
+        name = validate_list_name(body.get("name"))
+    except (TaskValidationError, TodoListValidationError):
+        return _error("invalid_request", "The list request is invalid.", HTTPStatus.BAD_REQUEST)
+
+    try:
+        with acquire_runtime_lock(lock_path=_task_mutation_lock_path(account, "todo-lists")):
+            _tags, lists, metadata_error = _load_todo_list_metadata(account)
+            if metadata_error is not None:
+                return metadata_error
+            assert lists is not None
+            owned = find_owned_list(lists, tag_id)
+            if owned is None:
+                return _error("list_not_found", "The list was not found.", HTTPStatus.NOT_FOUND)
+            if duplicate_list_name(lists, name, excluding_id=tag_id):
+                return _error(
+                    "duplicate_list",
+                    "A list with this name already exists.",
+                    HTTPStatus.CONFLICT,
+                )
+
+            from Habitica_API import update_tag_result
+
+            result = update_tag_result(
+                *_task_account_args(account),
+                tag_id,
+                list_tag_name(name),
+            )
+            if not result.ok:
+                return _habitica_error_response(result, mutation=True)
+            normalized = normalize_user_tags([result.data])
+            updated = todo_lists_from_tags(normalized or [])
+            if len(updated) != 1:
+                return _private_json(
+                    {"ok": True, "list": None, "reloadRequired": True},
+                    HTTPStatus.OK,
+                )
+            updated[0]["order"] = owned["order"]
+            return _private_json({"ok": True, "list": updated[0]}, HTTPStatus.OK)
+    except RuntimeLockUnavailable:
+        return _error(
+            "conflict",
+            "Lists are already being changed. Please wait and refresh.",
+            HTTPStatus.CONFLICT,
+        )
+
+
+@miniapp_blueprint.delete("/api/todo-lists/<tag_id>")
+def miniapp_todo_lists_delete(tag_id: str):
+    account, error_response = _authenticated_account()
+    if error_response is not None:
+        return error_response
+    assert account is not None
+    try:
+        tag_id = validate_list_id(tag_id, optional=False)
+    except TodoListValidationError:
+        return _error("invalid_request", "The list ID is invalid.", HTTPStatus.BAD_REQUEST)
+
+    try:
+        with acquire_runtime_lock(lock_path=_task_mutation_lock_path(account, "todo-lists")):
+            _tags, lists, metadata_error = _load_todo_list_metadata(account)
+            if metadata_error is not None:
+                return metadata_error
+            assert lists is not None
+            owned = find_owned_list(lists, tag_id)
+            if owned is None:
+                return _error("list_not_found", "The list was not found.", HTTPStatus.NOT_FOUND)
+
+            from Habitica_API import delete_tag_result
+
+            result = delete_tag_result(*_task_account_args(account), tag_id)
+            if not result.ok:
+                return _habitica_error_response(result, mutation=True)
+            return _private_json(
+                {"ok": True, "deleted": {"id": tag_id, "name": owned["name"]}},
+                HTTPStatus.OK,
+            )
+    except RuntimeLockUnavailable:
+        return _error(
+            "conflict",
+            "Lists are already being changed. Please wait and refresh.",
+            HTTPStatus.CONFLICT,
+        )
+
+
 @miniapp_blueprint.get("/api/tasks")
 def miniapp_tasks_list():
     account, error_response = _authenticated_account()
@@ -1427,13 +1628,19 @@ def miniapp_task_create():
         return error_response
     assert account is not None
     try:
-        _task_type, payload, _checklist = validate_task_payload(
-            _request_json_object(), creating=True
-        )
-    except TaskValidationError:
+        body = _request_json_object()
+        task_type, payload, _checklist = validate_task_payload(body, creating=True)
+        selected_list_id = payload.pop("listId", None)
+        if task_type == "todo" and "listId" in body:
+            _tags, lists, metadata_error = _load_todo_list_metadata(account)
+            if metadata_error is not None:
+                return metadata_error
+            assert lists is not None
+            payload["tags"] = tags_for_list_assignment([], lists, selected_list_id)
+    except (TaskValidationError, TodoListValidationError):
         return _error(
             "invalid_request",
-            "The task details are invalid.",
+            "The task details or selected list are invalid.",
             HTTPStatus.BAD_REQUEST,
         )
 
@@ -1484,6 +1691,20 @@ def miniapp_task_update(task_id: str):
                     creating=False,
                     existing_type=existing["type"],
                 )
+                list_assignment_requested = "listId" in body
+                selected_list_id = fields.pop("listId", None)
+                if existing["type"] == "todo" and list_assignment_requested:
+                    _tags, lists, metadata_error = _load_todo_list_metadata(account)
+                    if metadata_error is not None:
+                        return metadata_error
+                    assert lists is not None
+                    requested_tag_ids = tags_for_list_assignment(
+                        existing.get("tagIds", []),
+                        lists,
+                        selected_list_id,
+                    )
+                    if requested_tag_ids != existing.get("tagIds", []):
+                        fields["tags"] = requested_tag_ids
                 if existing["type"] == "daily" and ("repeatDays" in body or "startDate" in body):
                     if existing.get("scheduleEditable") is not True:
                         raise TaskValidationError("advanced schedules are read-only")
@@ -1511,10 +1732,10 @@ def miniapp_task_update(task_id: str):
                         > MAX_CHECKLIST_MUTATIONS_PER_EDIT
                     ):
                         raise TaskValidationError("too many checklist changes")
-            except TaskValidationError:
+            except (TaskValidationError, TodoListValidationError):
                 return _error(
                     "invalid_request",
-                    "The task details are invalid.",
+                    "The task details or selected list are invalid.",
                     HTTPStatus.BAD_REQUEST,
                 )
 

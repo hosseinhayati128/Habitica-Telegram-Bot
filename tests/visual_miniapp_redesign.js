@@ -28,6 +28,8 @@ const VALID_SCENARIOS = new Set([
   "day-unknown",
   "potion-unknown",
   "score-day-gate",
+  "list-loading",
+  "list-error",
 ]);
 const VALID_THEMES = new Set(["light", "dark"]);
 
@@ -149,6 +151,7 @@ function baseTask(id, type, text, overrides = {}) {
     repeatDays: type === "daily" ? ["su", "m", "t", "w", "th", "f", "s"] : [],
     scheduleEditable: type === "daily",
     checklist: [],
+    tagIds: [],
     revision: "a".repeat(32),
     canEdit: true,
     canDelete: true,
@@ -215,20 +218,21 @@ function fixtureTasks() {
     ),
     baseTask("daily-optional", "daily", "Weekly planning", { dueToday: false }),
     baseTask("daily-complete", "daily", "Make the bed", { completed: true }),
-    baseTask("todo-appointment", "todo", "Book dentist appointment", { date: "2026-08-20" }),
+    baseTask("todo-appointment", "todo", "Book dentist appointment", { date: "2026-08-20", tagIds: ["list-work"] }),
     baseTask("todo-report", "todo", "Finish project report", {
       notes: "Send the final PDF after one careful review",
+      tagIds: ["ordinary-focus", "list-work"],
       checklist: [
         { id: "todo-check-1", text: "Proofread", completed: true },
         { id: "todo-check-2", text: "Export PDF", completed: false },
       ],
     }),
-    baseTask("todo-groceries", "todo", "Buy groceries"),
-    baseTask("todo-call", "todo", "Call family"),
-    baseTask("todo-repair", "todo", "Repair the desk lamp"),
-    baseTask("todo-backup", "todo", "Back up documents"),
-    baseTask("todo-tickets", "todo", "Reserve train tickets", { date: "2026-08-24" }),
-    baseTask("todo-complete", "todo", "Renew library card", { completed: true }),
+    baseTask("todo-groceries", "todo", "Buy groceries", { tagIds: ["list-errands"] }),
+    baseTask("todo-call", "todo", "Call family", { tagIds: ["list-personal"] }),
+    baseTask("todo-repair", "todo", "Repair the desk lamp", { tagIds: ["deleted-list"] }),
+    baseTask("todo-backup", "todo", "Back up documents", { tagIds: ["list-work", "list-personal"] }),
+    baseTask("todo-tickets", "todo", "Reserve train tickets", { date: "2026-08-24", tagIds: ["list-work"] }),
+    baseTask("todo-complete", "todo", "Renew library card", { completed: true, tagIds: ["list-personal"] }),
   ];
 }
 
@@ -237,6 +241,12 @@ function newSession(scenario) {
     scenario,
     profile: fixtureProfile(),
     tasks: fixtureTasks(),
+    todoLists: [
+      { id: "list-work", name: "Work", order: 0 },
+      { id: "list-personal", name: "Personal", order: 1 },
+      { id: "list-errands", name: "Errands", order: 2 },
+    ],
+    ordinaryTags: [{ id: "ordinary-focus", name: "Focus", order: 0 }],
     meRequests: 0,
     avatarRequests: 0,
     scoreRequests: 0,
@@ -379,13 +389,14 @@ async function handleApi(request, response, url, session) {
     sendJson(response, 200, {
       ok: true,
       day: session.dayRefreshRequired
-        ? {
-            refreshRequired: true,
+          ? {
+              refreshRequired: true,
+              today: "2026-08-24",
             daysMissed: session.scenario === "day-multiple" ? 4 : 1,
             reviewLabel: session.scenario === "day-multiple" ? "Last active day" : "Yesterday",
             dailies: reviewDailies(session),
           }
-        : { refreshRequired: false },
+          : { refreshRequired: false, today: "2026-08-24" },
     });
     return;
   }
@@ -540,6 +551,61 @@ async function handleApi(request, response, url, session) {
     return;
   }
 
+  if (url.pathname === "/miniapp/api/todo-lists" && request.method === "GET") {
+    if (session.scenario === "list-loading") await delay(1800);
+    if (session.scenario === "list-error") {
+      sendJson(response, 503, {
+        ok: false,
+        error: { code: "habitica_unavailable", message: "The visual fixture could not load tags." },
+      });
+      return;
+    }
+    sendJson(response, 200, {
+      ok: true,
+      lists: copy(session.todoLists),
+      ordinaryTags: copy(session.ordinaryTags),
+    });
+    return;
+  }
+
+  if (url.pathname === "/miniapp/api/todo-lists" && request.method === "POST") {
+    const body = await readJsonBody(request);
+    generatedTaskId += 1;
+    const list = { id: `list-created-${generatedTaskId}`, name: body.name, order: session.todoLists.length };
+    session.todoLists.push(list);
+    sendJson(response, 201, { ok: true, list: copy(list) });
+    return;
+  }
+
+  const todoListMatch = url.pathname.match(/^\/miniapp\/api\/todo-lists\/([^/]+)$/);
+  if (todoListMatch && request.method === "PATCH") {
+    const listId = decodeURIComponent(todoListMatch[1]);
+    const list = session.todoLists.find((candidate) => candidate.id === listId);
+    const body = await readJsonBody(request);
+    if (!list) {
+      sendJson(response, 404, { ok: false, error: { code: "list_not_found", message: "List not found." } });
+      return;
+    }
+    list.name = body.name;
+    sendJson(response, 200, { ok: true, list: copy(list) });
+    return;
+  }
+
+  if (todoListMatch && request.method === "DELETE") {
+    const listId = decodeURIComponent(todoListMatch[1]);
+    const list = session.todoLists.find((candidate) => candidate.id === listId);
+    if (!list) {
+      sendJson(response, 404, { ok: false, error: { code: "list_not_found", message: "List not found." } });
+      return;
+    }
+    session.todoLists = session.todoLists.filter((candidate) => candidate.id !== listId);
+    session.tasks.forEach((task) => {
+      task.tagIds = (task.tagIds || []).filter((tagId) => tagId !== listId);
+    });
+    sendJson(response, 200, { ok: true, deleted: { id: listId, name: list.name } });
+    return;
+  }
+
   if (url.pathname === "/miniapp/api/tasks" && request.method === "GET") {
     session.taskListRequests += 1;
     if (session.scenario === "loading") await delay(1800);
@@ -576,6 +642,7 @@ async function handleApi(request, response, url, session) {
         text: item.text,
         completed: item.completed === true,
       })),
+      tagIds: draft.listId ? [draft.listId] : [],
     });
     session.tasks.push(created);
     sendJson(response, 200, { ok: true, task: copy(created) });
@@ -647,7 +714,13 @@ async function handleApi(request, response, url, session) {
       sendJson(response, 404, { ok: false, error: { code: "task_not_found", message: "Task not found." } });
       return;
     }
-    Object.assign(task, await readJsonBody(request));
+    const draft = await readJsonBody(request);
+    Object.assign(task, draft);
+    if (Object.prototype.hasOwnProperty.call(draft, "listId")) {
+      const listIds = new Set(session.todoLists.map((list) => list.id));
+      task.tagIds = (task.tagIds || []).filter((tagId) => !listIds.has(tagId));
+      if (draft.listId) task.tagIds.push(draft.listId);
+    }
     task.id = decodeURIComponent(taskMatch[1]);
     sendJson(response, 200, { ok: true, task: copy(task) });
     return;
@@ -772,6 +845,9 @@ async function disableMotion(page) {
 
 async function openFixture(browser, origin, options) {
   const page = await browser.newPage();
+  await page.evaluateOnNewDocument(() => {
+    try { localStorage.removeItem("hh_todo_view_v1"); } catch (_error) { /* optional */ }
+  });
   await page.setViewport({ width: options.width, height: options.height || VIEWPORT_HEIGHT, deviceScaleFactor: 1 });
   const errors = diagnosticsFor(page);
   const sid = options.sid.replace(/[^a-z0-9-]/g, "-");
@@ -1219,7 +1295,44 @@ async function captureTaskVariantsAndEditors(browser, origin, manifest) {
   });
   try {
     await waitForTaskView(todo.page);
-    await todo.page.click('[data-task-page="todo"] [data-task-filter="completed"]');
+    await todo.page.click("[data-todo-list-selector]");
+    await todo.page.waitForSelector("#todo-list-sheet[open]");
+    await screenshot(todo.page, "state-todo-list-selector-light-390.png", manifest, {
+      state: "todo-list-selector",
+      width: 390,
+      theme: "light",
+    });
+    await todo.page.click("[data-todo-lists-manage]");
+    await todo.page.waitForSelector("#todo-lists-manage-dialog[open]");
+    await screenshot(todo.page, "state-todo-manage-lists-light-390.png", manifest, {
+      state: "todo-manage-lists",
+      width: 390,
+      theme: "light",
+    });
+    await todo.page.click('[data-manage-list-delete="list-work"]');
+    await todo.page.waitForSelector("#todo-list-delete-dialog[open]");
+    assert.equal(await todo.page.$eval("#todo-list-delete-count", (node) => node.textContent), "3 Todos");
+    await screenshot(todo.page, "state-todo-delete-list-light-390.png", manifest, {
+      state: "todo-delete-list-confirmation",
+      width: 390,
+      theme: "light",
+    });
+    await todo.page.click("#todo-list-delete-cancel");
+
+    await todo.page.click("[data-todo-list-selector]");
+    await todo.page.waitForSelector("#todo-list-sheet[open]");
+    await todo.page.click("[data-todo-list-new]");
+    await todo.page.waitForSelector("#todo-list-name-dialog[open]");
+    await screenshot(todo.page, "state-todo-new-list-light-390.png", manifest, {
+      state: "todo-new-list",
+      width: 390,
+      theme: "light",
+    });
+    await todo.page.click("#todo-list-name-cancel");
+
+    await todo.page.click("[data-todo-list-selector]");
+    await todo.page.waitForSelector("#todo-list-sheet[open]");
+    await todo.page.click('[data-todo-view="completed"]');
     await todo.page.waitForSelector('[data-task-id="todo-complete"]');
     await screenshot(todo.page, "state-todos-completed-light-390.png", manifest, {
       state: "todos-completed",
@@ -1227,7 +1340,9 @@ async function captureTaskVariantsAndEditors(browser, origin, manifest) {
       theme: "light",
     });
 
-    await todo.page.click('[data-task-page="todo"] [data-task-filter="active"]');
+    await todo.page.click("[data-todo-list-selector]");
+    await todo.page.waitForSelector("#todo-list-sheet[open]");
+    await todo.page.click('[data-todo-view="list:list-work"]');
     await todo.page.waitForSelector('[data-task-id="todo-report"]');
     await todo.page.click('[data-task-id="todo-report"] .task-row__content');
     await todo.page.waitForSelector("#task-editor-dialog[open]");
@@ -1236,7 +1351,7 @@ async function captureTaskVariantsAndEditors(browser, origin, manifest) {
       width: 390,
       theme: "light",
     });
-    assertClean(todo.errors, "Todo completed view and editor");
+    assertClean(todo.errors, "Todo list selector, completed view, and editor");
   } finally {
     await todo.page.close();
   }
@@ -1280,6 +1395,79 @@ async function captureLoadingAndError(browser, origin, manifest) {
   }
 }
 
+async function captureTodoListMetadataStates(browser, origin, manifest) {
+  const tablet = await openFixture(browser, origin, {
+    width: 768,
+    height: 900,
+    theme: "dark",
+    view: "todos",
+    scenario: "normal",
+    sid: "todo-list-tablet",
+  });
+  try {
+    await waitForTaskView(tablet.page);
+    await tablet.page.click("[data-todo-list-selector]");
+    await tablet.page.waitForSelector("#todo-list-sheet[open]");
+    await screenshot(tablet.page, "state-todo-list-selector-dark-768.png", manifest, {
+      state: "todo-list-selector",
+      width: 768,
+      theme: "dark",
+    });
+    const sheetWidth = await tablet.page.$eval(
+      "#todo-list-sheet",
+      (node) => node.getBoundingClientRect().width,
+    );
+    assert(sheetWidth <= 621, `Tablet Todo sheet is too wide: ${sheetWidth}px.`);
+    assertClean(tablet.errors, "Todo list selector tablet");
+  } finally {
+    await tablet.page.close();
+  }
+
+  const loading = await openFixture(browser, origin, {
+    width: 360,
+    theme: "dark",
+    view: "todos",
+    scenario: "list-loading",
+    sid: "todo-list-loading",
+  });
+  try {
+    await loading.page.waitForFunction(() => {
+      const node = document.querySelector('[data-task-page="todo"] [data-task-loading]');
+      return node && !node.hidden;
+    });
+    await screenshot(loading.page, "state-todo-lists-loading-dark-360.png", manifest, {
+      state: "todo-lists-loading",
+      width: 360,
+      theme: "dark",
+    });
+    assertClean(loading.errors, "Todo list metadata loading");
+  } finally {
+    await loading.page.close();
+  }
+
+  const failed = await openFixture(browser, origin, {
+    width: 430,
+    theme: "light",
+    view: "todos",
+    scenario: "list-error",
+    sid: "todo-list-error",
+  });
+  try {
+    await failed.page.waitForFunction(() => {
+      const node = document.querySelector('[data-task-page="todo"] [data-task-error]');
+      return node && !node.hidden;
+    });
+    await screenshot(failed.page, "state-todo-lists-error-light-430.png", manifest, {
+      state: "todo-lists-error",
+      width: 430,
+      theme: "light",
+    });
+    assertClean(failed.errors, "Todo list metadata error", { allowHttp503: true });
+  } finally {
+    await failed.page.close();
+  }
+}
+
 async function captureProfileBeforeAfter(browser, origin, manifest) {
   const { page, errors, sid } = await openFixture(browser, origin, {
     width: 390,
@@ -1295,14 +1483,14 @@ async function captureProfileBeforeAfter(browser, origin, manifest) {
     await page.waitForFunction(() => document.querySelector("#mini-experience-value")?.textContent.startsWith("4073"));
     await screenshot(page, "state-profile-after-score-dark-390.png", manifest, { state: "profile-after-score", width: 390, theme: "dark" });
 
-    // The inline score patch is immediate; the authoritative /me refresh is
-    // deliberately debounced so rapid scores share one follow-up request.
+    // The confirmed score response carries the profile patch, so the Mini App
+    // must not add an avoidable full /me request after every tap.
     await new Promise((resolve) => setTimeout(resolve, 350));
 
     const session = sessions.get(sid);
     assert(session, "Profile scoring fixture session disappeared.");
     assert.equal(session.scoreRequests, 1, "One score tap must produce one score request.");
-    assert.equal(session.meRequests, 2, "A confirmed score must coalesce into one follow-up profile request.");
+    assert.equal(session.meRequests, 1, "A confirmed score must use its response patch without another /me request.");
     assert.equal(session.avatarRequests, 1, "Scoring must not rerender or refetch the avatar.");
     assertClean(errors, "profile before/after score");
   } finally {
@@ -1729,6 +1917,15 @@ async function main() {
   }
 
   const { server, origin } = await startServer();
+  if (process.env.VISUAL_SERVER_ONLY === "1") {
+    process.stdout.write(`Visual Mini App fixture ready at ${origin}\n`);
+    await new Promise((resolve) => {
+      process.once("SIGINT", resolve);
+      process.once("SIGTERM", resolve);
+    });
+    await new Promise((resolve) => server.close(resolve));
+    return;
+  }
   let browser;
   const manifest = [];
   const metrics = {};
@@ -1745,6 +1942,7 @@ async function main() {
     await captureQuickAdd(browser, origin, manifest);
     await captureEditorAndDelete(browser, origin, manifest);
     await captureLoadingAndError(browser, origin, manifest);
+    await captureTodoListMetadataStates(browser, origin, manifest);
     await captureProfileBeforeAfter(browser, origin, manifest);
     await capturePotionAndCounters(browser, origin, manifest);
     await captureDayGateFlows(browser, origin, manifest);

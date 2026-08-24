@@ -96,6 +96,51 @@ test("Todo filters keep active and completed data distinct", () => {
   assert.deepEqual(tasks.filterTasks("todo", [active, completed], "completed").map((item) => item.id), ["done"]);
 });
 
+test("Todo smart views and list views classify locally with Inbox-safe malformed tags", () => {
+  const lists = [
+    { id: "work", name: "Work", order: 0 },
+    { id: "personal", name: "Personal", order: 1 },
+  ];
+  const fixture = [
+    task({ id: "inbox", type: "todo", tagIds: [], date: null }),
+    task({ id: "today", type: "todo", tagIds: ["work"], date: "2026-08-24" }),
+    task({ id: "future", type: "todo", tagIds: ["personal"], date: "2026-08-26" }),
+    task({ id: "late", type: "todo", tagIds: ["work"], date: "2026-08-20" }),
+    task({ id: "unknown", type: "todo", tagIds: ["deleted"], date: null }),
+    task({ id: "multiple", type: "todo", tagIds: ["work", "personal"], date: null }),
+  ].map(tasks.normalizeTask);
+
+  assert.deepEqual(tasks.todoTasksForView(fixture, "inbox", lists, "2026-08-24").map((item) => item.id), [
+    "inbox", "unknown", "multiple",
+  ]);
+  assert.deepEqual(tasks.todoTasksForView(fixture, "today", lists, "2026-08-24").map((item) => item.id), ["today"]);
+  assert.deepEqual(tasks.todoTasksForView(fixture, "upcoming", lists, "2026-08-24").map((item) => item.id), ["future"]);
+  assert.deepEqual(tasks.todoTasksForView(fixture, "overdue", lists, "2026-08-24").map((item) => item.id), ["late"]);
+  assert.deepEqual(tasks.todoTasksForView(fixture, "list:work", lists, "2026-08-24").map((item) => item.id), ["today", "late"]);
+  assert.equal(tasks.primaryTodoListId(fixture.at(-1), lists), null);
+});
+
+test("All Todos groups Inbox first, then Habitica tag order, preserving task order within groups", () => {
+  const lists = [
+    { id: "personal", name: "Personal", order: 0 },
+    { id: "work", name: "Work", order: 1 },
+  ];
+  const fixture = [
+    task({ id: "work-1", type: "todo", tagIds: ["work"] }),
+    task({ id: "inbox-1", type: "todo", tagIds: [] }),
+    task({ id: "personal-1", type: "todo", tagIds: ["personal"] }),
+    task({ id: "work-2", type: "todo", tagIds: ["work"] }),
+  ].map(tasks.normalizeTask);
+  assert.deepEqual(tasks.groupAllTodos(fixture, lists).map((group) => ({
+    label: group.label,
+    ids: group.tasks.map((item) => item.id),
+  })), [
+    { label: "Inbox", ids: ["inbox-1"] },
+    { label: "Personal", ids: ["personal-1"] },
+    { label: "Work", ids: ["work-1", "work-2"] },
+  ]);
+});
+
 test("task editor validation returns a compact whitelisted Habit payload", () => {
   const result = tasks.validateTaskDraft({
     type: "habit",
@@ -272,6 +317,59 @@ test("controller lazy-loads collections and can refresh one when its tab is reop
     "/miniapp/api/tasks?type=habit",
   ]);
   assert.ok(calls.every((call) => call.options.method === "GET"));
+  controller.destroy();
+});
+
+test("Todo view switching is local and completed Todos load only when first opened", async () => {
+  const calls = [];
+  const active = [task({ id: "todo-1", type: "todo", tagIds: ["work"] })];
+  const completed = [task({ id: "todo-done", type: "todo", completed: true, tagIds: ["work"] })];
+  const controller = tasks.createTaskController({
+    root: null,
+    today: "2026-08-24",
+    requestJson: async (path, options) => {
+      calls.push({ path, options });
+      if (path.endsWith("/todo-lists")) {
+        return { ok: true, lists: [{ id: "work", name: "Work", order: 0 }], ordinaryTags: [] };
+      }
+      return { ok: true, tasks: path.includes("completed=true") ? completed : active };
+    },
+  });
+
+  await controller.activate("todos");
+  await controller.setTodoView("all");
+  await controller.setTodoView("list:work");
+  await controller.setTodoView("today");
+  assert.equal(calls.length, 2);
+  await controller.setTodoView("completed");
+  await controller.setTodoView("inbox");
+  await controller.setTodoView("completed");
+  assert.equal(calls.filter((call) => call.path.includes("completed=true")).length, 1);
+  assert.equal(calls.filter((call) => call.path.endsWith("/todo-lists")).length, 1);
+  controller.destroy();
+});
+
+test("confirmed list deletion moves locally classified tasks to Inbox without deleting them", async () => {
+  const active = task({ id: "todo-work", type: "todo", tagIds: ["work"] });
+  const controller = tasks.createTaskController({
+    root: null,
+    requestJson: async (path, options) => {
+      if (path.endsWith("/todo-lists") && options.method === "GET") {
+        return { ok: true, lists: [{ id: "work", name: "Work", order: 0 }], ordinaryTags: [] };
+      }
+      if (path.includes("/todo-lists/work") && options.method === "DELETE") {
+        return { ok: true, deleted: { id: "work", name: "Work" } };
+      }
+      return { ok: true, tasks: [active] };
+    },
+  });
+
+  await controller.activate("todos");
+  await controller.setTodoView("list:work");
+  await controller.deleteTodoList("work");
+  assert.equal(controller.findTask("todo-work").id, "todo-work");
+  assert.equal(controller.state.todoView, "inbox");
+  assert.equal(tasks.primaryTodoListId(controller.findTask("todo-work"), controller.state.todoLists.lists), null);
   controller.destroy();
 });
 

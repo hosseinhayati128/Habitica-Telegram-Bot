@@ -20,6 +20,7 @@ function daily(id, overrides = {}) {
 test("day status normalization distinguishes ready, one missed day, and multiple missed days", () => {
   assert.deepEqual(gameplay.normalizeDayPayload({ day: { refreshRequired: false } }), {
     refreshRequired: false,
+    today: null,
     daysMissed: 0,
     reviewLabel: "Yesterday",
     dailies: [],

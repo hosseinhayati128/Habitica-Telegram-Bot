@@ -135,6 +135,19 @@ def gameplay_failure(code, *, payload=None, **attributes):
     return SimpleNamespace(ok=False, data=value, error=error)
 
 
+LIST_WORK = "323e4567-e89b-42d3-a456-426614174010"
+LIST_PERSONAL = "323e4567-e89b-42d3-a456-426614174011"
+ORDINARY_TAG = "323e4567-e89b-42d3-a456-426614174012"
+
+
+def raw_tags():
+    return [
+        {"id": ORDINARY_TAG, "name": "Focus"},
+        {"id": LIST_WORK, "name": "list:Work"},
+        {"id": LIST_PERSONAL, "name": "list:Personal"},
+    ]
+
+
 def issued_potion_body(account=ACCOUNT):
     token = backend._issue_potion_purchase_intent(account)
     assert token is not None
@@ -1786,6 +1799,172 @@ def test_edit_limits_checklist_batch_before_any_mutation(app, monkeypatch, froze
         f"/miniapp/api/tasks/{TASK_ID}",
         headers=auth_header(),
         json={"revision": revision_for(old), "checklist": checklist},
+    )
+    assert response.status_code == 400
+    assert response.json["error"]["code"] == "invalid_request"
+
+
+def test_todo_lists_get_returns_ordered_lists_and_separate_ordinary_tags(
+    app, monkeypatch, frozen_time
+):
+    import Habitica_API
+
+    monkeypatch.setattr(Habitica_API, "get_tags_result", lambda *_args: ok(raw_tags()))
+    response = app.test_client().get("/miniapp/api/todo-lists", headers=auth_header())
+
+    assert response.status_code == 200
+    assert response.json["lists"] == [
+        {"id": LIST_WORK, "name": "Work", "order": 1},
+        {"id": LIST_PERSONAL, "name": "Personal", "order": 2},
+    ]
+    assert response.json["ordinaryTags"] == [
+        {"id": ORDINARY_TAG, "name": "Focus", "order": 0}
+    ]
+
+
+def test_todo_list_create_prefixes_tag_and_rejects_casefold_duplicate(
+    app, monkeypatch, frozen_time
+):
+    import Habitica_API
+
+    monkeypatch.setattr(Habitica_API, "get_tags_result", lambda *_args: ok(raw_tags()))
+    duplicate = app.test_client().post(
+        "/miniapp/api/todo-lists", headers=auth_header(), json={"name": " work "}
+    )
+    assert duplicate.status_code == 409
+    assert duplicate.json["error"]["code"] == "duplicate_list"
+
+    captured = []
+    monkeypatch.setattr(
+        Habitica_API,
+        "create_tag_result",
+        lambda _user, _key, name: captured.append(name)
+        or ok({"id": "323e4567-e89b-42d3-a456-426614174099", "name": name}, 201),
+    )
+    created = app.test_client().post(
+        "/miniapp/api/todo-lists", headers=auth_header(), json={"name": "Errands"}
+    )
+    assert created.status_code == 201
+    assert captured == ["list:Errands"]
+    assert created.json["list"]["name"] == "Errands"
+
+
+def test_todo_list_delete_validates_owned_prefix_and_never_deletes_tasks(
+    app, monkeypatch, frozen_time
+):
+    import Habitica_API
+
+    monkeypatch.setattr(Habitica_API, "get_tags_result", lambda *_args: ok(raw_tags()))
+    monkeypatch.setattr(
+        Habitica_API,
+        "delete_tag_result",
+        lambda _user, _key, tag_id: ok({}) if tag_id == LIST_WORK else pytest.fail(),
+    )
+    response = app.test_client().delete(
+        f"/miniapp/api/todo-lists/{LIST_WORK}", headers=auth_header()
+    )
+    assert response.status_code == 200
+    assert response.json["deleted"] == {"id": LIST_WORK, "name": "Work"}
+
+    ordinary = app.test_client().delete(
+        f"/miniapp/api/todo-lists/{ORDINARY_TAG}", headers=auth_header()
+    )
+    assert ordinary.status_code == 404
+
+
+def test_todo_create_accepts_owned_list_id_as_task_tag(app, monkeypatch, frozen_time):
+    import Habitica_API
+
+    captured = []
+    monkeypatch.setattr(Habitica_API, "get_tags_result", lambda *_args: ok(raw_tags()))
+
+    def create(_user, _key, payload):
+        captured.append(payload)
+        return ok(raw_task("todo", tags=payload["tags"]), 201)
+
+    monkeypatch.setattr(Habitica_API, "create_task_result", create)
+    response = app.test_client().post(
+        "/miniapp/api/tasks",
+        headers=auth_header(),
+        json={"type": "todo", "text": "Ship", "notes": "", "priority": 1, "listId": LIST_WORK},
+    )
+    assert response.status_code == 201
+    assert captured[0]["tags"] == [LIST_WORK]
+    assert "listId" not in captured[0]
+    assert response.json["task"]["tagIds"] == [LIST_WORK]
+
+
+def test_todo_edit_preserves_ordinary_tags_and_normalizes_multiple_list_tags(
+    app, monkeypatch, frozen_time
+):
+    import Habitica_API
+
+    current = raw_task(
+        "todo",
+        tags=[ORDINARY_TAG, LIST_WORK, LIST_PERSONAL],
+    )
+    captured = []
+    monkeypatch.setattr(Habitica_API, "get_task_result", lambda *_args: ok(current))
+    monkeypatch.setattr(Habitica_API, "get_tags_result", lambda *_args: ok(raw_tags()))
+
+    def update(_user, _key, _task_id, fields):
+        captured.append(fields)
+        return ok({**current, "tags": fields["tags"]})
+
+    monkeypatch.setattr(Habitica_API, "update_task_result", update)
+    response = app.test_client().patch(
+        f"/miniapp/api/tasks/{TASK_ID}",
+        headers=auth_header(),
+        json={"revision": revision_for(current), "listId": LIST_PERSONAL},
+    )
+    assert response.status_code == 200
+    assert captured == [{"tags": [ORDINARY_TAG, LIST_PERSONAL]}]
+    assert response.json["task"]["tagIds"] == [ORDINARY_TAG, LIST_PERSONAL]
+
+
+def test_repeated_same_list_save_does_not_add_tags_or_call_task_update(
+    app, monkeypatch, frozen_time
+):
+    import Habitica_API
+
+    current = raw_task("todo", tags=[ORDINARY_TAG, LIST_WORK])
+    monkeypatch.setattr(Habitica_API, "get_task_result", lambda *_args: ok(current))
+    monkeypatch.setattr(Habitica_API, "get_tags_result", lambda *_args: ok(raw_tags()))
+    monkeypatch.setattr(
+        Habitica_API,
+        "update_task_result",
+        lambda *_args: pytest.fail("an unchanged assignment must not mutate Habitica"),
+    )
+    response = app.test_client().patch(
+        f"/miniapp/api/tasks/{TASK_ID}",
+        headers=auth_header(),
+        json={"revision": revision_for(current), "listId": LIST_WORK},
+    )
+    assert response.status_code == 200
+    assert response.json["task"]["tagIds"] == [ORDINARY_TAG, LIST_WORK]
+
+
+def test_todo_save_rejects_list_deleted_by_another_client_before_mutation(
+    app, monkeypatch, frozen_time
+):
+    import Habitica_API
+
+    current = raw_task("todo", tags=[ORDINARY_TAG])
+    monkeypatch.setattr(Habitica_API, "get_task_result", lambda *_args: ok(current))
+    monkeypatch.setattr(
+        Habitica_API,
+        "get_tags_result",
+        lambda *_args: ok([{"id": ORDINARY_TAG, "name": "Focus"}]),
+    )
+    monkeypatch.setattr(
+        Habitica_API,
+        "update_task_result",
+        lambda *_args: pytest.fail("a missing list must fail before mutation"),
+    )
+    response = app.test_client().patch(
+        f"/miniapp/api/tasks/{TASK_ID}",
+        headers=auth_header(),
+        json={"revision": revision_for(current), "listId": LIST_WORK},
     )
     assert response.status_code == 400
     assert response.json["error"]["code"] == "invalid_request"
