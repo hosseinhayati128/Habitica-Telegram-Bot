@@ -24,8 +24,8 @@ exposing Habitica credentials to the browser.
 - Flask webhook and authenticated reminder-tick endpoints for PythonAnywhere.
 - Telegram Mini App Home view with signed Telegram authentication and read-only access
   to the existing linked Habitica account.
-- Authenticated Mini App task views with filters, simple task editing, checklists,
-  completion, and Habit scoring.
+- Authenticated Mini App task views with local smart filters, tag-backed Todo lists,
+  simple task editing, checklists, completion, and Habit scoring.
 - A startup Record Yesterday gate that follows Habitica's own `needsCron`, timezone,
   custom-day, and Daily-schedule rules before current-day scoring is enabled.
 - Compact authoritative Habit counters and a deliberate Health Potion action that
@@ -112,17 +112,19 @@ load a `.env` file.
 | `MINIAPP_DEV_MODE` | Local development only | Disabled. Set exactly `1` together with `MINIAPP_DEV_TELEGRAM_USER_ID` to open the Mini App outside Telegram. Never enable this in production. |
 | `MINIAPP_DEV_TELEGRAM_USER_ID` | Local development only | Existing linked Telegram user ID used only when development mode is explicitly enabled and the auth header is absent. |
 | `MINIAPP_AVATAR_REFRESH_COOLDOWN_SECONDS` | No | `30`, capped at 300. Reuses a recently rendered avatar instead of repeatedly launching Puppeteer for authenticated refresh replays. |
-| `HABITICA_CLIENT_ID` | Recommended | Habitica's public `x-client` identifier in `<author Habitica UUID>-<app name>` form. It is not a secret. The historical `habitica-telegram-bot` value remains the compatibility fallback. |
+| `HABITICA_CLIENT_ID` | Required for Habitica API use | Public `x-client` identifier in `<tool creator Habitica UUID>-<app name>` form, for example `12345678-90ab-416b-cdef-1234567890ab-hhabitica`. The app name must start with an ASCII letter or digit and contain at most 100 letters, digits, dots, underscores, or hyphens. It is not a secret. Missing or malformed values stop the request before any Habitica credentials are sent; the historical constant remains importable for code compatibility but is never sent. |
 
 Never commit real values. `.gitignore` excludes common secret files, pickle data,
 runtime locks, caches, and avatar output.
 
 ## Local development with polling
 
-Set at least the Telegram token and preferably an absolute development data path:
+Set the Telegram token, a compliant public Habitica client identifier, and preferably
+an absolute development data path:
 
 ```bash
 export TELEGRAM_BOT_TOKEN='replace-with-your-token'
+export HABITICA_CLIENT_ID='<tool-creator-habitica-uuid>-hhabitica'
 export BOT_DATA_PATH="$PWD/.runtime/dev-botdata.pkl"
 mkdir -p .runtime
 chmod 700 .runtime
@@ -204,13 +206,40 @@ The WSGI entry point is `webhook_app.flask_app`. It exposes:
   consumes that intent for one deliberate purchase.
 - `GET /miniapp/api/tasks?type=habit|daily|todo` for normalized active task lists;
   Todos also accept `completed=true|false`.
-- `POST /miniapp/api/tasks` to create a Habit, simple weekly Daily, or Todo.
+- `GET` and `POST /miniapp/api/todo-lists` to list or create user-owned Todo-list
+  tags; `PATCH` and `DELETE /miniapp/api/todo-lists/<tag_uuid>` rename or delete one.
+- `POST /miniapp/api/tasks` to create a Habit, simple weekly Daily, or Todo. Todo
+  requests may include a normalized `listId` (a user-owned tag UUID or `null`).
 - `PATCH /miniapp/api/tasks/<uuid>` and `DELETE /miniapp/api/tasks/<uuid>` to edit or
   delete an editable personal task.
 - `POST /miniapp/api/tasks/<uuid>/score` to score a Habit or change Daily/Todo
   completion.
 - `POST /miniapp/api/tasks/<uuid>/checklist/<item_uuid>/score` to set the requested
   checklist completion state safely.
+
+### Todo list storage and request behavior
+
+Todo lists do not add a database or change Habitica difficulty. Each custom list is an
+ordinary user tag named `list:<friendly name>`. Inbox is computed locally for an active
+Todo with no single valid list tag. A Todo may retain any number of ordinary Habitica
+tags, but the Mini App assigns at most one current list tag. Multiple valid list tags,
+unknown/deleted tag IDs, and malformed list metadata display safely in Inbox; an
+explicit editor save removes all current valid list tags and applies the chosen one
+while preserving every non-list tag ID.
+
+Opening Todos fetches the active Todo feed and ordered user tags once. Inbox, Today,
+Upcoming, Overdue, No Date, All Todos, and custom-list switches then filter that
+in-memory snapshot without additional Habitica requests. Completed Todos are fetched
+only when Completed is first opened and are limited by Habitica to the 30 most recently
+completed items. Manual refresh or reopening the Todos tab requests fresh active Todos
+and tags. The current view ID is the only list preference stored in browser local
+storage; task data remains authoritative in Habitica.
+
+Renaming a list renames its backing tag, so assigned Todos keep the same tag UUID.
+Deleting a list calls Habitica's tag-delete endpoint: Habitica removes that tag UUID
+from tasks, the tasks themselves are not deleted, and they consequently appear in
+Inbox. The confirmation count is calculated from the current active Todo snapshot and
+may change if another Habitica client edits tasks concurrently.
 
 The webhook and tick routes serialize their complete persistence transaction with a Linux advisory
 lock next to the pickle file. Lock contention returns HTTP 503 rather than allowing
@@ -276,7 +305,9 @@ from webhook_app import flask_app as application
 ```
 
 Generate independent high-entropy webhook and tick values. Do not reuse the bot token
-or a Habitica key. Reload the web app after changing its environment.
+or a Habitica key. `HABITICA_CLIENT_ID` is public, but it must identify the tool creator
+and application in Habitica's required `UserID-appname` form. Reload the web app after
+changing its environment.
 
 ### 3. Register the Telegram webhook manually
 
@@ -481,8 +512,10 @@ payload, or runtime output is staged.
   reproduce locally for detailed diagnosis rather than logging profile JSON.
 - **PythonAnywhere import fails:** verify the source directory, virtualenv, selected
   Python version, and WSGI `sys.path`, then reload the web app.
-- **Habitica actions fail:** verify credentials through `/relink` in a private chat.
-  Never paste credentials into an issue, log, screenshot, or group chat.
+- **Habitica actions fail:** first verify that `HABITICA_CLIENT_ID` is present in the
+  running process in `UserID-appname` form, then verify account credentials through
+  `/relink` in a private chat. Never paste credentials into an issue, log, screenshot,
+  or group chat.
 - **Task change says its outcome is unknown:** do not repeat the action immediately.
   Let the page reconcile from Habitica or use its refresh control first; score and
   checklist operations are intentionally never retried blindly.
@@ -522,17 +555,18 @@ payload, or runtime output is staged.
   process crash after an external Habitica mutation but before the journal is flushed
   can still leave an ambiguous replay; solving that fully needs a durable transactional
   design beyond a local pickle.
-- The Mini App supports personal Habits, Todos, and simple weekly Dailies. It displays
-  challenge/group or advanced-schedule tasks but keeps unsupported edits read-only;
-  tags, rewards, reminders, advanced recurrence, and drag ordering remain out of scope.
-- Editing an existing checklist is capped at one item operation per save to keep a
+- The Mini App supports personal Habits, Todos, simple weekly Dailies, and tag-backed
+  Todo lists. It displays challenge/group or advanced-schedule tasks but keeps
+  unsupported edits read-only; general tag editing, rewards, reminders, advanced
+  recurrence, list/task drag ordering, and list sharing remain out of scope.
+- Editing an existing checklist is capped at eight item operations per save to keep a
   one-worker deployment responsive and reduce partial updates. Larger checklist edits
   should be split across saves.
 - Habitica task mutations are not transactional. If a mutation response is lost, the
   UI refreshes display state but blocks another conflicting mutation for the remainder
   of that Mini App session; reopening the app is the explicit new intent. A partly
   applied edit likewise requires authoritative refresh before further work.
-- Completed Todos are limited to Habitica's retained completed-Todo feed rather than a
+- Completed Todos are limited to Habitica's 30-item completed-Todo feed rather than a
   permanent local archive; this project intentionally adds no task database or cache.
 - The runtime lock coordinates only processes on one Linux host that use these WSGI
   routes and the same `BOT_DATA_PATH`; it does not coordinate polling or another host.

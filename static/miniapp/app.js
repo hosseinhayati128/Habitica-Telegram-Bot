@@ -69,6 +69,10 @@
     quickAddType: null,
     quickAddSubmitting: false,
     quickAddTrigger: null,
+    todoListNameMode: "create",
+    todoListEditingId: null,
+    todoListDeleteId: null,
+    todoListSubmitting: false,
     discardConfirmed: false,
     ignoreNextPopstate: false,
   };
@@ -144,6 +148,9 @@
     habitDown: document.getElementById("habit-down"),
     dailyStartDate: document.getElementById("daily-start-date"),
     todoDueDate: document.getElementById("todo-due-date"),
+    todoListSelect: document.getElementById("todo-list-select"),
+    todoOrdinaryTagsField: document.getElementById("todo-ordinary-tags-field"),
+    todoOrdinaryTags: document.getElementById("todo-ordinary-tags"),
     checklistEditor: document.getElementById("checklist-editor"),
     checklistItems: document.getElementById("checklist-editor-items"),
     checklistAdd: document.getElementById("checklist-add"),
@@ -162,6 +169,28 @@
     quickAddMore: document.getElementById("quick-add-more"),
     quickAddSubmit: document.getElementById("quick-add-submit"),
     quickAddError: document.getElementById("quick-add-error"),
+    quickAddListField: document.querySelector("[data-quick-add-list-field]"),
+    quickAddList: document.getElementById("quick-add-list"),
+    todoListSheet: document.getElementById("todo-list-sheet"),
+    todoListSheetClose: document.getElementById("todo-list-sheet-close"),
+    todoListNameDialog: document.getElementById("todo-list-name-dialog"),
+    todoListNameForm: document.getElementById("todo-list-name-form"),
+    todoListNameTitle: document.getElementById("todo-list-name-title"),
+    todoListName: document.getElementById("todo-list-name"),
+    todoListNameClose: document.getElementById("todo-list-name-close"),
+    todoListNameCancel: document.getElementById("todo-list-name-cancel"),
+    todoListNameSubmit: document.getElementById("todo-list-name-submit"),
+    todoListNameError: document.getElementById("todo-list-name-error"),
+    todoListsManageDialog: document.getElementById("todo-lists-manage-dialog"),
+    todoListsManageRows: document.getElementById("todo-lists-manage-rows"),
+    todoListsManageClose: document.getElementById("todo-lists-manage-close"),
+    todoListsManageAdd: document.getElementById("todo-lists-manage-add"),
+    todoListDeleteDialog: document.getElementById("todo-list-delete-dialog"),
+    todoListDeleteForm: document.getElementById("todo-list-delete-form"),
+    todoListDeleteCount: document.getElementById("todo-list-delete-count"),
+    todoListDeleteError: document.getElementById("todo-list-delete-error"),
+    todoListDeleteCancel: document.getElementById("todo-list-delete-cancel"),
+    todoListDeleteConfirm: document.getElementById("todo-list-delete-confirm"),
     taskFab: document.getElementById("task-fab"),
     potionFab: document.getElementById("potion-fab"),
     potionDialog: document.getElementById("potion-dialog"),
@@ -666,6 +695,9 @@
   }
 
   function mutationProfilePatch(payload) {
+    if (payload?.profilePatch && typeof payload.profilePatch === "object") {
+      return payload.profilePatch;
+    }
     const envelope = gameplay?.profileEnvelope?.(payload);
     if (!envelope) return null;
     return {
@@ -765,12 +797,17 @@
     }
   }
 
-  function scheduleProfileRefresh(detail = {}) {
-    if (!profileCoordinator) initializeProfileCoordinator();
+  function applyConfirmedProfilePatch(detail = {}) {
     const sequence = Number.isInteger(detail.sequence) ? detail.sequence : 0;
     const isNewest = sequence >= state.profileMutationSequence;
-    if (isNewest) state.profileMutationSequence = sequence;
-    profileCoordinator?.scheduleMutationRefresh(isNewest ? detail.profilePatch || null : null);
+    if (!isNewest) return false;
+    state.profileMutationSequence = sequence;
+    const patch = detail.profilePatch;
+    if (!patch || typeof patch !== "object" || Object.keys(patch).length === 0) {
+      showProfileRefreshWarning();
+      return false;
+    }
+    return applyProfilePatch(patch);
   }
 
   async function ensureTaskProfileLoaded() {
@@ -1069,6 +1106,7 @@
       if (sequence !== state.startupRequestSequence) return false;
       applyProfileEnvelope(payload);
       const day = gameplay.normalizeDayPayload(payload);
+      if (day.today) taskController?.setToday?.(day.today);
       if (day.refreshRequired) {
         showDayReview(day, {
           preserveSelection,
@@ -1321,16 +1359,13 @@
         body: { purchaseIntent: state.potionPurchaseIntent },
       });
       const patch = mutationProfilePatch(payload);
-      // The server has confirmed this intent terminal even when Habitica's
-      // follow-up stats are unusable. Never turn that confirmed purchase into
-      // a retryable/unknown action; synchronize once through the safe GET.
+      // A successful Habitica response confirms the mutation and carries the
+      // new character statistics. Do not spend another request re-reading /me.
       state.potionPurchaseIntent = null;
-      if (patch && state.profilePayload && profileCoordinator) {
-        profileCoordinator.scheduleMutationRefresh(patch);
-      } else if (patch && state.profilePayload) {
+      if (patch && Object.keys(patch).length > 0 && state.profilePayload) {
         applyProfilePatch(patch);
       } else {
-        await loadProfile();
+        showProfileRefreshWarning();
       }
       state.potionSubmitting = false;
       closeDialog(elements.potionDialog);
@@ -1387,6 +1422,10 @@
       elements.quickAddDialog,
       elements.discardDialog,
       elements.potionDialog,
+      elements.todoListSheet,
+      elements.todoListNameDialog,
+      elements.todoListsManageDialog,
+      elements.todoListDeleteDialog,
     ].some(dialogIsOpen);
   }
 
@@ -1407,7 +1446,14 @@
     } catch (_error) {
       dialog.setAttribute("open", "");
     }
-    if ([elements.editorDialog, elements.quickAddDialog, elements.potionDialog].includes(dialog)) {
+    if ([
+      elements.editorDialog,
+      elements.quickAddDialog,
+      elements.potionDialog,
+      elements.todoListSheet,
+      elements.todoListNameDialog,
+      elements.todoListsManageDialog,
+    ].includes(dialog)) {
       history.pushState({ miniappOverlay: dialog.id, tab: state.activeTab }, "", window.location.href);
     }
     updateTelegramBackButton();
@@ -1428,7 +1474,14 @@
     if (
       unwindHistory
       && history.state?.miniappOverlay === dialog.id
-      && [elements.editorDialog, elements.quickAddDialog, elements.potionDialog].includes(dialog)
+      && [
+        elements.editorDialog,
+        elements.quickAddDialog,
+        elements.potionDialog,
+        elements.todoListSheet,
+        elements.todoListNameDialog,
+        elements.todoListsManageDialog,
+      ].includes(dialog)
     ) {
       state.ignoreNextPopstate = true;
       history.back();
@@ -1444,6 +1497,10 @@
         || dialogIsOpen(elements.quickAddDialog)
         || dialogIsOpen(elements.discardDialog)
         || dialogIsOpen(elements.potionDialog)
+        || dialogIsOpen(elements.todoListSheet)
+        || dialogIsOpen(elements.todoListNameDialog)
+        || dialogIsOpen(elements.todoListsManageDialog)
+        || dialogIsOpen(elements.todoListDeleteDialog)
         || state.startupState !== "ready"
       ) {
         telegram.BackButton.show();
@@ -1456,6 +1513,22 @@
   }
 
   function closeTopOverlay() {
+    if (dialogIsOpen(elements.todoListDeleteDialog) && !state.todoListSubmitting) {
+      closeDialog(elements.todoListDeleteDialog);
+      return true;
+    }
+    if (dialogIsOpen(elements.todoListNameDialog) && !state.todoListSubmitting) {
+      closeDialog(elements.todoListNameDialog);
+      return true;
+    }
+    if (dialogIsOpen(elements.todoListsManageDialog) && !state.todoListSubmitting) {
+      closeDialog(elements.todoListsManageDialog);
+      return true;
+    }
+    if (dialogIsOpen(elements.todoListSheet)) {
+      closeDialog(elements.todoListSheet);
+      return true;
+    }
     if (dialogIsOpen(elements.potionDialog) && !state.potionSubmitting) {
       closePotionDialog();
       return true;
@@ -1507,6 +1580,7 @@
       repeatDays: document.querySelector('[name="repeat-day"]'),
       startDate: elements.dailyStartDate,
       date: elements.todoDueDate,
+      listId: elements.todoListSelect,
       checklist: elements.checklistAdd,
     };
     const direct = fieldName && fieldName.startsWith("checklist.")
@@ -1628,6 +1702,22 @@
     elements.habitDown.checked = task ? task.down === true : true;
     elements.todoDueDate.value = task?.date || "";
     elements.dailyStartDate.value = task?.startDate || "";
+    const todoContext = taskController?.todoListContext?.(task) || {
+      lists: [], ordinaryTags: [], selectedListId: null,
+    };
+    elements.todoListSelect.replaceChildren(new Option("Inbox", ""));
+    todoContext.lists.forEach((list) => {
+      elements.todoListSelect.append(new Option(list.name, list.id));
+    });
+    elements.todoListSelect.value = todoContext.selectedListId || "";
+    elements.todoOrdinaryTags.replaceChildren();
+    todoContext.ordinaryTags.forEach((tag) => {
+      const chip = document.createElement("span");
+      chip.className = "tag-chip";
+      chip.textContent = tag.name;
+      elements.todoOrdinaryTags.append(chip);
+    });
+    elements.todoOrdinaryTagsField.hidden = type !== "todo" || todoContext.ordinaryTags.length === 0;
 
     document.querySelectorAll("[data-editor-fields]").forEach((section) => {
       section.hidden = section.dataset.editorFields !== type;
@@ -1709,6 +1799,7 @@
     }
     if (type === "todo") {
       draft.date = elements.todoDueDate.value;
+      draft.listId = elements.todoListSelect.value || null;
       draft.checklist = collectChecklistDraft();
     }
     return draft;
@@ -1866,6 +1957,16 @@
     });
   }
 
+  function syncQuickAddListOptions(type) {
+    const isTodo = type === "todo";
+    elements.quickAddListField.hidden = !isTodo;
+    elements.quickAddList.replaceChildren(new Option("Inbox", ""));
+    if (!isTodo) return;
+    const context = taskController?.todoListContext?.() || { lists: [], selectedListId: null };
+    context.lists.forEach((list) => elements.quickAddList.append(new Option(list.name, list.id)));
+    elements.quickAddList.value = context.selectedListId || "";
+  }
+
   function openQuickAdd(type) {
     if (!window.HabiticaTaskUI.TYPES.includes(type) || dialogIsOpen(elements.quickAddDialog)) return;
     state.quickAddType = type;
@@ -1874,6 +1975,7 @@
     elements.quickAddError.hidden = true;
     elements.quickAddError.textContent = "";
     elements.quickAddTypeLabel.textContent = `New ${taskTypeLabel(type)}`;
+    syncQuickAddListOptions(type);
     elements.quickAddSubmit.textContent = "Scribe Task";
     elements.quickAddForm.querySelectorAll('[name="quick-add-type"]').forEach((control) => {
       control.checked = control.value === type;
@@ -1898,6 +2000,7 @@
     const selectedPriority = elements.quickAddForm.querySelector('[name="quick-add-priority"]:checked')?.value;
     if (["habit", "daily", "todo"].includes(selectedType)) state.quickAddType = selectedType;
     const draft = window.HabiticaTaskUI.quickAddDefaults(state.quickAddType, elements.quickAddInput.value);
+    if (state.quickAddType === "todo") draft.listId = elements.quickAddList.value || null;
     if (["0.1", "1", "1.5", "2"].includes(selectedPriority)) draft.priority = selectedPriority;
     const validation = window.HabiticaTaskUI.validateTaskDraft(draft);
     if (!validation.ok) {
@@ -1943,7 +2046,188 @@
     }
   }
 
+  function todoLists() {
+    return taskController?.state?.todoLists?.lists || [];
+  }
+
+  function renderManageLists() {
+    elements.todoListsManageRows.replaceChildren();
+    const lists = todoLists();
+    if (!lists.length) {
+      const empty = document.createElement("p");
+      empty.className = "todo-sheet__loading";
+      empty.textContent = "No custom lists yet. Inbox is always available.";
+      elements.todoListsManageRows.append(empty);
+      return;
+    }
+    lists.forEach((list) => {
+      const row = document.createElement("div");
+      row.className = "manage-list-row";
+      const name = document.createElement("strong");
+      name.textContent = list.name;
+      const rename = document.createElement("button");
+      rename.type = "button";
+      rename.dataset.manageListRename = list.id;
+      rename.setAttribute("aria-label", `Rename ${list.name}`);
+      rename.textContent = "✎";
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.dataset.manageListDelete = list.id;
+      remove.setAttribute("aria-label", `Delete ${list.name}`);
+      remove.textContent = "×";
+      row.append(name, rename, remove);
+      elements.todoListsManageRows.append(row);
+    });
+  }
+
+  function openTodoListNameDialog(mode = "create", listId = null) {
+    const existing = todoLists().find((list) => list.id === listId) || null;
+    if (mode === "rename" && !existing) return;
+    state.todoListNameMode = mode;
+    state.todoListEditingId = existing?.id || null;
+    state.todoListSubmitting = false;
+    elements.todoListNameTitle.textContent = mode === "rename" ? "Rename List" : "New List";
+    elements.todoListNameSubmit.textContent = mode === "rename" ? "Save Name" : "Create List";
+    elements.todoListName.value = existing?.name || "";
+    elements.todoListNameError.hidden = true;
+    elements.todoListNameError.textContent = "";
+    closeDialog(elements.todoListsManageDialog, { unwindHistory: false });
+    showDialog(elements.todoListNameDialog);
+    window.requestAnimationFrame(() => elements.todoListName.select());
+  }
+
+  function setTodoListSubmitting(submitting) {
+    state.todoListSubmitting = submitting;
+    [
+      elements.todoListName,
+      elements.todoListNameClose,
+      elements.todoListNameCancel,
+      elements.todoListNameSubmit,
+      elements.todoListDeleteCancel,
+      elements.todoListDeleteConfirm,
+    ].forEach((control) => { if (control) control.disabled = submitting; });
+    elements.todoListNameDialog.setAttribute("aria-busy", String(submitting));
+    elements.todoListDeleteDialog.setAttribute("aria-busy", String(submitting));
+  }
+
+  async function submitTodoListName(event) {
+    event.preventDefault();
+    if (state.todoListSubmitting || !taskController) return;
+    const name = elements.todoListName.value.trim();
+    if (!name) {
+      elements.todoListNameError.textContent = "List name is required.";
+      elements.todoListNameError.hidden = false;
+      elements.todoListName.focus();
+      return;
+    }
+    setTodoListSubmitting(true);
+    elements.todoListNameError.hidden = true;
+    try {
+      if (state.todoListNameMode === "rename") {
+        await taskController.renameTodoList(state.todoListEditingId, name);
+      } else {
+        await taskController.createTodoList(name);
+      }
+      closeDialog(elements.todoListNameDialog);
+      haptic("notification", "success");
+    } catch (error) {
+      elements.todoListNameError.textContent = error?.message || "This list could not be saved.";
+      elements.todoListNameError.hidden = false;
+      setTodoListSubmitting(false);
+    }
+  }
+
+  function openManageLists() {
+    renderManageLists();
+    showDialog(elements.todoListsManageDialog);
+  }
+
+  function openTodoListDelete(listId) {
+    const list = todoLists().find((candidate) => candidate.id === listId);
+    if (!list) return;
+    const active = taskController?.state?.collections?.todoActive;
+    const tasks = active ? window.HabiticaTaskUI.collectionTasks(active) : [];
+    const affected = tasks.filter((task) => (
+      window.HabiticaTaskUI.primaryTodoListId(task, todoLists()) === listId
+    )).length;
+    state.todoListDeleteId = listId;
+    elements.todoListDeleteCount.textContent = `${affected} ${affected === 1 ? "Todo" : "Todos"}`;
+    elements.todoListDeleteError.hidden = true;
+    elements.todoListDeleteError.textContent = "";
+    closeDialog(elements.todoListsManageDialog, { unwindHistory: false });
+    showDialog(elements.todoListDeleteDialog);
+    haptic("notification", "warning");
+  }
+
+  async function submitTodoListDelete(event) {
+    event.preventDefault();
+    if (state.todoListSubmitting || !state.todoListDeleteId || !taskController) return;
+    setTodoListSubmitting(true);
+    try {
+      await taskController.deleteTodoList(state.todoListDeleteId);
+      state.todoListDeleteId = null;
+      closeDialog(elements.todoListDeleteDialog);
+      haptic("notification", "success");
+    } catch (error) {
+      elements.todoListDeleteError.textContent = error?.message || "This list could not be deleted.";
+      elements.todoListDeleteError.hidden = false;
+      setTodoListSubmitting(false);
+    }
+  }
+
   function installTaskDialogs() {
+    elements.todoListSheetClose.addEventListener("click", () => closeDialog(elements.todoListSheet));
+    elements.todoListSheet.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      closeDialog(elements.todoListSheet);
+    });
+    elements.todoListSheet.addEventListener("close", syncOverlayState);
+
+    elements.todoListNameForm.addEventListener("submit", submitTodoListName);
+    elements.todoListNameClose.addEventListener("click", () => {
+      if (!state.todoListSubmitting) closeDialog(elements.todoListNameDialog);
+    });
+    elements.todoListNameCancel.addEventListener("click", () => {
+      if (!state.todoListSubmitting) closeDialog(elements.todoListNameDialog);
+    });
+    elements.todoListNameDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      if (!state.todoListSubmitting) closeDialog(elements.todoListNameDialog);
+    });
+    elements.todoListNameDialog.addEventListener("close", () => {
+      state.todoListEditingId = null;
+      state.todoListSubmitting = false;
+      syncOverlayState();
+    });
+
+    elements.todoListsManageClose.addEventListener("click", () => closeDialog(elements.todoListsManageDialog));
+    elements.todoListsManageAdd.addEventListener("click", () => openTodoListNameDialog("create"));
+    elements.todoListsManageRows.addEventListener("click", (event) => {
+      const rename = event.target.closest("[data-manage-list-rename]");
+      const remove = event.target.closest("[data-manage-list-delete]");
+      if (rename) openTodoListNameDialog("rename", rename.dataset.manageListRename);
+      if (remove) openTodoListDelete(remove.dataset.manageListDelete);
+    });
+    elements.todoListsManageDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      closeDialog(elements.todoListsManageDialog);
+    });
+    elements.todoListsManageDialog.addEventListener("close", syncOverlayState);
+
+    elements.todoListDeleteForm.addEventListener("submit", submitTodoListDelete);
+    elements.todoListDeleteCancel.addEventListener("click", () => {
+      if (!state.todoListSubmitting) closeDialog(elements.todoListDeleteDialog);
+    });
+    elements.todoListDeleteDialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      if (!state.todoListSubmitting) closeDialog(elements.todoListDeleteDialog);
+    });
+    elements.todoListDeleteDialog.addEventListener("close", () => {
+      state.todoListDeleteId = null;
+      state.todoListSubmitting = false;
+      syncOverlayState();
+    });
+
     elements.editorForm.addEventListener("submit", submitTaskEditor);
     elements.editorClose.addEventListener("click", requestCloseTaskEditor);
     elements.editorBack.addEventListener("click", requestCloseTaskEditor);
@@ -2069,6 +2353,16 @@
     document.addEventListener("miniapp:task-delete-request", (event) => {
       openDeleteDialog(event.detail?.task);
     });
+    document.addEventListener("miniapp:todo-list-selector-open", () => {
+      showDialog(elements.todoListSheet);
+    });
+    document.addEventListener("miniapp:todo-list-selector-close", () => {
+      closeDialog(elements.todoListSheet, { unwindHistory: false });
+    });
+    document.addEventListener("miniapp:todo-list-create", () => {
+      openTodoListNameDialog("create");
+    });
+    document.addEventListener("miniapp:todo-lists-manage", openManageLists);
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape" && !state.editorSubmitting && !state.deleteSubmitting) closeTopOverlay();
     });
@@ -2094,7 +2388,8 @@
       announce,
       haptic,
       onMutationConfirmed: (detail) => {
-        scheduleProfileRefresh(detail);
+        if (detail.kind === "checklist") return;
+        applyConfirmedProfilePatch(detail);
         // Task pages already hold the confirmed mutation. Defer the expensive
         // four-list Home summary until Home is opened or explicitly refreshed.
         markQuestLogDirty();
@@ -2163,7 +2458,7 @@
       const type = { habits: "habit", dailies: "daily", todos: "todo" }[name];
       elements.taskFab.dataset.taskType = type;
       elements.taskFab.setAttribute("aria-label", `Quick add ${taskTypeLabel(type)}`);
-      void taskController?.activate(name);
+      void taskController?.activate(name, { refresh: !initial && previous !== name });
       void ensureTaskProfileLoaded();
     }
     if (!initial && previous !== name) {
@@ -2267,6 +2562,7 @@
         if (!control.checked || !["habit", "daily", "todo"].includes(control.value)) return;
         state.quickAddType = control.value;
         elements.quickAddTypeLabel.textContent = `New ${taskTypeLabel(control.value)}`;
+        syncQuickAddListOptions(control.value);
       });
     });
     installGameplayControls();

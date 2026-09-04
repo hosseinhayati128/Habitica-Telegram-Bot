@@ -102,20 +102,21 @@ def test_task_css_keeps_mobile_content_clear_and_long_text_wrapped():
     assert "@media (min-width: 760px)" in styles
 
 
-def test_profile_state_is_shared_without_refreshing_avatar_after_scores():
+def test_score_response_stats_patch_shared_profile_without_follow_up_fetch():
     application = (ROOT / "static" / "miniapp" / "app.js").read_text()
     tasks = (ROOT / "static" / "miniapp" / "tasks.js").read_text()
 
     assert "state.profilePayload" in application
     assert "renderMiniProfile" in application
-    assert "scheduleProfileRefresh" in application
-    assert "scheduleProfileRefresh(detail)" in application
-    assert "profileCoordinator?.scheduleMutationRefresh" in application
+    assert "applyConfirmedProfilePatch" in application
+    assert "applyConfirmedProfilePatch(detail)" in application
     assert "onMutationConfirmed(detail)" in tasks
     assert "profilePatch" in tasks
-    score_callback = application[application.index("function scheduleProfileRefresh") :]
+    score_callback = application[application.index("function applyConfirmedProfilePatch") :]
     score_callback = score_callback[: score_callback.index("async function ensureTaskProfileLoaded")]
     assert "loadAvatar" not in score_callback
+    assert "fetchProfile" not in score_callback
+    assert "scheduleMutationRefresh" not in score_callback
 
 
 def test_task_scores_defer_and_coalesce_expensive_home_summary_refreshes():
@@ -128,8 +129,17 @@ def test_task_scores_defer_and_coalesce_expensive_home_summary_refreshes():
 
     callback = application[application.index("onMutationConfirmed: (detail) =>") :]
     callback = callback[: callback.index("onDayRefreshRequired:")]
+    assert 'detail.kind === "checklist"' in callback
     assert "markQuestLogDirty()" in callback
     assert "loadQuestLog" not in callback
+
+
+def test_reopening_a_task_tab_refreshes_only_that_authoritative_collection():
+    application = (ROOT / "static" / "miniapp" / "app.js").read_text()
+    tasks = (ROOT / "static" / "miniapp" / "tasks.js").read_text()
+
+    assert 'taskController?.activate(name, { refresh: !initial && previous !== name })' in application
+    assert 'load(type, { force: activateOptions.refresh === true })' in tasks
 
 
 def test_collapsed_tasks_use_separate_content_and_scoring_actions():
@@ -198,8 +208,9 @@ def test_health_potion_is_a_persistent_confirmed_post_action_without_avatar_refr
     assert "var(--system-safe-left)" in styles
     assert "potionOutcomeUnknown" in application
     assert '"Check Habitica First"' in application
-    assert "profileCoordinator.scheduleMutationRefresh(patch)" in potion_section
-    assert "await loadProfile()" in potion_section
+    assert "applyProfilePatch(patch)" in potion_section
+    assert "scheduleMutationRefresh" not in potion_section
+    assert "await loadProfile()" not in potion_section
     assert 'throw Object.assign(new Error("Potion response was incomplete.")' not in application[
         application.index("async function submitPotion") :
         application.index("function installGameplayControls")

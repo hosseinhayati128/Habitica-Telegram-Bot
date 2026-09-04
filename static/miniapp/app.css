@@ -3442,6 +3442,333 @@ fieldset.editor-section,
   }
 }
 
+/* Tag-backed Todo lists and local smart views */
+.task-toolbar--todo {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.task-toolbar--todo .task-toolbar__title {
+  display: block;
+}
+
+.task-toolbar--todo .task-toolbar__title h1 {
+  margin: 0;
+  color: var(--figma-text);
+  font-family: var(--font-display);
+  font-size: 24px;
+  font-weight: 500;
+}
+
+.todo-list-selector {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 138px;
+  min-height: 44px;
+  padding: 7px 10px 7px 14px;
+  color: var(--figma-text);
+  text-align: left;
+  border: 1px solid var(--figma-border);
+  border-radius: 10px;
+  background: var(--figma-surface);
+}
+
+.todo-list-selector > span {
+  display: grid;
+  flex: 1;
+  gap: 1px;
+  min-width: 0;
+}
+
+.todo-list-selector small {
+  color: var(--figma-muted);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.todo-list-selector strong {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.todo-list-selector svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: var(--figma-gold);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+}
+
+.task-row__list-badge {
+  align-self: flex-start;
+  max-width: 100%;
+  margin-top: 3px;
+  overflow: hidden;
+  padding: 2px 6px;
+  color: var(--figma-muted);
+  border: 1px solid var(--figma-border);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--figma-raised) 72%, transparent);
+  font-size: 9px;
+  font-weight: 650;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-row--todo {
+  min-height: 70px;
+}
+
+.task-row--todo .task-row__completion,
+.task-row--todo .task-row__content {
+  min-height: 68px;
+}
+
+.todo-completed-limit {
+  margin: 14px 8px 0;
+  color: var(--figma-muted);
+  font-size: 10px;
+  line-height: 1.4;
+  text-align: center;
+}
+
+.task-dialog.bottom-sheet {
+  inset: auto 0 0;
+  width: min(100%, 620px);
+  max-width: none;
+  max-height: min(88dvh, 760px);
+  margin: auto auto 0;
+  overflow: hidden;
+  color: var(--figma-text);
+  border: 1px solid var(--figma-border);
+  border-bottom: 0;
+  border-radius: 22px 22px 0 0;
+  background: var(--figma-surface);
+  box-shadow: 0 -14px 40px rgb(0 0 0 / 48%);
+}
+
+.bottom-sheet__handle {
+  width: 42px;
+  height: 4px;
+  margin: 8px auto 2px;
+  border-radius: 99px;
+  background: var(--figma-border);
+}
+
+.bottom-sheet__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 18px 10px;
+}
+
+.bottom-sheet__header .eyebrow,
+.bottom-sheet__header h2 {
+  margin: 0;
+}
+
+.bottom-sheet__header h2 {
+  color: var(--figma-text);
+  font-size: 20px;
+}
+
+.bottom-sheet__body {
+  max-height: calc(min(88dvh, 760px) - 78px);
+  overflow: auto;
+  padding: 0 14px max(18px, env(safe-area-inset-bottom));
+  overscroll-behavior: contain;
+}
+
+.todo-sheet__section {
+  padding: 8px 0 12px;
+}
+
+.todo-sheet__section + .todo-sheet__section {
+  border-top: 1px solid var(--figma-border);
+}
+
+.todo-sheet__section-title {
+  margin: 0 8px 7px;
+  color: var(--figma-muted);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.todo-sheet__choices {
+  display: grid;
+  gap: 3px;
+}
+
+.todo-sheet__choice {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  min-height: 44px;
+  padding: 6px 10px;
+  color: var(--figma-text);
+  text-align: left;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+}
+
+.todo-sheet__choice:hover,
+.todo-sheet__choice.is-active {
+  border-color: color-mix(in srgb, var(--figma-purple) 45%, var(--figma-border));
+  background: color-mix(in srgb, var(--figma-purple) 13%, var(--figma-raised));
+}
+
+.todo-sheet__choice.is-active .todo-sheet__choice-icon,
+.todo-sheet__choice.is-active .todo-sheet__choice-label {
+  color: var(--figma-purple);
+}
+
+.todo-sheet__choice-icon {
+  color: var(--figma-muted);
+  font-size: 17px;
+  text-align: center;
+}
+
+.todo-sheet__choice-label {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.todo-sheet__choice-count {
+  min-width: 28px;
+  padding: 3px 7px;
+  color: var(--figma-muted);
+  border-radius: 999px;
+  background: var(--figma-raised);
+  font-size: 10px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.todo-sheet__actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--figma-border);
+}
+
+.todo-sheet__action {
+  min-height: 42px;
+  color: var(--figma-purple);
+  border: 1px solid color-mix(in srgb, var(--figma-purple) 42%, var(--figma-border));
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--figma-purple) 9%, var(--figma-surface));
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.todo-sheet__loading,
+.todo-sheet__error {
+  margin: 12px 4px;
+  padding: 18px;
+  color: var(--figma-muted);
+  border: 1px solid var(--figma-border);
+  border-radius: 12px;
+  background: var(--figma-raised);
+  text-align: center;
+}
+
+.todo-sheet__error strong { color: var(--figma-text); }
+
+.list-name-dialog,
+.manage-lists-dialog {
+  width: min(calc(100% - 28px), 520px);
+  color: var(--figma-text);
+  border: 1px solid var(--figma-border);
+  border-radius: 16px;
+  background: var(--figma-surface);
+}
+
+.list-name-dialog > form { background: transparent; }
+
+.manage-list-rows {
+  display: grid;
+  gap: 7px;
+}
+
+.manage-list-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 6px;
+  min-height: 48px;
+  padding: 7px 8px 7px 12px;
+  border: 1px solid var(--figma-border);
+  border-radius: 9px;
+  background: var(--figma-raised);
+}
+
+.manage-list-row strong {
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.manage-list-row button {
+  min-width: 36px;
+  min-height: 34px;
+  color: var(--figma-muted);
+  border: 1px solid var(--figma-border);
+  border-radius: 7px;
+  background: var(--figma-surface);
+}
+
+.manage-list-row button[data-manage-list-delete] { color: var(--figma-red); }
+.manage-list-add { width: 100%; margin-top: 12px; }
+
+.form-label {
+  display: block;
+  margin-bottom: 7px;
+  color: var(--figma-text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.tag-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tag-chip {
+  padding: 4px 8px;
+  color: var(--figma-muted);
+  border: 1px solid var(--figma-border);
+  border-radius: 999px;
+  background: var(--figma-raised);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+@media (max-width: 350px) {
+  .task-toolbar--todo { align-items: stretch; flex-direction: column; }
+  .todo-list-selector { width: 100%; }
+}
+
 @keyframes shimmer {
   to { transform: translateX(110%); }
 }

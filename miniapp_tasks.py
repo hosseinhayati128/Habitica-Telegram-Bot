@@ -34,6 +34,7 @@ MAX_TITLE_LENGTH = 500
 MAX_NOTES_LENGTH = 10_000
 MAX_CHECKLIST_ITEMS = 100
 MAX_CHECKLIST_TEXT_LENGTH = 500
+MAX_TASK_TAGS = 500
 MAX_SAFE_COUNTER = 9_007_199_254_740_991
 COUNTER_FREQUENCIES = frozenset({"daily", "weekly", "monthly"})
 
@@ -163,7 +164,7 @@ def validate_task_payload(
     allowed_by_type = {
         "habit": common_allowed | {"up", "down"},
         "daily": common_allowed | {"repeatDays", "startDate", "checklist"},
-        "todo": common_allowed | {"date", "checklist"},
+        "todo": common_allowed | {"date", "checklist", "listId"},
     }
     if set(value) - set().union(*allowed_by_type.values()):
         raise TaskValidationError("request body has unsupported fields")
@@ -236,6 +237,11 @@ def validate_task_payload(
             raise TaskValidationError("Todos do not support repeat fields")
         if "date" in value:
             fields["date"] = _calendar_date(value.get("date"), field="due date", optional=True)
+        if "listId" in value:
+            list_id = value.get("listId")
+            if list_id is not None:
+                list_id = validate_task_id(list_id)
+            fields["listId"] = list_id
 
     if creating:
         fields["type"] = task_type
@@ -342,6 +348,7 @@ def task_revision(task: Mapping[str, Any]) -> str:
         "everyX": task.get("everyX"),
         "repeatDays": task.get("repeatDays"),
         "checklist": task.get("checklist"),
+        "tagIds": task.get("tagIds"),
     }
     serialized = json.dumps(
         revision_fields,
@@ -394,6 +401,23 @@ def normalize_task(raw: Any) -> dict[str, Any] | None:
     )
     value = _safe_number(raw.get("value"))
 
+    raw_tags = raw.get("tags", [])
+    tag_ids: list[str] = []
+    seen_tag_ids: set[str] = set()
+    tags_truncated = False
+    if isinstance(raw_tags, list):
+        for tag_id in raw_tags:
+            if (
+                isinstance(tag_id, str)
+                and TASK_ID_RE.fullmatch(tag_id)
+                and tag_id not in seen_tag_ids
+            ):
+                if len(tag_ids) >= MAX_TASK_TAGS:
+                    tags_truncated = True
+                    break
+                seen_tag_ids.add(tag_id)
+                tag_ids.append(tag_id)
+
     task = {
         "id": task_id,
         "type": task_type,
@@ -434,10 +458,13 @@ def normalize_task(raw: Any) -> dict[str, Any] | None:
         "everyX": _safe_number(every_x),
         "scheduleEditable": schedule_editable,
         "checklist": [],
+        "tagIds": tag_ids,
+        "tagsTruncated": tags_truncated,
         "canEdit": not challenge_linked
         and not group_task
         and not text_truncated
-        and not notes_truncated,
+        and not notes_truncated
+        and not tags_truncated,
         "canDelete": not challenge_linked and not group_task,
     }
     raw_checklist = raw.get("checklist")

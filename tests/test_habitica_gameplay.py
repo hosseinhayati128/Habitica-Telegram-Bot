@@ -389,6 +389,7 @@ def test_evaluate_day_status_handles_no_tasks_and_multiple_days():
         "daysMissed": 4,
         "reviewLabel": "4 missed days",
         "dailies": [],
+        "today": "2026-08-14",
     }
 
 

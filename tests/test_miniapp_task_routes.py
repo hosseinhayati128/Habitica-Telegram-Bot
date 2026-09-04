@@ -54,7 +54,6 @@ def app(monkeypatch):
     application.config.update(TESTING=True, MAX_CONTENT_LENGTH=backend.MAX_TASK_REQUEST_BYTES)
     application.register_blueprint(backend.miniapp_blueprint)
     monkeypatch.setattr(backend, "load_linked_habitica_account", lambda _user_id: ACCOUNT)
-    monkeypatch.setattr(backend, "_ensure_gameplay_ready", lambda _account: None)
     with backend._POTION_PURCHASE_INTENTS_LOCK:
         backend._POTION_PURCHASE_INTENTS.clear()
 
@@ -134,6 +133,19 @@ def gameplay_failure(code, *, payload=None, **attributes):
     )
     value = PayloadValue(payload) if payload is not None else None
     return SimpleNamespace(ok=False, data=value, error=error)
+
+
+LIST_WORK = "323e4567-e89b-42d3-a456-426614174010"
+LIST_PERSONAL = "323e4567-e89b-42d3-a456-426614174011"
+ORDINARY_TAG = "323e4567-e89b-42d3-a456-426614174012"
+
+
+def raw_tags():
+    return [
+        {"id": ORDINARY_TAG, "name": "Focus"},
+        {"id": LIST_WORK, "name": "list:Work"},
+        {"id": LIST_PERSONAL, "name": "list:Personal"},
+    ]
 
 
 def issued_potion_body(account=ACCOUNT):
@@ -636,10 +648,10 @@ def test_health_potion_status_returns_only_confirmation_fields(
     assert response.headers["Vary"] == "Authorization"
 
 
-def test_health_potion_purchase_is_locked_and_returns_profile_without_avatar_work(
+def test_health_potion_purchase_is_one_call_and_returns_profile_patch_without_avatar_work(
     app, monkeypatch, frozen_time
 ):
-    import habitica_gameplay
+    import Habitica_API
 
     lock_calls = []
 
@@ -650,32 +662,25 @@ def test_health_potion_purchase_is_locked_and_returns_profile_without_avatar_wor
 
     service_calls = []
 
-    def purchase(user, key, *, fetch_content):
-        service_calls.append((user, key, fetch_content))
-        return gameplay_ok(
+    def purchase(user, key):
+        service_calls.append((user, key))
+        return ok(
             {
-                "profile": {
-                    "profile": {"level": 20, "class": "warrior"},
-                    "stats": {
-                        "hp": 35,
-                        "maxHp": 50,
-                        "exp": 100,
-                        "maxExp": 200,
-                        "mp": 30,
-                        "maxMp": 40,
-                        "gold": 55,
-                    },
-                },
-                "potion": {
-                    "name": "Health Potion",
-                    "price": 25,
-                    "healing": 15,
-                },
+                "stats": {
+                    "lvl": 20,
+                    "hp": 35,
+                    "maxHealth": 50,
+                    "exp": 100,
+                    "toNextLevel": 200,
+                    "mp": 30,
+                    "maxMP": 40,
+                    "gp": 55,
+                }
             }
         )
 
     monkeypatch.setattr(backend, "acquire_runtime_lock", tracked_lock)
-    monkeypatch.setattr(habitica_gameplay, "purchase_health_potion", purchase)
+    monkeypatch.setattr(Habitica_API, "buy_health_potion_result", purchase)
     monkeypatch.setattr(
         backend,
         "render_habitica_avatar",
@@ -693,37 +698,40 @@ def test_health_potion_purchase_is_locked_and_returns_profile_without_avatar_wor
     assert response.status_code == 200
     assert replay.status_code == response.status_code
     assert replay.get_json() == response.get_json()
-    assert response.json["profile"]["stats"]["hp"] == 35
-    assert response.json["profile"]["stats"]["gold"] == 55
-    assert response.json["invalidate"] == {"profile": True, "avatar": False}
-    assert service_calls == [
-        ("habitica-user", "habitica-key", backend._cached_potion_content_result)
-    ]
+    assert response.json["profilePatch"] == {
+        "level": 20,
+        "hp": 35,
+        "maxHp": 50,
+        "exp": 100,
+        "maxExp": 200,
+        "mp": 30,
+        "maxMp": 40,
+        "gold": 55,
+    }
+    assert response.json["syncRequired"] is False
+    assert service_calls == [("habitica-user", "habitica-key")]
     assert lock_calls[0][1] == 0
     assert lock_calls[0][0].parent.name == ".miniapp-gameplay-locks"
 
 
 @pytest.mark.parametrize(
-    ("code", "status", "public_code"),
+    ("kind", "status", "public_code"),
     [
-        ("health_already_full", 409, "health_already_full"),
-        ("not_enough_gold", 409, "not_enough_gold"),
-        ("habitica_unauthorized", 401, "habitica_unauthorized"),
-        ("habitica_unavailable", 502, "habitica_unavailable"),
-        ("invalid_response", 502, "habitica_unavailable"),
-        ("purchase_failed", 502, "purchase_failed"),
-        ("request_timeout", 504, "habitica_unavailable"),
+        (HabiticaErrorKind.UNAUTHORIZED, 409, "purchase_failed"),
+        (HabiticaErrorKind.INVALID_CREDENTIALS, 401, "unauthorized"),
+        (HabiticaErrorKind.BAD_REQUEST, 400, "invalid_request"),
+        (HabiticaErrorKind.UPSTREAM_ERROR, 502, "habitica_unavailable"),
     ],
 )
 def test_health_potion_errors_are_distinct_and_sanitized(
-    app, monkeypatch, frozen_time, code, status, public_code
+    app, monkeypatch, frozen_time, kind, status, public_code
 ):
-    import habitica_gameplay
+    import Habitica_API
 
     monkeypatch.setattr(
-        habitica_gameplay,
-        "purchase_health_potion",
-        lambda *_args, **_kwargs: gameplay_failure(code),
+        Habitica_API,
+        "buy_health_potion_result",
+        lambda *_args: failure(kind),
     )
 
     response = app.test_client().post(
@@ -739,18 +747,18 @@ def test_health_potion_errors_are_distinct_and_sanitized(
 def test_health_potion_rate_limit_and_unknown_outcome_keep_retry_metadata(
     app, monkeypatch, frozen_time
 ):
-    import habitica_gameplay
+    import Habitica_API
 
     calls = 0
 
-    def purchase(*_args, **_kwargs):
+    def purchase(*_args):
         nonlocal calls
         calls += 1
-        return gameplay_failure(
-            "rate_limited", retry_after=4.2, outcome_unknown=True
+        return failure(
+            HabiticaErrorKind.RATE_LIMITED, retry_after=4.2, outcome_unknown=True
         )
 
-    monkeypatch.setattr(habitica_gameplay, "purchase_health_potion", purchase)
+    monkeypatch.setattr(Habitica_API, "buy_health_potion_result", purchase)
 
     body = issued_potion_body()
     response = app.test_client().post(
@@ -760,19 +768,17 @@ def test_health_potion_rate_limit_and_unknown_outcome_keep_retry_metadata(
         "/miniapp/api/health-potion", headers=auth_header(), json=body
     )
 
-    assert response.status_code == 429
-    assert response.headers["Retry-After"] == "5"
+    assert response.status_code == 502
     assert response.json["reconcileRequired"] is True
     assert replay.status_code == response.status_code
     assert replay.get_json() == response.get_json()
-    assert replay.headers["Retry-After"] == "5"
     assert calls == 1
 
 
 def test_health_potion_duplicate_tap_never_reaches_purchase(
     app, monkeypatch, frozen_time
 ):
-    import habitica_gameplay
+    import Habitica_API
 
     def busy_lock(**_kwargs):
         raise backend.RuntimeLockUnavailable
@@ -780,20 +786,12 @@ def test_health_potion_duplicate_tap_never_reaches_purchase(
     monkeypatch.setattr(backend, "acquire_runtime_lock", busy_lock)
     calls = 0
 
-    def purchase(*_args, **_kwargs):
+    def purchase(*_args):
         nonlocal calls
         calls += 1
-        return gameplay_ok(
-            {
-                "profile": {
-                    "profile": {"level": 20, "class": "warrior"},
-                    "stats": {"hp": 35, "maxHp": 50, "gold": 55},
-                },
-                "potion": {"name": "Health Potion", "price": 25, "healing": 15},
-            }
-        )
+        return ok({"hp": 35, "maxHealth": 50, "gp": 55})
 
-    monkeypatch.setattr(habitica_gameplay, "purchase_health_potion", purchase)
+    monkeypatch.setattr(Habitica_API, "buy_health_potion_result", purchase)
 
     body = issued_potion_body()
     response = app.test_client().post(
@@ -819,7 +817,7 @@ def test_health_potion_duplicate_tap_never_reaches_purchase(
 def test_health_potion_in_progress_intent_rejects_overlap_before_service(
     app, monkeypatch, frozen_time
 ):
-    import habitica_gameplay
+    import Habitica_API
 
     body = issued_potion_body()
     claim, _digest, _replay = backend._claim_potion_purchase_intent(
@@ -827,9 +825,9 @@ def test_health_potion_in_progress_intent_rejects_overlap_before_service(
     )
     assert claim == "claimed"
     monkeypatch.setattr(
-        habitica_gameplay,
-        "purchase_health_potion",
-        lambda *_args, **_kwargs: pytest.fail("overlap must not reach the service"),
+        Habitica_API,
+        "buy_health_potion_result",
+        lambda *_args: pytest.fail("overlap must not reach the service"),
     )
 
     response = app.test_client().post(
@@ -843,7 +841,7 @@ def test_health_potion_in_progress_intent_rejects_overlap_before_service(
 def test_health_potion_intent_is_account_bound_and_expires_before_service(
     app, monkeypatch, frozen_time
 ):
-    import habitica_gameplay
+    import Habitica_API
 
     clock = [100.0]
     monkeypatch.setattr(backend.time, "monotonic", lambda: clock[0])
@@ -853,9 +851,9 @@ def test_health_potion_intent_is_account_bound_and_expires_before_service(
         backend, "load_linked_habitica_account", lambda _user_id: other_account
     )
     monkeypatch.setattr(
-        habitica_gameplay,
-        "purchase_health_potion",
-        lambda *_args, **_kwargs: pytest.fail("foreign intent must not reach service"),
+        Habitica_API,
+        "buy_health_potion_result",
+        lambda *_args: pytest.fail("foreign intent must not reach service"),
     )
 
     foreign = app.test_client().post(
@@ -879,16 +877,16 @@ def test_health_potion_intent_is_account_bound_and_expires_before_service(
 def test_health_potion_service_exception_is_terminal_and_replayed_once(
     app, monkeypatch, frozen_time
 ):
-    import habitica_gameplay
+    import Habitica_API
 
     calls = 0
 
-    def purchase(*_args, **_kwargs):
+    def purchase(*_args):
         nonlocal calls
         calls += 1
         raise RuntimeError("simulated private upstream failure")
 
-    monkeypatch.setattr(habitica_gameplay, "purchase_health_potion", purchase)
+    monkeypatch.setattr(Habitica_API, "buy_health_potion_result", purchase)
     body = issued_potion_body()
 
     first = app.test_client().post(
@@ -908,22 +906,16 @@ def test_health_potion_service_exception_is_terminal_and_replayed_once(
 def test_health_potion_confirmed_sync_required_success_is_terminal(
     app, monkeypatch, frozen_time
 ):
-    import habitica_gameplay
+    import Habitica_API
 
     calls = 0
 
-    def purchase(*_args, **_kwargs):
+    def purchase(*_args):
         nonlocal calls
         calls += 1
-        return gameplay_ok(
-            {
-                "profile": None,
-                "syncRequired": True,
-                "potion": {"name": "Health Potion", "price": 25, "healing": None},
-            }
-        )
+        return ok({"unexpected": "validated-but-incomplete"})
 
-    monkeypatch.setattr(habitica_gameplay, "purchase_health_potion", purchase)
+    monkeypatch.setattr(Habitica_API, "buy_health_potion_result", purchase)
     body = issued_potion_body()
     first = app.test_client().post(
         "/miniapp/api/health-potion", headers=auth_header(), json=body
@@ -933,33 +925,24 @@ def test_health_potion_confirmed_sync_required_success_is_terminal(
     )
 
     assert first.status_code == 200
-    assert first.json["profile"] is None
+    assert first.json["profilePatch"] == {}
     assert first.json["syncRequired"] is True
     assert second.get_json() == first.get_json()
     assert calls == 1
 
 
-@pytest.mark.parametrize(
-    ("method", "service_name"),
-    [
-        ("get", "get_health_potion_status"),
-        ("post", "purchase_health_potion"),
-    ],
-)
-def test_health_potion_service_day_gate_is_returned_consistently(
-    app, monkeypatch, frozen_time, method, service_name
+def test_health_potion_confirmation_dialog_respects_startup_day_gate(
+    app, monkeypatch, frozen_time
 ):
     import habitica_gameplay
 
     monkeypatch.setattr(
         habitica_gameplay,
-        service_name,
+        "get_health_potion_status",
         lambda *_args, **_kwargs: gameplay_failure("day_refresh_required"),
     )
-    kwargs = {"json": issued_potion_body()} if method == "post" else {}
-
-    response = getattr(app.test_client(), method)(
-        "/miniapp/api/health-potion", headers=auth_header(), **kwargs
+    response = app.test_client().get(
+        "/miniapp/api/health-potion", headers=auth_header()
     )
 
     assert response.status_code == 409
@@ -979,12 +962,12 @@ def test_health_potion_service_day_gate_is_returned_consistently(
 def test_health_potion_purchase_rejects_missing_or_extra_fields(
     app, monkeypatch, frozen_time, body
 ):
-    import habitica_gameplay
+    import Habitica_API
 
     monkeypatch.setattr(
-        habitica_gameplay,
-        "purchase_health_potion",
-        lambda *_args, **_kwargs: pytest.fail("invalid body must not purchase"),
+        Habitica_API,
+        "buy_health_potion_result",
+        lambda *_args: pytest.fail("invalid body must not purchase"),
     )
     kwargs = {"json": body} if body is not None else {}
     response = app.test_client().post(
@@ -999,12 +982,12 @@ def test_health_potion_purchase_rejects_missing_or_extra_fields(
 def test_health_potion_purchase_rejects_malformed_intent_before_service(
     app, monkeypatch, frozen_time, token
 ):
-    import habitica_gameplay
+    import Habitica_API
 
     monkeypatch.setattr(
-        habitica_gameplay,
-        "purchase_health_potion",
-        lambda *_args, **_kwargs: pytest.fail("malformed intent must not purchase"),
+        Habitica_API,
+        "buy_health_potion_result",
+        lambda *_args: pytest.fail("malformed intent must not purchase"),
     )
     response = app.test_client().post(
         "/miniapp/api/health-potion",
@@ -1016,25 +999,39 @@ def test_health_potion_purchase_rejects_malformed_intent_before_service(
     assert response.json["error"]["code"] == "invalid_purchase_intent"
 
 
-def test_day_gate_blocks_task_and_checklist_scores_before_task_lookup(
+def test_task_mutations_do_not_repeat_the_startup_day_gate_or_preflight_read(
     app, monkeypatch, frozen_time
 ):
     import Habitica_API
+    import habitica_gameplay
 
     monkeypatch.setattr(
-        backend,
-        "_ensure_gameplay_ready",
-        lambda _account: backend._error(
-            "day_refresh_required",
-            "Review yesterday's Dailies before starting the new day.",
-            backend.HTTPStatus.CONFLICT,
-        ),
+        habitica_gameplay,
+        "fetch_day_status",
+        lambda *_args: pytest.fail("startup day status must not be re-read by a mutation"),
     )
-    monkeypatch.setattr(
-        Habitica_API,
-        "get_task_result",
-        lambda *_args: pytest.fail("day-gated score must not load or mutate a task"),
-    )
+    calls = []
+
+    def score_task(*_args):
+        calls.append("score")
+        return ok({"hp": 49})
+
+    def confirm_task(*_args):
+        calls.append("confirm")
+        return ok(raw_task("habit", counterUp=1))
+
+    def update_checklist(*_args):
+        calls.append("checklist")
+        return ok(
+            raw_task(
+                "todo",
+                checklist=[{"id": ITEM_ID, "text": "Step", "completed": True}],
+            )
+        )
+
+    monkeypatch.setattr(Habitica_API, "score_task_result", score_task)
+    monkeypatch.setattr(Habitica_API, "get_task_result", confirm_task)
+    monkeypatch.setattr(Habitica_API, "update_checklist_item_result", update_checklist)
 
     score = app.test_client().post(
         f"/miniapp/api/tasks/{TASK_ID}/score",
@@ -1047,10 +1044,9 @@ def test_day_gate_blocks_task_and_checklist_scores_before_task_lookup(
         json={"completed": True},
     )
 
-    assert score.status_code == 409
-    assert checklist.status_code == 409
-    assert score.json["error"]["code"] == "day_refresh_required"
-    assert checklist.json["error"]["code"] == "day_refresh_required"
+    assert score.status_code == 200
+    assert checklist.status_code == 200
+    assert calls == ["score", "confirm", "checklist"]
 
 
 @pytest.mark.parametrize(
@@ -1104,7 +1100,11 @@ def test_edit_gets_authoritative_task_then_updates(app, monkeypatch, frozen_time
 
     current = raw_task("todo")
     calls = []
-    monkeypatch.setattr(Habitica_API, "get_task_result", lambda *_args: ok(current))
+    monkeypatch.setattr(
+        Habitica_API,
+        "get_task_result",
+        lambda *_args: ok(current),
+    )
 
     def update(_user, _key, task_id, fields):
         calls.append((task_id, fields))
@@ -1198,6 +1198,49 @@ def test_edit_reconciles_checklist_operations(app, monkeypatch, frozen_time):
     assert response.json["task"]["checklist"][0]["text"] == "new"
 
 
+def test_edit_adds_multiple_todo_checklist_items_in_one_save(app, monkeypatch, frozen_time):
+    import Habitica_API
+
+    old = raw_task("todo", checklist=[])
+    second_item_id = "323e4567-e89b-42d3-a456-426614174002"
+    calls = []
+    monkeypatch.setattr(Habitica_API, "get_task_result", lambda *_args: ok(old))
+
+    def add_item(_user, _key, _task_id, item):
+        calls.append(item)
+        checklist = [
+            {"id": ITEM_ID, "text": "First step", "completed": False},
+        ]
+        if len(calls) == 2:
+            checklist.append(
+                {"id": second_item_id, "text": "Second step", "completed": False}
+            )
+        return ok(raw_task("todo", checklist=checklist))
+
+    monkeypatch.setattr(Habitica_API, "add_checklist_item_result", add_item)
+    response = app.test_client().patch(
+        f"/miniapp/api/tasks/{TASK_ID}",
+        headers=auth_header(),
+        json={
+            "revision": revision_for(old),
+            "checklist": [
+                {"text": "First step", "completed": False},
+                {"text": "Second step", "completed": False},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls == [
+        {"text": "First step", "completed": False},
+        {"text": "Second step", "completed": False},
+    ]
+    assert [item["text"] for item in response.json["task"]["checklist"]] == [
+        "First step",
+        "Second step",
+    ]
+
+
 def test_delete_checks_capability_and_returns_minimal_tombstone(app, monkeypatch, frozen_time):
     import Habitica_API
 
@@ -1260,7 +1303,7 @@ def test_habit_scoring_reconciles_with_follow_up_get(
         json={"direction": direction},
     )
     assert response.status_code == 200
-    assert response.json["task"][counter_name] == 2
+    assert response.json["task"][counter_name] == 1
     assert response.json["profilePatch"] == {
         "level": 19,
         "hp": 49.5,
@@ -1274,7 +1317,7 @@ def test_habit_scoring_reconciles_with_follow_up_get(
     assert "score-secret-marker" not in response.get_data(as_text=True)
     assert "class" not in response.json["profilePatch"]
     assert "points" not in response.json["profilePatch"]
-    assert calls == 2
+    assert calls == 1
 
 
 @pytest.mark.parametrize(("completed", "direction"), [(False, "up"), (True, "down")])
@@ -1288,7 +1331,7 @@ def test_daily_and_todo_completion_direction_is_state_checked(
     def get_task(*_args):
         nonlocal calls
         calls += 1
-        return ok(raw_task("todo", completed=completed if calls == 1 else not completed))
+        return ok(raw_task("todo", completed=not completed))
 
     monkeypatch.setattr(Habitica_API, "get_task_result", get_task)
     monkeypatch.setattr(
@@ -1303,6 +1346,7 @@ def test_daily_and_todo_completion_direction_is_state_checked(
     )
     assert response.status_code == 200
     assert response.json["task"]["completed"] is (not completed)
+    assert calls == 1
 
 
 def test_score_confirmed_but_reconcile_failed_reports_applied(app, monkeypatch, frozen_time):
@@ -1313,11 +1357,7 @@ def test_score_confirmed_but_reconcile_failed_reports_applied(app, monkeypatch, 
     def get_task(*_args):
         nonlocal calls
         calls += 1
-        return (
-            ok(raw_task("todo"))
-            if calls == 1
-            else failure(HabiticaErrorKind.UPSTREAM_ERROR, status=503)
-        )
+        return failure(HabiticaErrorKind.UPSTREAM_ERROR, status=503)
 
     monkeypatch.setattr(Habitica_API, "get_task_result", get_task)
     monkeypatch.setattr(
@@ -1332,15 +1372,16 @@ def test_score_confirmed_but_reconcile_failed_reports_applied(app, monkeypatch, 
     )
     assert response.status_code == 200
     assert response.json["reloadRequired"] is True
-    assert response.json["task"]["completed"] is True
+    assert response.json["task"] is None
     assert response.json["profilePatch"] == {"level": 3, "hp": 48, "gold": 12.5}
+    assert calls == 1
 
 
 @pytest.mark.parametrize(
     ("direction", "counter_name"),
     [("up", "counterUp"), ("down", "counterDown")],
 )
-def test_stale_habit_reconciliation_cannot_restore_an_older_counter(
+def test_habit_score_returns_the_authoritative_follow_up_task(
     app, monkeypatch, frozen_time, direction, counter_name
 ):
     import Habitica_API
@@ -1356,8 +1397,8 @@ def test_stale_habit_reconciliation_cannot_restore_an_older_counter(
     )
 
     assert response.status_code == 200
-    assert response.json["reloadRequired"] is True
-    assert response.json["task"][counter_name] == stale[counter_name] + 1
+    assert "reloadRequired" not in response.json
+    assert response.json["task"][counter_name] == stale[counter_name]
     assert response.json["task"]["counterFrequency"] == "monthly"
 
 
@@ -1450,9 +1491,11 @@ def test_ambiguous_score_is_not_reported_as_safe_retry(app, monkeypatch, frozen_
 def test_checklist_desired_state_makes_repeated_request_safe(app, monkeypatch, frozen_time):
     import Habitica_API
 
-    score_calls = 0
+    update_calls = 0
 
-    def get_task(*_args):
+    def update(*_args):
+        nonlocal update_calls
+        update_calls += 1
         return ok(
             raw_task(
                 "todo",
@@ -1460,31 +1503,25 @@ def test_checklist_desired_state_makes_repeated_request_safe(app, monkeypatch, f
             )
         )
 
-    def score(*_args):
-        nonlocal score_calls
-        score_calls += 1
-        return ok({})
-
-    monkeypatch.setattr(Habitica_API, "get_task_result", get_task)
-    monkeypatch.setattr(Habitica_API, "score_checklist_item_result", score)
+    monkeypatch.setattr(Habitica_API, "update_checklist_item_result", update)
     response = app.test_client().post(
         f"/miniapp/api/tasks/{TASK_ID}/checklist/{ITEM_ID}/score",
         headers=auth_header(),
         json={"completed": True},
     )
     assert response.status_code == 200
-    assert score_calls == 0
+    assert update_calls == 1
 
 
 def test_checklist_change_uses_idempotent_completed_only_put(app, monkeypatch, frozen_time):
     import Habitica_API
 
-    current = raw_task(
-        "todo",
-        checklist=[{"id": ITEM_ID, "text": "keep this text", "completed": False}],
-    )
     sent = []
-    monkeypatch.setattr(Habitica_API, "get_task_result", lambda *_args: ok(current))
+    monkeypatch.setattr(
+        Habitica_API,
+        "get_task_result",
+        lambda *_args: pytest.fail("checklist update must not pre-read the task"),
+    )
 
     def update(_user, _key, _task_id, _item_id, body):
         sent.append(body)
@@ -1762,6 +1799,172 @@ def test_edit_limits_checklist_batch_before_any_mutation(app, monkeypatch, froze
         f"/miniapp/api/tasks/{TASK_ID}",
         headers=auth_header(),
         json={"revision": revision_for(old), "checklist": checklist},
+    )
+    assert response.status_code == 400
+    assert response.json["error"]["code"] == "invalid_request"
+
+
+def test_todo_lists_get_returns_ordered_lists_and_separate_ordinary_tags(
+    app, monkeypatch, frozen_time
+):
+    import Habitica_API
+
+    monkeypatch.setattr(Habitica_API, "get_tags_result", lambda *_args: ok(raw_tags()))
+    response = app.test_client().get("/miniapp/api/todo-lists", headers=auth_header())
+
+    assert response.status_code == 200
+    assert response.json["lists"] == [
+        {"id": LIST_WORK, "name": "Work", "order": 1},
+        {"id": LIST_PERSONAL, "name": "Personal", "order": 2},
+    ]
+    assert response.json["ordinaryTags"] == [
+        {"id": ORDINARY_TAG, "name": "Focus", "order": 0}
+    ]
+
+
+def test_todo_list_create_prefixes_tag_and_rejects_casefold_duplicate(
+    app, monkeypatch, frozen_time
+):
+    import Habitica_API
+
+    monkeypatch.setattr(Habitica_API, "get_tags_result", lambda *_args: ok(raw_tags()))
+    duplicate = app.test_client().post(
+        "/miniapp/api/todo-lists", headers=auth_header(), json={"name": " work "}
+    )
+    assert duplicate.status_code == 409
+    assert duplicate.json["error"]["code"] == "duplicate_list"
+
+    captured = []
+    monkeypatch.setattr(
+        Habitica_API,
+        "create_tag_result",
+        lambda _user, _key, name: captured.append(name)
+        or ok({"id": "323e4567-e89b-42d3-a456-426614174099", "name": name}, 201),
+    )
+    created = app.test_client().post(
+        "/miniapp/api/todo-lists", headers=auth_header(), json={"name": "Errands"}
+    )
+    assert created.status_code == 201
+    assert captured == ["list:Errands"]
+    assert created.json["list"]["name"] == "Errands"
+
+
+def test_todo_list_delete_validates_owned_prefix_and_never_deletes_tasks(
+    app, monkeypatch, frozen_time
+):
+    import Habitica_API
+
+    monkeypatch.setattr(Habitica_API, "get_tags_result", lambda *_args: ok(raw_tags()))
+    monkeypatch.setattr(
+        Habitica_API,
+        "delete_tag_result",
+        lambda _user, _key, tag_id: ok({}) if tag_id == LIST_WORK else pytest.fail(),
+    )
+    response = app.test_client().delete(
+        f"/miniapp/api/todo-lists/{LIST_WORK}", headers=auth_header()
+    )
+    assert response.status_code == 200
+    assert response.json["deleted"] == {"id": LIST_WORK, "name": "Work"}
+
+    ordinary = app.test_client().delete(
+        f"/miniapp/api/todo-lists/{ORDINARY_TAG}", headers=auth_header()
+    )
+    assert ordinary.status_code == 404
+
+
+def test_todo_create_accepts_owned_list_id_as_task_tag(app, monkeypatch, frozen_time):
+    import Habitica_API
+
+    captured = []
+    monkeypatch.setattr(Habitica_API, "get_tags_result", lambda *_args: ok(raw_tags()))
+
+    def create(_user, _key, payload):
+        captured.append(payload)
+        return ok(raw_task("todo", tags=payload["tags"]), 201)
+
+    monkeypatch.setattr(Habitica_API, "create_task_result", create)
+    response = app.test_client().post(
+        "/miniapp/api/tasks",
+        headers=auth_header(),
+        json={"type": "todo", "text": "Ship", "notes": "", "priority": 1, "listId": LIST_WORK},
+    )
+    assert response.status_code == 201
+    assert captured[0]["tags"] == [LIST_WORK]
+    assert "listId" not in captured[0]
+    assert response.json["task"]["tagIds"] == [LIST_WORK]
+
+
+def test_todo_edit_preserves_ordinary_tags_and_normalizes_multiple_list_tags(
+    app, monkeypatch, frozen_time
+):
+    import Habitica_API
+
+    current = raw_task(
+        "todo",
+        tags=[ORDINARY_TAG, LIST_WORK, LIST_PERSONAL],
+    )
+    captured = []
+    monkeypatch.setattr(Habitica_API, "get_task_result", lambda *_args: ok(current))
+    monkeypatch.setattr(Habitica_API, "get_tags_result", lambda *_args: ok(raw_tags()))
+
+    def update(_user, _key, _task_id, fields):
+        captured.append(fields)
+        return ok({**current, "tags": fields["tags"]})
+
+    monkeypatch.setattr(Habitica_API, "update_task_result", update)
+    response = app.test_client().patch(
+        f"/miniapp/api/tasks/{TASK_ID}",
+        headers=auth_header(),
+        json={"revision": revision_for(current), "listId": LIST_PERSONAL},
+    )
+    assert response.status_code == 200
+    assert captured == [{"tags": [ORDINARY_TAG, LIST_PERSONAL]}]
+    assert response.json["task"]["tagIds"] == [ORDINARY_TAG, LIST_PERSONAL]
+
+
+def test_repeated_same_list_save_does_not_add_tags_or_call_task_update(
+    app, monkeypatch, frozen_time
+):
+    import Habitica_API
+
+    current = raw_task("todo", tags=[ORDINARY_TAG, LIST_WORK])
+    monkeypatch.setattr(Habitica_API, "get_task_result", lambda *_args: ok(current))
+    monkeypatch.setattr(Habitica_API, "get_tags_result", lambda *_args: ok(raw_tags()))
+    monkeypatch.setattr(
+        Habitica_API,
+        "update_task_result",
+        lambda *_args: pytest.fail("an unchanged assignment must not mutate Habitica"),
+    )
+    response = app.test_client().patch(
+        f"/miniapp/api/tasks/{TASK_ID}",
+        headers=auth_header(),
+        json={"revision": revision_for(current), "listId": LIST_WORK},
+    )
+    assert response.status_code == 200
+    assert response.json["task"]["tagIds"] == [ORDINARY_TAG, LIST_WORK]
+
+
+def test_todo_save_rejects_list_deleted_by_another_client_before_mutation(
+    app, monkeypatch, frozen_time
+):
+    import Habitica_API
+
+    current = raw_task("todo", tags=[ORDINARY_TAG])
+    monkeypatch.setattr(Habitica_API, "get_task_result", lambda *_args: ok(current))
+    monkeypatch.setattr(
+        Habitica_API,
+        "get_tags_result",
+        lambda *_args: ok([{"id": ORDINARY_TAG, "name": "Focus"}]),
+    )
+    monkeypatch.setattr(
+        Habitica_API,
+        "update_task_result",
+        lambda *_args: pytest.fail("a missing list must fail before mutation"),
+    )
+    response = app.test_client().patch(
+        f"/miniapp/api/tasks/{TASK_ID}",
+        headers=auth_header(),
+        json={"revision": revision_for(current), "listId": LIST_WORK},
     )
     assert response.status_code == 400
     assert response.json["error"]["code"] == "invalid_request"

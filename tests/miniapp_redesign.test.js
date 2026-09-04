@@ -118,6 +118,7 @@ test("quick add creates minimal safe defaults for the active task type", () => {
     priority: 1,
     date: null,
     checklist: [],
+    listId: null,
   });
   assert.throws(() => tasks.quickAddDefaults("reward", "Unsafe"), /invalid/i);
 });

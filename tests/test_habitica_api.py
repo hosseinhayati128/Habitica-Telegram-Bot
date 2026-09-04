@@ -8,6 +8,7 @@ import Habitica_API as api
 
 USER_ID = "habitica-user-secret"
 API_KEY = "habitica-api-key-secret"
+CLIENT_ID = "12345678-90ab-416b-cdef-1234567890ab-hhabitica-tests"
 
 
 class FakeResponse:
@@ -73,26 +74,57 @@ def test_get_status_uses_canonical_headers_and_connect_read_timeout(monkeypatch)
     assert kwargs["headers"] == {
         "x-api-user": USER_ID,
         "x-api-key": API_KEY,
-        "x-client": api.CLIENT_ID,
+        "x-client": CLIENT_ID,
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
 
 
 def test_headers_support_configured_habitica_client_id(monkeypatch):
-    monkeypatch.setenv("HABITICA_CLIENT_ID", "configured-client-id")
+    configured = "abcdefab-cdef-4abc-8def-abcdefabcdef-configured-client"
+    monkeypatch.setenv("HABITICA_CLIENT_ID", configured)
 
-    assert api._headers(USER_ID, API_KEY)["x-client"] == "configured-client-id"
+    assert api._headers(USER_ID, API_KEY)["x-client"] == configured
 
 
 @pytest.mark.parametrize(
     "configured",
-    ["", "   ", "bad\nheader", "non-ascii-💥", "x" * 201],
+    [
+        "",
+        "   ",
+        "configured-client-id",
+        "bad\nheader",
+        "non-ascii-💥",
+        "12345678-90ab-416b-cdef-1234567890ab-bad app",
+        "12345678-90ab-416b-cdef-1234567890ab-" + "x" * 101,
+    ],
 )
-def test_headers_fall_back_for_empty_or_unsafe_client_id(monkeypatch, configured):
+def test_headers_reject_missing_or_malformed_client_id(monkeypatch, configured):
     monkeypatch.setenv("HABITICA_CLIENT_ID", configured)
 
-    assert api._headers(USER_ID, API_KEY)["x-client"] == api.CLIENT_ID
+    with pytest.raises(api.HabiticaConfigurationError):
+        api._headers(USER_ID, API_KEY)
+
+
+def test_transports_fail_safely_before_network_without_client_id(monkeypatch, caplog):
+    monkeypatch.delenv("HABITICA_CLIENT_ID")
+    calls = install_response(
+        monkeypatch,
+        FakeResponse(payload={"success": True, "data": {}}),
+    )
+
+    typed = api.get_user_result(USER_ID, API_KEY)
+    with caplog.at_level(logging.ERROR):
+        legacy = api.get_status(USER_ID, API_KEY)
+
+    assert typed.error == api.HabiticaAPIError(
+        kind=api.HabiticaErrorKind.CONFIGURATION_ERROR,
+    )
+    assert legacy is None
+    assert calls == []
+    assert "configuration_error" in caplog.text
+    assert USER_ID not in caplog.text
+    assert API_KEY not in caplog.text
 
 
 def test_make_request_does_not_allow_header_or_timeout_override(monkeypatch):
@@ -151,7 +183,7 @@ def test_get_tasks_preserves_successful_empty_list(monkeypatch):
     assert api.get_tasks(USER_ID, API_KEY, "todos") == []
     args, kwargs = calls[0]
     assert args == ("GET", f"{api.BASE_URL}/tasks/user")
-    assert kwargs["params"] == {"type": "todos"}
+    assert kwargs["params"] == {"type": "todos", "history": "false"}
 
 
 def test_get_tasks_rejects_non_dict_entries(monkeypatch):
@@ -581,15 +613,43 @@ def test_typed_invalid_path_or_direction_does_not_request(operation, expected_me
 
 
 @pytest.mark.parametrize(
-    ("upstream_code", "expected_kind"),
+    ("operation", "upstream_code", "expected_kind"),
     [
-        ("invalid_credentials", api.HabiticaErrorKind.INVALID_CREDENTIALS),
-        ("NotAuthorized", api.HabiticaErrorKind.UNAUTHORIZED),
-        (None, api.HabiticaErrorKind.UNAUTHORIZED),
+        (
+            lambda: api.get_user_result(USER_ID, API_KEY),
+            "invalid_credentials",
+            api.HabiticaErrorKind.INVALID_CREDENTIALS,
+        ),
+        (
+            lambda: api.score_task_result(USER_ID, API_KEY, "task-id", "up"),
+            "invalid_credentials",
+            api.HabiticaErrorKind.INVALID_CREDENTIALS,
+        ),
+        (
+            lambda: api.get_user_result(USER_ID, API_KEY),
+            "NotAuthorized",
+            api.HabiticaErrorKind.UNAUTHORIZED,
+        ),
+        (
+            lambda: api.score_task_result(USER_ID, API_KEY, "task-id", "up"),
+            "NotAuthorized",
+            api.HabiticaErrorKind.UNAUTHORIZED,
+        ),
+        (
+            lambda: api.buy_health_potion_result(USER_ID, API_KEY),
+            "NotAuthorized",
+            api.HabiticaErrorKind.UNAUTHORIZED,
+        ),
+        (
+            lambda: api.score_task_result(USER_ID, API_KEY, "task-id", "up"),
+            None,
+            api.HabiticaErrorKind.UNAUTHORIZED,
+        ),
     ],
 )
-def test_typed_401_distinguishes_invalid_credentials(
+def test_typed_401_distinguishes_invalid_credentials_by_error_code(
     monkeypatch,
+    operation,
     upstream_code,
     expected_kind,
 ):
@@ -603,7 +663,7 @@ def test_typed_401_distinguishes_invalid_credentials(
         FakeResponse(status_code=401, payload=payload),
     )
 
-    result = api.score_task_result(USER_ID, API_KEY, "task-id", "up")
+    result = operation()
 
     assert result.ok is False
     assert result.status == 401
@@ -753,6 +813,38 @@ def test_typed_success_rejects_invalid_json_envelope_or_shape(monkeypatch, respo
     assert result.error.outcome_unknown is False
 
 
+def test_typed_tag_helpers_use_official_routes_and_never_retry(monkeypatch):
+    tag = {"id": "123e4567-e89b-42d3-a456-426614174010", "name": "list:Work"}
+    responses = iter(
+        [
+            FakeResponse(payload={"success": True, "data": [tag]}),
+            FakeResponse(status_code=201, payload={"success": True, "data": tag}),
+            FakeResponse(payload={"success": True, "data": tag}),
+            FakeResponse(payload={"success": True, "data": {}}),
+        ]
+    )
+    calls = []
+
+    def request(*args, **kwargs):
+        calls.append((args, kwargs))
+        return next(responses)
+
+    monkeypatch.setattr(api.requests, "request", request)
+
+    assert api.get_tags_result(USER_ID, API_KEY).data == [tag]
+    assert api.create_tag_result(USER_ID, API_KEY, "list:Work").data == tag
+    assert api.update_tag_result(USER_ID, API_KEY, tag["id"], "list:Career").data == tag
+    assert api.delete_tag_result(USER_ID, API_KEY, tag["id"]).data == {}
+    assert [call[0] for call in calls] == [
+        ("GET", f"{api.BASE_URL}/tags"),
+        ("POST", f"{api.BASE_URL}/tags"),
+        ("PUT", f"{api.BASE_URL}/tags/{tag['id']}"),
+        ("DELETE", f"{api.BASE_URL}/tags/{tag['id']}"),
+    ]
+    assert calls[1][1]["json"] == {"name": "list:Work"}
+    assert calls[2][1]["json"] == {"name": "list:Career"}
+
+
 def test_typed_invalid_success_response_marks_mutation_outcome_unknown(monkeypatch):
     install_response(
         monkeypatch,
@@ -848,24 +940,31 @@ def test_typed_full_user_uses_user_endpoint(monkeypatch):
     assert calls[0][0] == ("GET", f"{api.BASE_URL}/user")
 
 
-def test_typed_content_uses_supported_language(monkeypatch):
+@pytest.mark.parametrize("language", ["en", "en_GB", "pt_BR"])
+def test_typed_content_uses_supported_language(monkeypatch, language):
     content = {"potion": {"text": "Health Potion", "value": 25}}
     calls = install_response(
         monkeypatch,
         FakeResponse(payload={"success": True, "data": content}),
     )
 
-    result = api.get_content_result(USER_ID, API_KEY, language="en")
+    result = api.get_content_result(USER_ID, API_KEY, language=language)
 
     assert result.data == content
     assert calls[0][0] == ("GET", f"{api.BASE_URL}/content")
-    assert calls[0][1]["params"] == {"language": "en"}
+    assert calls[0][1]["params"] == {"language": language}
 
 
-def test_typed_content_rejects_untrusted_language_without_request():
+def test_typed_content_rejects_untrusted_language_without_request(monkeypatch):
+    calls = install_response(
+        monkeypatch,
+        FakeResponse(payload={"success": True, "data": {}}),
+    )
+
     result = api.get_content_result(USER_ID, API_KEY, language="bad\nheader")
 
     assert result.error.kind is api.HabiticaErrorKind.INVALID_INPUT
+    assert calls == []
 
 
 @pytest.mark.parametrize(

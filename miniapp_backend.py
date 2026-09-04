@@ -38,11 +38,22 @@ from miniapp_tasks import (
     checklist_changes,
     normalize_task,
     normalize_tasks,
-    optimistic_scored_task,
     quest_log_summary,
     upstream_list_type,
     validate_task_id,
     validate_task_payload,
+)
+from miniapp_todo_lists import (
+    TodoListValidationError,
+    duplicate_list_name,
+    find_owned_list,
+    list_tag_name,
+    normalize_user_tags,
+    ordinary_tags_from_tags,
+    tags_for_list_assignment,
+    todo_lists_from_tags,
+    validate_list_id,
+    validate_list_name,
 )
 
 miniapp_blueprint = Blueprint("miniapp", __name__, url_prefix="/miniapp")
@@ -57,7 +68,9 @@ _CLASS_LABELS = {
 DEFAULT_AVATAR_REFRESH_COOLDOWN_SECONDS = 30.0
 MAX_AVATAR_REFRESH_COOLDOWN_SECONDS = 300.0
 MAX_TASK_REQUEST_BYTES = 128 * 1024
-MAX_CHECKLIST_MUTATIONS_PER_EDIT = 1
+# Each checklist change is one Habitica request. Keep multi-item edits useful
+# while bounding a single save well below Habitica's shared request quota.
+MAX_CHECKLIST_MUTATIONS_PER_EDIT = 8
 TASK_MUTATION_LOCK_SHARDS = 32
 # ``refresh_day`` performs one score plus an immediately preceding day-state
 # read per selection. It processes this many per request, then returns an
@@ -683,6 +696,25 @@ def _habitica_error_response(result, *, mutation: bool = False):
     return response
 
 
+def _potion_habitica_error_response(result):
+    """Translate the potion endpoint's gameplay-rule 401 without exposing details."""
+
+    from Habitica_API import HabiticaErrorKind
+
+    failure = result.error
+    if (
+        failure is not None
+        and failure.kind is HabiticaErrorKind.UNAUTHORIZED
+        and not failure.outcome_unknown
+    ):
+        return _error(
+            "purchase_failed",
+            "Habitica rejected the purchase. Your health may be full or you may not have enough gold.",
+            HTTPStatus.CONFLICT,
+        )
+    return _habitica_error_response(result, mutation=True)
+
+
 def _request_json_object():
     from werkzeug.exceptions import RequestEntityTooLarge
 
@@ -708,6 +740,35 @@ def _request_json_object():
 
 def _task_account_args(account: LinkedHabiticaAccount) -> tuple[str, str]:
     return account.habitica_user_id, account.habitica_api_key
+
+
+def _load_todo_list_metadata(account: LinkedHabiticaAccount):
+    """Load and whitelist ordered user tags once for one request."""
+
+    from Habitica_API import get_tags_result
+
+    result = get_tags_result(*_task_account_args(account))
+    if not result.ok:
+        return None, None, _habitica_error_response(result)
+    tags = normalize_user_tags(result.data)
+    if tags is None:
+        return None, None, _error(
+            "habitica_unavailable",
+            "Habitica returned unexpected tag metadata.",
+            HTTPStatus.BAD_GATEWAY,
+        )
+    return tags, todo_lists_from_tags(tags), None
+
+
+def _todo_list_response(tags: list[dict[str, Any]], lists: list[dict[str, Any]]):
+    return _private_json(
+        {
+            "ok": True,
+            "lists": lists,
+            "ordinaryTags": ordinary_tags_from_tags(tags),
+        },
+        HTTPStatus.OK,
+    )
 
 
 def _load_task(account: LinkedHabiticaAccount, task_id: str):
@@ -950,30 +1011,6 @@ def _day_refresh_error_response(result: Any):
     if "Retry-After" in response.headers:
         merged.headers["Retry-After"] = response.headers["Retry-After"]
     return merged
-
-
-def _ensure_gameplay_ready(account: LinkedHabiticaAccount):
-    """Re-check Habitica's authoritative day gate while the gameplay lock is held."""
-
-    from habitica_gameplay import fetch_day_status
-
-    result = fetch_day_status(*_task_account_args(account))
-    if not result.ok:
-        return _gameplay_error_response(result.error)
-    day = result.data
-    if day is None:
-        return _error(
-            "habitica_unavailable",
-            "Habitica returned an unexpected response.",
-            HTTPStatus.BAD_GATEWAY,
-        )
-    if getattr(day, "refresh_required", False) is True:
-        return _error(
-            "day_refresh_required",
-            "Review yesterday's Dailies before starting the new day.",
-            HTTPStatus.CONFLICT,
-        )
-    return None
 
 
 def _validate_completed_daily_ids(body: Mapping[str, Any]) -> tuple[str, ...]:
@@ -1276,14 +1313,11 @@ def miniapp_health_potion_purchase():
 
     service_entered = False
     try:
-        from habitica_gameplay import purchase_health_potion
+        from Habitica_API import buy_health_potion_result
 
         with acquire_runtime_lock(lock_path=_gameplay_lock_path(account), timeout=0):
             service_entered = True
-            result = purchase_health_potion(
-                *_task_account_args(account),
-                fetch_content=_cached_potion_content_result,
-            )
+            result = buy_health_potion_result(*_task_account_args(account))
     except RuntimeLockUnavailable:
         if not service_entered:
             _restore_potion_purchase_intent(account, token_digest)
@@ -1313,23 +1347,20 @@ def miniapp_health_potion_purchase():
 
     try:
         if not result.ok:
-            response = _gameplay_error_response(result.error)
+            response = _potion_habitica_error_response(result)
         else:
-            purchased = result.data
-            payload = purchased.to_payload() if purchased is not None else None
-            if not isinstance(payload, Mapping):
-                response = _error(
-                    "habitica_unavailable",
-                    "Habitica returned an unexpected response.",
-                    HTTPStatus.BAD_GATEWAY,
-                )
-            else:
-                response_payload = {"ok": True, **dict(payload)}
-                response_payload["invalidate"] = {
-                    "profile": True,
-                    "avatar": False,
-                }
-                response = _private_json(response_payload, HTTPStatus.OK)
+            raw_stats = result.data
+            if isinstance(raw_stats, Mapping) and isinstance(raw_stats.get("stats"), Mapping):
+                raw_stats = raw_stats["stats"]
+            profile_patch = normalize_score_profile_patch(raw_stats)
+            response = _private_json(
+                {
+                    "ok": True,
+                    "profilePatch": profile_patch,
+                    "syncRequired": not bool(profile_patch),
+                },
+                HTTPStatus.OK,
+            )
     except Exception:
         LOGGER.error("Health Potion purchase result could not be serialized")
         response = _error(
@@ -1338,6 +1369,166 @@ def miniapp_health_potion_purchase():
             HTTPStatus.INTERNAL_SERVER_ERROR,
         )
     return _terminalize_potion_purchase_intent(account, token_digest, response)
+
+
+@miniapp_blueprint.get("/api/todo-lists")
+def miniapp_todo_lists_get():
+    account, error_response = _authenticated_account()
+    if error_response is not None:
+        return error_response
+    assert account is not None
+    tags, lists, metadata_error = _load_todo_list_metadata(account)
+    if metadata_error is not None:
+        return metadata_error
+    assert tags is not None and lists is not None
+    return _todo_list_response(tags, lists)
+
+
+@miniapp_blueprint.post("/api/todo-lists")
+def miniapp_todo_lists_create():
+    account, error_response = _authenticated_account()
+    if error_response is not None:
+        return error_response
+    assert account is not None
+    try:
+        body = _request_json_object()
+        if set(body) != {"name"}:
+            raise TodoListValidationError("unsupported list fields")
+        name = validate_list_name(body.get("name"))
+    except (TaskValidationError, TodoListValidationError):
+        return _error("invalid_request", "The list name is invalid.", HTTPStatus.BAD_REQUEST)
+
+    try:
+        with acquire_runtime_lock(lock_path=_task_mutation_lock_path(account, "todo-lists")):
+            _tags, lists, metadata_error = _load_todo_list_metadata(account)
+            if metadata_error is not None:
+                return metadata_error
+            assert lists is not None
+            if duplicate_list_name(lists, name):
+                return _error(
+                    "duplicate_list",
+                    "A list with this name already exists.",
+                    HTTPStatus.CONFLICT,
+                )
+
+            from Habitica_API import create_tag_result
+
+            result = create_tag_result(
+                *_task_account_args(account),
+                list_tag_name(name),
+            )
+            if not result.ok:
+                return _habitica_error_response(result, mutation=True)
+            normalized = normalize_user_tags([result.data])
+            created = todo_lists_from_tags(normalized or [])
+            if len(created) != 1:
+                return _private_json(
+                    {"ok": True, "list": None, "reloadRequired": True},
+                    HTTPStatus.CREATED,
+                )
+            created[0]["order"] = len(lists)
+            return _private_json({"ok": True, "list": created[0]}, HTTPStatus.CREATED)
+    except RuntimeLockUnavailable:
+        return _error(
+            "conflict",
+            "Lists are already being changed. Please wait and refresh.",
+            HTTPStatus.CONFLICT,
+        )
+
+
+@miniapp_blueprint.patch("/api/todo-lists/<tag_id>")
+def miniapp_todo_lists_update(tag_id: str):
+    account, error_response = _authenticated_account()
+    if error_response is not None:
+        return error_response
+    assert account is not None
+    try:
+        tag_id = validate_list_id(tag_id, optional=False)
+        body = _request_json_object()
+        if set(body) != {"name"}:
+            raise TodoListValidationError("unsupported list fields")
+        name = validate_list_name(body.get("name"))
+    except (TaskValidationError, TodoListValidationError):
+        return _error("invalid_request", "The list request is invalid.", HTTPStatus.BAD_REQUEST)
+
+    try:
+        with acquire_runtime_lock(lock_path=_task_mutation_lock_path(account, "todo-lists")):
+            _tags, lists, metadata_error = _load_todo_list_metadata(account)
+            if metadata_error is not None:
+                return metadata_error
+            assert lists is not None
+            owned = find_owned_list(lists, tag_id)
+            if owned is None:
+                return _error("list_not_found", "The list was not found.", HTTPStatus.NOT_FOUND)
+            if duplicate_list_name(lists, name, excluding_id=tag_id):
+                return _error(
+                    "duplicate_list",
+                    "A list with this name already exists.",
+                    HTTPStatus.CONFLICT,
+                )
+
+            from Habitica_API import update_tag_result
+
+            result = update_tag_result(
+                *_task_account_args(account),
+                tag_id,
+                list_tag_name(name),
+            )
+            if not result.ok:
+                return _habitica_error_response(result, mutation=True)
+            normalized = normalize_user_tags([result.data])
+            updated = todo_lists_from_tags(normalized or [])
+            if len(updated) != 1:
+                return _private_json(
+                    {"ok": True, "list": None, "reloadRequired": True},
+                    HTTPStatus.OK,
+                )
+            updated[0]["order"] = owned["order"]
+            return _private_json({"ok": True, "list": updated[0]}, HTTPStatus.OK)
+    except RuntimeLockUnavailable:
+        return _error(
+            "conflict",
+            "Lists are already being changed. Please wait and refresh.",
+            HTTPStatus.CONFLICT,
+        )
+
+
+@miniapp_blueprint.delete("/api/todo-lists/<tag_id>")
+def miniapp_todo_lists_delete(tag_id: str):
+    account, error_response = _authenticated_account()
+    if error_response is not None:
+        return error_response
+    assert account is not None
+    try:
+        tag_id = validate_list_id(tag_id, optional=False)
+    except TodoListValidationError:
+        return _error("invalid_request", "The list ID is invalid.", HTTPStatus.BAD_REQUEST)
+
+    try:
+        with acquire_runtime_lock(lock_path=_task_mutation_lock_path(account, "todo-lists")):
+            _tags, lists, metadata_error = _load_todo_list_metadata(account)
+            if metadata_error is not None:
+                return metadata_error
+            assert lists is not None
+            owned = find_owned_list(lists, tag_id)
+            if owned is None:
+                return _error("list_not_found", "The list was not found.", HTTPStatus.NOT_FOUND)
+
+            from Habitica_API import delete_tag_result
+
+            result = delete_tag_result(*_task_account_args(account), tag_id)
+            if not result.ok:
+                return _habitica_error_response(result, mutation=True)
+            return _private_json(
+                {"ok": True, "deleted": {"id": tag_id, "name": owned["name"]}},
+                HTTPStatus.OK,
+            )
+    except RuntimeLockUnavailable:
+        return _error(
+            "conflict",
+            "Lists are already being changed. Please wait and refresh.",
+            HTTPStatus.CONFLICT,
+        )
 
 
 @miniapp_blueprint.get("/api/tasks")
@@ -1437,13 +1628,19 @@ def miniapp_task_create():
         return error_response
     assert account is not None
     try:
-        _task_type, payload, _checklist = validate_task_payload(
-            _request_json_object(), creating=True
-        )
-    except TaskValidationError:
+        body = _request_json_object()
+        task_type, payload, _checklist = validate_task_payload(body, creating=True)
+        selected_list_id = payload.pop("listId", None)
+        if task_type == "todo" and "listId" in body:
+            _tags, lists, metadata_error = _load_todo_list_metadata(account)
+            if metadata_error is not None:
+                return metadata_error
+            assert lists is not None
+            payload["tags"] = tags_for_list_assignment([], lists, selected_list_id)
+    except (TaskValidationError, TodoListValidationError):
         return _error(
             "invalid_request",
-            "The task details are invalid.",
+            "The task details or selected list are invalid.",
             HTTPStatus.BAD_REQUEST,
         )
 
@@ -1494,6 +1691,20 @@ def miniapp_task_update(task_id: str):
                     creating=False,
                     existing_type=existing["type"],
                 )
+                list_assignment_requested = "listId" in body
+                selected_list_id = fields.pop("listId", None)
+                if existing["type"] == "todo" and list_assignment_requested:
+                    _tags, lists, metadata_error = _load_todo_list_metadata(account)
+                    if metadata_error is not None:
+                        return metadata_error
+                    assert lists is not None
+                    requested_tag_ids = tags_for_list_assignment(
+                        existing.get("tagIds", []),
+                        lists,
+                        selected_list_id,
+                    )
+                    if requested_tag_ids != existing.get("tagIds", []):
+                        fields["tags"] = requested_tag_ids
                 if existing["type"] == "daily" and ("repeatDays" in body or "startDate" in body):
                     if existing.get("scheduleEditable") is not True:
                         raise TaskValidationError("advanced schedules are read-only")
@@ -1521,10 +1732,10 @@ def miniapp_task_update(task_id: str):
                         > MAX_CHECKLIST_MUTATIONS_PER_EDIT
                     ):
                         raise TaskValidationError("too many checklist changes")
-            except TaskValidationError:
+            except (TaskValidationError, TodoListValidationError):
                 return _error(
                     "invalid_request",
-                    "The task details are invalid.",
+                    "The task details or selected list are invalid.",
                     HTTPStatus.BAD_REQUEST,
                 )
 
@@ -1684,29 +1895,6 @@ def miniapp_task_score(task_id: str):
 
     try:
         with _acquire_gameplay_task_locks(account, task_id):
-            gate_error = _ensure_gameplay_ready(account)
-            if gate_error is not None:
-                return gate_error
-            task, load_error = _load_task(account, task_id)
-            if load_error is not None:
-                return load_error
-            assert task is not None
-            if task["type"] == "habit":
-                if task.get(direction) is not True:
-                    return _error(
-                        "invalid_request",
-                        "This Habit does not support that direction.",
-                        HTTPStatus.BAD_REQUEST,
-                    )
-            else:
-                expected_direction = "down" if task.get("completed") is True else "up"
-                if direction != expected_direction:
-                    return _error(
-                        "conflict",
-                        "This task changed elsewhere. Refresh and try again.",
-                        HTTPStatus.CONFLICT,
-                    )
-
             from Habitica_API import get_task_result, score_task_result
 
             result = score_task_result(*_task_account_args(account), task_id, direction)
@@ -1717,21 +1905,10 @@ def miniapp_task_score(task_id: str):
             if reconciled.ok:
                 normalized = normalize_task(reconciled.data)
                 if normalized is not None:
-                    if task["type"] == "habit":
-                        counter_name = "counterUp" if direction == "up" else "counterDown"
-                        expected_counter = task[counter_name] + 1
-                        if normalized[counter_name] < expected_counter:
-                            return _private_json(
-                                {
-                                    "ok": True,
-                                    "task": optimistic_scored_task(task, direction),
-                                    "profilePatch": profile_patch,
-                                    "reloadRequired": True,
-                                },
-                                HTTPStatus.OK,
-                            )
-                    if task["type"] in {"daily", "todo"} and normalized.get("completed") is not (
-                        direction == "up"
+                    completion_expected = direction == "up"
+                    if (
+                        normalized["type"] in {"daily", "todo"}
+                        and normalized.get("completed") is not completion_expected
                     ):
                         return _private_json(
                             {
@@ -1739,7 +1916,7 @@ def miniapp_task_score(task_id: str):
                                 "reconcileRequired": True,
                                 "error": {
                                     "code": "conflict",
-                                    "message": "The task changed elsewhere. Refresh before trying again.",
+                                    "message": "The task state could not be confirmed. Refresh before trying again.",
                                 },
                             },
                             HTTPStatus.CONFLICT,
@@ -1755,7 +1932,7 @@ def miniapp_task_score(task_id: str):
             return _private_json(
                 {
                     "ok": True,
-                    "task": optimistic_scored_task(task, direction),
+                    "task": None,
                     "profilePatch": profile_patch,
                     "reloadRequired": True,
                 },
@@ -1787,42 +1964,6 @@ def miniapp_checklist_score(task_id: str, item_id: str):
 
     try:
         with _acquire_gameplay_task_locks(account, task_id):
-            gate_error = _ensure_gameplay_ready(account)
-            if gate_error is not None:
-                return gate_error
-            task, load_error = _load_task(account, task_id)
-            if load_error is not None:
-                return load_error
-            assert task is not None
-            if task["type"] not in {"daily", "todo"}:
-                return _error(
-                    "invalid_request",
-                    "Habits do not have checklist items.",
-                    HTTPStatus.BAD_REQUEST,
-                )
-            item = next(
-                (candidate for candidate in task["checklist"] if candidate["id"] == item_id),
-                None,
-            )
-            if item is None:
-                return _error(
-                    "task_not_found",
-                    "This checklist item is no longer available.",
-                    HTTPStatus.NOT_FOUND,
-                )
-            if item["completed"] is completed:
-                return _private_json({"ok": True, "task": task}, HTTPStatus.OK)
-
-            capability_error = _require_editable(task)
-            if capability_error is not None:
-                return capability_error
-            if item.get("textTruncated") is True:
-                return _error(
-                    "conflict",
-                    "This checklist item must be changed in Habitica.",
-                    HTTPStatus.CONFLICT,
-                )
-
             from Habitica_API import update_checklist_item_result
 
             # Habitica's score endpoint toggles, so a concurrent external
