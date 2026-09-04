@@ -16,6 +16,7 @@ from enum import Enum
 import logging
 import math
 import os
+import re
 from typing import Any, Dict, Generic, Optional, TypeVar
 from urllib.parse import quote
 
@@ -23,8 +24,14 @@ import requests
 
 
 BASE_URL = "https://habitica.com/api/v3"
+# Retained as a compatibility export for code that imported the historical
+# constant. It is not a valid third-party X-Client value and is never sent.
 CLIENT_ID = "habitica-telegram-bot"
 MAX_RETRY_AFTER_SECONDS = 3600.0
+HABITICA_CLIENT_ID_PATTERN = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}-[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
+)
 
 # A tuple gives requests separate connection and response-read limits.  These
 # helpers remain synchronous, so bounding both phases is particularly
@@ -40,6 +47,7 @@ class HabiticaErrorKind(str, Enum):
     """Stable failure classes for callers that must map API errors to HTTP."""
 
     INVALID_INPUT = "invalid_input"
+    CONFIGURATION_ERROR = "configuration_error"
     BAD_REQUEST = "bad_request"
     INVALID_CREDENTIALS = "invalid_credentials"
     UNAUTHORIZED = "unauthorized"
@@ -52,6 +60,10 @@ class HabiticaErrorKind(str, Enum):
     UPSTREAM_ERROR = "upstream_error"
     HTTP_ERROR = "http_error"
     INVALID_RESPONSE = "invalid_response"
+
+
+class HabiticaConfigurationError(RuntimeError):
+    """Raised internally when the required public X-Client ID is unavailable."""
 
 
 @dataclass(frozen=True)
@@ -84,18 +96,47 @@ class HabiticaResult(Generic[T]):
 
 
 TASK_LIST_TYPES = frozenset(("habits", "dailys", "todos", "rewards", "completedTodos"))
-CONTENT_LANGUAGES = frozenset(("cs", "da", "de", "en", "es", "fr", "it", "ja", "nl", "pl", "pt", "ru", "sk", "sv", "uk", "zh"))
+CONTENT_LANGUAGES = frozenset(
+    (
+        "bg",
+        "cs",
+        "da",
+        "de",
+        "en",
+        "en@pirate",
+        "en_GB",
+        "es",
+        "es_419",
+        "fr",
+        "he",
+        "hu",
+        "id",
+        "it",
+        "ja",
+        "nl",
+        "pl",
+        "pt",
+        "pt_BR",
+        "ro",
+        "ru",
+        "sk",
+        "sr",
+        "sv",
+        "uk",
+        "zh",
+        "zh_TW",
+    )
+)
 
 
 def _configured_client_id() -> str:
-    """Return a safe configured x-client value or the historical fallback."""
+    """Return the required compliant X-Client value without exposing it in errors."""
     configured = os.environ.get("HABITICA_CLIENT_ID", "").strip()
-    if (
-        not configured
-        or len(configured) > 200
-        or any(not 32 <= ord(character) <= 126 for character in configured)
-    ):
-        return CLIENT_ID
+    if not HABITICA_CLIENT_ID_PATTERN.fullmatch(configured):
+        raise HabiticaConfigurationError(
+            "HABITICA_CLIENT_ID is unavailable or malformed; expected "
+            "<Habitica-UUID>-<app-name>"
+        )
     return configured
 
 
@@ -222,7 +263,10 @@ def _task_api_request(
     """
     method = method.upper()
     full_url = f"{BASE_URL}{url}"
-    kwargs["headers"] = _headers(user_id, api_key)
+    try:
+        kwargs["headers"] = _headers(user_id, api_key)
+    except HabiticaConfigurationError:
+        return _typed_failure(method, HabiticaErrorKind.CONFIGURATION_ERROR)
     kwargs["timeout"] = REQUEST_TIMEOUT
     # Never forward Habitica credentials to a redirect target.  Redirects are
     # unexpected for these fixed API endpoints and must be handled as a
@@ -681,7 +725,15 @@ def _make_request(
     # Authentication headers and timeouts are not caller-overridable.  Keeping
     # credentials per request also avoids cross-user header leakage if callers
     # later execute these helpers concurrently.
-    kwargs["headers"] = _headers(user_id, api_key)
+    try:
+        kwargs["headers"] = _headers(user_id, api_key)
+    except HabiticaConfigurationError:
+        logger.error(
+            "Habitica request blocked method=%s kind=%s",
+            method,
+            HabiticaErrorKind.CONFIGURATION_ERROR.value,
+        )
+        return None
     kwargs["timeout"] = REQUEST_TIMEOUT
     kwargs["allow_redirects"] = False
 
@@ -758,7 +810,7 @@ def get_tasks(user_id: str, api_key: str, task_type: str) -> Optional[list]:
         user_id,
         api_key,
         expected_data_type=list,
-        params={"type": task_type},
+        params={"type": task_type, "history": "false"},
     )
     if response_data is None:
         return None

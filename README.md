@@ -112,17 +112,19 @@ load a `.env` file.
 | `MINIAPP_DEV_MODE` | Local development only | Disabled. Set exactly `1` together with `MINIAPP_DEV_TELEGRAM_USER_ID` to open the Mini App outside Telegram. Never enable this in production. |
 | `MINIAPP_DEV_TELEGRAM_USER_ID` | Local development only | Existing linked Telegram user ID used only when development mode is explicitly enabled and the auth header is absent. |
 | `MINIAPP_AVATAR_REFRESH_COOLDOWN_SECONDS` | No | `30`, capped at 300. Reuses a recently rendered avatar instead of repeatedly launching Puppeteer for authenticated refresh replays. |
-| `HABITICA_CLIENT_ID` | Recommended | Habitica's public `x-client` identifier in `<author Habitica UUID>-<app name>` form. It is not a secret. The historical `habitica-telegram-bot` value remains the compatibility fallback. |
+| `HABITICA_CLIENT_ID` | Required for Habitica API use | Public `x-client` identifier in `<tool creator Habitica UUID>-<app name>` form, for example `12345678-90ab-416b-cdef-1234567890ab-hhabitica`. The app name must start with an ASCII letter or digit and contain at most 100 letters, digits, dots, underscores, or hyphens. It is not a secret. Missing or malformed values stop the request before any Habitica credentials are sent; the historical constant remains importable for code compatibility but is never sent. |
 
 Never commit real values. `.gitignore` excludes common secret files, pickle data,
 runtime locks, caches, and avatar output.
 
 ## Local development with polling
 
-Set at least the Telegram token and preferably an absolute development data path:
+Set the Telegram token, a compliant public Habitica client identifier, and preferably
+an absolute development data path:
 
 ```bash
 export TELEGRAM_BOT_TOKEN='replace-with-your-token'
+export HABITICA_CLIENT_ID='<tool-creator-habitica-uuid>-hhabitica'
 export BOT_DATA_PATH="$PWD/.runtime/dev-botdata.pkl"
 mkdir -p .runtime
 chmod 700 .runtime
@@ -303,7 +305,9 @@ from webhook_app import flask_app as application
 ```
 
 Generate independent high-entropy webhook and tick values. Do not reuse the bot token
-or a Habitica key. Reload the web app after changing its environment.
+or a Habitica key. `HABITICA_CLIENT_ID` is public, but it must identify the tool creator
+and application in Habitica's required `UserID-appname` form. Reload the web app after
+changing its environment.
 
 ### 3. Register the Telegram webhook manually
 
@@ -508,8 +512,10 @@ payload, or runtime output is staged.
   reproduce locally for detailed diagnosis rather than logging profile JSON.
 - **PythonAnywhere import fails:** verify the source directory, virtualenv, selected
   Python version, and WSGI `sys.path`, then reload the web app.
-- **Habitica actions fail:** verify credentials through `/relink` in a private chat.
-  Never paste credentials into an issue, log, screenshot, or group chat.
+- **Habitica actions fail:** first verify that `HABITICA_CLIENT_ID` is present in the
+  running process in `UserID-appname` form, then verify account credentials through
+  `/relink` in a private chat. Never paste credentials into an issue, log, screenshot,
+  or group chat.
 - **Task change says its outcome is unknown:** do not repeat the action immediately.
   Let the page reconcile from Habitica or use its refresh control first; score and
   checklist operations are intentionally never retried blindly.
